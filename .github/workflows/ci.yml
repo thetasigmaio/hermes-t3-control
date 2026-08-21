@@ -44,12 +44,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Check out pinned Hermes revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes-commit }}
+          path: .ci/hermes-agent
+          persist-credentials: false
       - name: Set up Python 3.11
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
-      - name: Install pinned Hermes revision
-        run: python -m pip install "git+https://github.com/NousResearch/hermes-agent.git@${{ matrix.hermes-commit }}"
+      - name: Install pinned Hermes revision editably
+        run: python -m pip install --editable .ci/hermes-agent
       - name: Run Plugin Doctor
         env:
           PYTHONDONTWRITEBYTECODE: "1"

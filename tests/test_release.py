@@ -415,6 +415,25 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         self.assertIn('python-version: "3.11"', workflow)
         for commit in HERMES_COMMITS:
             self.assertIn(commit, workflow)
+        hermes_bootstrap = """      - name: Check out pinned Hermes revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes-commit }}
+          path: .ci/hermes-agent
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      - name: Install pinned Hermes revision editably
+        run: python -m pip install --editable .ci/hermes-agent
+"""
+        self.assertEqual(
+            workflow.count(hermes_bootstrap),
+            1,
+        )
+        self.assertNotIn("git+https://github.com/NousResearch/hermes-agent", workflow)
         self.assertRegex(workflow, r"(?m)^  package:\n(?:.*\n)*?    needs: \[unit, doctor\]$")
         self.assertLess(workflow.index("needs: [unit, doctor]"), workflow.index("Upload release artifacts"))
 
