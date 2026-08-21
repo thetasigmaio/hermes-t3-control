@@ -8,11 +8,13 @@ All notable changes to Hermes T3 Control are documented in this file.
 
 - Restored installation on declared Hermes 0.20.4 and 0.20.5 by using their supported native manifest version.
 - Removed historical development specifications that the default install-time security scanner rejects; they remain available in the v1.1.0 tag and repository history.
+- Rejected active-credential reflection across every normalized public argument before any T3 HTTP request or mutation.
+- Rejected explicit JSON `null` for the non-null `before_cursor`, `branch`, and `worktree_path` string fields.
 
 ### Changed
 
-- Added a real disabled pinned-ref install regression with scanning enabled and exact eight-tool Plugin Doctor verification for both supported Hermes revisions.
-- Streamlined the operator guide around safe installation, common workflows, recovery, and rollback.
+- Added a real pinned-ref install, disabled-state, explicit-enable, fresh-process load, and exact eight-tool verification regression for both supported Hermes revisions.
+- Streamlined the operator guide around safe installation, common workflows, recovery, compatible rollback, and canonical removal.
 
 ## [1.1.0] - 2026-08-21
 

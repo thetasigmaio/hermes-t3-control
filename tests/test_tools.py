@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 import uuid
 from unittest import mock
 
+import schemas
 import tools
 from tests.support import (
     LoopbackServer,
@@ -40,10 +42,15 @@ def invoke(
     args: object,
     *,
     context: FakeContext | None = None,
+    credential: str | None = None,
     **kwargs: object,
 ) -> dict:
     handler = tools.bind_handler(context or FakeContext(server.base_url), operation)
-    with mock.patch.object(tools, "_profile_secret", return_value=server.token):
+    with mock.patch.object(
+        tools,
+        "_profile_secret",
+        return_value=server.token if credential is None else credential,
+    ):
         return json.loads(handler(args, **kwargs))
 
 
@@ -123,6 +130,162 @@ class ReadToolTests(unittest.TestCase):
             self.assertNotIn(server.token, encoded)
             self.assertNotIn(exception_text, encoded)
             self.assertEqual(server.requests, [])
+
+
+class PublicArgumentPreflightTests(unittest.TestCase):
+    def test_active_credential_in_every_public_string_path_makes_no_http_request(self) -> None:
+        base_args = {
+            "t3_thread_read": {
+                "thread_id": "thread-1",
+                "turn_limit": 20,
+                "before_cursor": "older",
+            },
+            "t3_thread_create": {
+                "project_id": "project-1",
+                "title": "Thread",
+                "instance_id": "codex-main",
+                "model": "gpt-current",
+                "model_options": [{"id": "reasoning_effort", "value": "high"}],
+                "runtime_mode": "approval-required",
+                "interaction_mode": "default",
+                "initial_message": "Start",
+                "branch": "feature/test",
+                "worktree_path": "/work/test",
+            },
+            "t3_thread_send": {"thread_id": "thread-1", "message": "Continue"},
+            "t3_thread_set_mode": {
+                "thread_id": "thread-1",
+                "runtime_mode": "approval-required",
+            },
+            "t3_thread_implement_plan": {
+                "thread_id": "thread-1",
+                "plan_id": "plan-1",
+            },
+            "t3_turn_interrupt": {"thread_id": "thread-1"},
+            "t3_session_stop": {"thread_id": "thread-1"},
+        }
+        public_string_paths = {
+            (tool_name, (field_name,))
+            for tool_name, schema in schemas.SCHEMAS.items()
+            if tool_name in base_args
+            for field_name, field_schema in schema["parameters"][
+                "properties"
+            ].items()
+            if field_schema.get("type") == "string"
+        }
+        public_string_paths.update(
+            {
+                ("t3_thread_create", ("model_options", "id")),
+                ("t3_thread_create", ("model_options", "value")),
+            }
+        )
+        mode_credentials = {
+            ("t3_thread_create", ("runtime_mode",)): "auto",
+            ("t3_thread_create", ("interaction_mode",)): "plan",
+            ("t3_thread_set_mode", ("runtime_mode",)): "auto",
+            ("t3_thread_set_mode", ("interaction_mode",)): "plan",
+        }
+        self.assertEqual(len(public_string_paths), 22)
+
+        with LoopbackServer([]) as server:
+            for tool_name, field_path in sorted(public_string_paths):
+                with self.subTest(tool=tool_name, path=".".join(field_path)):
+                    credential = mode_credentials.get(
+                        (tool_name, field_path), server.token
+                    )
+                    payload = copy.deepcopy(base_args[tool_name])
+                    if (
+                        tool_name == "t3_thread_set_mode"
+                        and field_path == ("interaction_mode",)
+                    ):
+                        payload.pop("runtime_mode")
+                    if field_path[0] == "model_options":
+                        payload["model_options"][0][field_path[1]] = credential
+                    else:
+                        payload[field_path[0]] = credential
+                    request_count = len(server.requests)
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS[tool_name],
+                        payload,
+                        credential=credential,
+                    )
+                    encoded = json.dumps(result)
+                    self.assertEqual(result["error_code"], "invalid_input")
+                    self.assertFalse(
+                        credential in encoded,
+                        "The sanitized public-operation error reflected the active credential.",
+                    )
+                    self.assertEqual(len(server.requests) - request_count, 0)
+                    self.assertEqual(
+                        sum(
+                            request["method"] == "POST"
+                            for request in server.requests[request_count:]
+                        ),
+                        0,
+                    )
+
+    def test_non_null_string_schema_and_handler_parity_makes_no_http_request(self) -> None:
+        base_args = {
+            "t3_thread_read": {"thread_id": "thread-1", "turn_limit": 20},
+            "t3_thread_create": {"project_id": "project-1", "title": "Thread"},
+            "t3_thread_send": {"thread_id": "thread-1", "message": "Continue"},
+            "t3_thread_set_mode": {
+                "thread_id": "thread-1",
+                "runtime_mode": "approval-required",
+            },
+            "t3_thread_implement_plan": {
+                "thread_id": "thread-1",
+                "plan_id": "plan-1",
+            },
+            "t3_turn_interrupt": {"thread_id": "thread-1"},
+            "t3_session_stop": {"thread_id": "thread-1"},
+        }
+        schema_matrix = {
+            (tool_name, field_name)
+            for tool_name, schema in schemas.SCHEMAS.items()
+            for field_name, field_schema in schema["parameters"]["properties"].items()
+            if field_schema.get("type") == "string"
+        }
+
+        with LoopbackServer([]) as server:
+            exercised: set[tuple[str, str]] = set()
+            for tool_name, field_name in sorted(schema_matrix):
+                payload = dict(base_args[tool_name])
+                if tool_name == "t3_thread_create" and field_name in {
+                    "instance_id",
+                    "model",
+                }:
+                    payload.update(
+                        {"instance_id": "codex-main", "model": "gpt-current"}
+                    )
+                if (
+                    tool_name == "t3_thread_set_mode"
+                    and field_name == "interaction_mode"
+                ):
+                    payload.pop("runtime_mode")
+                payload[field_name] = None
+
+                with self.subTest(tool=tool_name, field=field_name):
+                    request_count = len(server.requests)
+                    result = invoke(server, tools.OPERATIONS[tool_name], payload)
+                    self.assertEqual(result["error_code"], "invalid_input")
+                    self.assertEqual(len(server.requests) - request_count, 0)
+                    exercised.add((tool_name, field_name))
+
+            self.assertEqual(exercised, schema_matrix)
+
+        with LoopbackServer([Response(value=detail_snapshot())]) as server:
+            omitted = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+            self.assertTrue(omitted["ok"])
+            self.assertEqual(
+                server.requests[0]["path"],
+                "/api/orchestration/threads/thread-1?turnLimit=20",
+            )
 
 
 class MutationToolTests(unittest.TestCase):

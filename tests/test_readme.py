@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import unittest
+
+import schemas
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -29,9 +32,15 @@ class ReadmeContractTests(unittest.TestCase):
             'hermes plugins install thetasigmaio/hermes-t3-control --ref '
             '"$HERMES_T3_CONTROL_REF" --no-enable'
         )
-        self.assertEqual(README.count(fresh_install), 1)
+        self.assertEqual(README.count(fresh_install), 2)
         self.assertNotIn("--force", fresh_install)
-        self.assertNotIn("1.1.0", README)
+        self.assertIn("hermes config set plugins.scan_on_install true", README)
+        self.assertIn("hermes config get plugins.scan_on_install --json", README)
+        self.assertIn("must print `true` before installation", README)
+        self.assertIn(
+            "v1.1.0 is not an installable rollback target on Hermes 0.20.4 or 0.20.5",
+            README,
+        )
 
     def test_configuration_activation_and_first_read_are_copy_pasteable(self) -> None:
         for command in (
@@ -59,22 +68,13 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("Hostnames such as `localhost`", README)
 
     def test_documents_exact_eight_tools_defaults_and_result_shapes(self) -> None:
-        tools = (
-            "t3_threads",
-            "t3_thread_read",
-            "t3_thread_create",
-            "t3_thread_send",
-            "t3_thread_set_mode",
-            "t3_thread_implement_plan",
-            "t3_turn_interrupt",
-            "t3_session_stop",
-        )
         table = README.split("## Eight-tool reference", 1)[1].split(
             "## Safety and recovery", 1
         )[0]
-        for name in tools:
-            with self.subTest(name=name):
-                self.assertIn(f"| `{name}` |", table)
+        documented_tools = tuple(
+            re.findall(r"(?m)^\| `([^`]+)` \|", table)
+        )
+        self.assertEqual(documented_tools, schemas.TOOL_NAMES)
         for phrase in (
             "`turn_limit` 1-150, default 20",
             "exactly one of `runtime_mode` or `interaction_mode`",
@@ -113,6 +113,36 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertNotIn('"plan_markdown"', README)
         self.assertNotIn('"plan_text"', README)
 
+    def test_every_json_example_parses_and_matches_its_tool_schema(self) -> None:
+        examples = tuple(
+            json.loads(block)
+            for block in re.findall(r"```json\n(.*?)\n```", README, re.DOTALL)
+        )
+        example_tools = (
+            "t3_thread_create",
+            "t3_thread_send",
+            "t3_thread_implement_plan",
+        )
+        self.assertEqual(len(examples), len(example_tools))
+        for tool_name, example in zip(example_tools, examples, strict=True):
+            with self.subTest(tool=tool_name):
+                parameters = schemas.SCHEMAS[tool_name]["parameters"]
+                self.assertIsInstance(example, dict)
+                self.assertLessEqual(set(parameters["required"]), set(example))
+                self.assertLessEqual(set(example), set(parameters["properties"]))
+                for field_name, value in example.items():
+                    field_schema = parameters["properties"][field_name]
+                    if field_schema.get("type") == "string":
+                        self.assertIsInstance(value, str)
+                        self.assertGreaterEqual(
+                            len(value), field_schema.get("minLength", 0)
+                        )
+                        self.assertLessEqual(
+                            len(value), field_schema.get("maxLength", len(value))
+                        )
+                    if "enum" in field_schema:
+                        self.assertIn(value, field_schema["enum"])
+
     def test_documents_full_access_races_recovery_and_security_boundary(self) -> None:
         for phrase in (
             "full-access` permits trusted provider work to execute commands and modify or delete files without approval",
@@ -120,6 +150,10 @@ class ReadmeContractTests(unittest.TestCase):
             "fresh UUIDv4 command ID",
             "byte-identical command",
             "`mutation_ambiguous` or `verification_failed`",
+            "`network_error`",
+            "retry only when `outcome_ambiguous` is false",
+            "`conflict`",
+            "re-read `t3_threads` or `t3_thread_read`",
             "`concurrent_state_change`",
             "10-second absolute monotonic deadline",
             "30 seconds",
@@ -150,8 +184,8 @@ class ReadmeContractTests(unittest.TestCase):
         commands = (
             "read -r -p 'New audited 40-character commit SHA: ' HERMES_T3_CONTROL_REF",
             "hermes plugins disable hermes-t3-control",
-            'hermes plugins install thetasigmaio/hermes-t3-control --force --ref "$HERMES_T3_CONTROL_REF" --no-enable',
-            "hermes plugins uninstall hermes-t3-control",
+            'hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable',
+            "hermes plugins remove hermes-t3-control",
             "hermes config unset plugins.entries.hermes-t3-control",
         )
         for command in commands:
@@ -159,12 +193,26 @@ class ReadmeContractTests(unittest.TestCase):
                 self.assertIn(command, update_block)
         self.assertLess(
             update_block.index("hermes plugins disable hermes-t3-control"),
+            update_block.index("hermes plugins remove hermes-t3-control"),
+        )
+        self.assertLess(
+            update_block.index("hermes plugins remove hermes-t3-control"),
             update_block.index("hermes plugins install thetasigmaio/hermes-t3-control"),
         )
+        self.assertNotIn(
+            "hermes plugins install thetasigmaio/hermes-t3-control --force",
+            update_block,
+        )
+        self.assertIn(
+            "`--force` also accepts a `caution` security-scan verdict",
+            update_block,
+        )
+        self.assertIn("separately reviewed exact commit", update_block)
         self.assertIn("there is no moving-channel or automatic rollback command", README)
         self.assertIn("Plugin removal does not erase profile settings or secrets", README)
         self.assertIn("leaves `hermes-t3-control` in `plugins.disabled`", README)
         self.assertIn("hermes config edit", update_block)
+        self.assertNotIn("hermes plugins uninstall hermes-t3-control", README)
 
         for command in (
             "python3 -B -m unittest discover -s tests -v",

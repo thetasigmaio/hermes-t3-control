@@ -622,6 +622,10 @@ class T3Client:
             raise T3ClientError() from exc
         return _validate_uuid4(str(candidate), "generated identity")
 
+    def _preflight_public_arguments(self, arguments: Mapping[str, Any]) -> None:
+        """Reject active-credential reflection before a public operation performs I/O."""
+        _reject_active_token(arguments, self.token, "Tool arguments")
+
     def get_shell(self, *, deadline: float | None = None) -> dict[str, Any]:
         value = self._request_json("GET", "/api/orchestration/shell", deadline=deadline)
         return validate_shell_snapshot(value)

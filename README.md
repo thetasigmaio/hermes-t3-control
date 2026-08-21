@@ -8,12 +8,16 @@ Compatibility: Hermes 0.20.4 and 0.20.5, Python 3.11-3.13, and T3 server contrac
 
 ## Secure quick start
 
-Work in the intended Hermes profile. These commands show which profile files will receive configuration and the prompted secret:
+Work in the intended Hermes profile. These commands show which profile files will receive configuration and make the install-time scanner prerequisite explicit:
 
 ```bash
 hermes config path
 hermes config env-path
+hermes config set plugins.scan_on_install true
+hermes config get plugins.scan_on_install --json
 ```
+
+The final command must print `true` before installation.
 
 Set the audited v1.1.1 release commit, then install that immutable revision disabled. Replace the placeholder with the published 40-character commit SHA; do not use a branch name or a moving tag.
 
@@ -22,7 +26,7 @@ read -r -p 'v1.1.1 release commit SHA: ' HERMES_T3_CONTROL_REF
 hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable
 ```
 
-The supported install path keeps `plugins.scan_on_install` enabled and does not need `--force` for a fresh install. At the masked `requires_env` prompt, enter the operator-provisioned `T3_ORCHESTRATION_TOKEN`. Prefer a short-lived token limited to `orchestration:read` and `orchestration:operate`.
+The supported path does not need `--force` for a fresh install. At the masked `requires_env` prompt, enter the operator-provisioned `T3_ORCHESTRATION_TOKEN`. Prefer a short-lived token limited to `orchestration:read` and `orchestration:operate`.
 
 Configure the non-secret loopback origin and the conservative create default:
 
@@ -141,27 +145,32 @@ One HTTP request has a 10-second absolute monotonic deadline. A logical mutation
 - Doctor does not report eight tools: keep the plugin disabled, confirm the active profile and installed SHA, then reinstall the audited ref.
 - `configuration_error`: check `hermes config get plugins.entries.hermes-t3-control.settings --json`, the active profile's masked credential, and the numeric-loopback T3 origin.
 - `authentication_error` or `authorization_error`: refresh the operator-managed token and its two orchestration scopes; never retry with the credential in a prompt or tool input.
+- `network_error`: restore or verify the configured loopback T3 service; retry only when `outcome_ambiguous` is false. Otherwise reconcile the exact thread before any mutation.
+- `conflict`: re-read `t3_threads` or `t3_thread_read`, resolve stale IDs or running/already-implemented state, then decide whether a new mutation is valid.
 - A pinned `hermes plugins update` is refused by design. Use the pinned reinstall flow below.
 
 ## Update, rollback, and uninstall
 
-`--no-enable` does not clear an existing enabled entry, so disable before replacing a pinned install:
+`--no-enable` does not clear an existing enabled entry. Disable and remove the old copy before installing the new audited revision; plugin removal preserves its profile settings and secret:
 
 ```bash
 read -r -p 'New audited 40-character commit SHA: ' HERMES_T3_CONTROL_REF
 hermes plugins disable hermes-t3-control
-hermes plugins install thetasigmaio/hermes-t3-control --force --ref "$HERMES_T3_CONTROL_REF" --no-enable
+hermes plugins remove hermes-t3-control
+hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable
 hermes plugins doctor hermes-t3-control --ci
 hermes plugins enable hermes-t3-control --no-allow-tool-override
 ```
 
-Restart the long-lived Hermes host as described in quick start. Rollback uses the same commands with the previous known-good 40-character commit SHA; there is no moving-channel or automatic rollback command.
+Use this flow only with a separately reviewed exact commit. Do not substitute `--force`: `--force` also accepts a `caution` security-scan verdict, not only replacement, so it weakens the install gate.
 
-To uninstall:
+Restart the long-lived Hermes host as described in quick start. Rollback uses the same commands only with an audited previous revision whose manifest version is 1. v1.1.0 is not an installable rollback target on Hermes 0.20.4 or 0.20.5 because its manifest version is 2. If no compatible known-good revision exists, keep v1.1.1 disabled or remove it; there is no moving-channel or automatic rollback command.
+
+To remove the plugin:
 
 ```bash
 hermes plugins disable hermes-t3-control
-hermes plugins uninstall hermes-t3-control
+hermes plugins remove hermes-t3-control
 hermes config unset plugins.entries.hermes-t3-control
 ```
 
@@ -185,7 +194,7 @@ python3 -B scripts/build_release.py --output-dir dist
 python3 -B scripts/verify_release.py dist/hermes-t3-control-1.1.1.tar.gz.sha256
 ```
 
-CI runs the supported-install regression separately against pinned Hermes 0.20.4 and 0.20.5 revisions. It uses a fresh `HERMES_HOME`, explicit `plugins.scan_on_install: true`, the real `hermes plugins install` pinned-ref path without `--force`, the exact tracked repository tree, and installed-copy Doctor verification for exactly eight tools.
+CI runs the supported-install regression separately against pinned Hermes 0.20.4 and 0.20.5 revisions. It uses a fresh `HERMES_HOME`, explicit `plugins.scan_on_install: true`, the real `hermes plugins install` pinned-ref path without `--force`, and the exact tracked repository tree. It then enables without tool-override permission and uses a fresh network-blocked Python process plus Plugin Doctor to verify exactly eight loaded tools and their manifest, configuration, and secret metadata.
 
 After publication, download and verify both release assets:
 

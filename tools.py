@@ -163,12 +163,6 @@ def _configured_runtime_mode(ctx: Any) -> str:
     return value
 
 
-def _normalize_optional_string(value: Any, name: str, maximum: int) -> str | None:
-    if value is None:
-        return None
-    return normalize_string(value, name, max_chars=maximum)
-
-
 def _normalize_model_options(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         _invalid("model_options must be an array.")
@@ -293,6 +287,7 @@ def _annotate_error(exc: T3ClientError, **details: Any) -> T3ClientError:
 def t3_threads(ctx: Any, raw_args: Any) -> dict[str, Any]:
     _args(raw_args, allowed=set(), required=set())
     transport = _make_client(ctx)
+    transport._preflight_public_arguments({})
     return {"shell": transport.get_shell()}
 
 
@@ -304,14 +299,21 @@ def t3_thread_read(ctx: Any, raw_args: Any) -> dict[str, Any]:
     )
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     turn_limit = validate_turn_limit(args.get("turn_limit", 20))
-    before_cursor = args.get("before_cursor")
-    if before_cursor is not None:
+    before_cursor = None
+    if "before_cursor" in args:
+        before_cursor = normalize_string(
+            args["before_cursor"], "before_cursor", max_chars=MAX_CURSOR_CHARS
+        )
         if "turn_limit" not in args:
             _invalid("before_cursor requires an explicit turn_limit.")
-        before_cursor = normalize_string(
-            before_cursor, "before_cursor", max_chars=MAX_CURSOR_CHARS
-        )
     transport = _make_client(ctx)
+    transport._preflight_public_arguments(
+        {
+            "thread_id": thread_id,
+            "turn_limit": turn_limit,
+            "before_cursor": before_cursor,
+        }
+    )
     return {
         "detail": transport.get_thread(
             thread_id,
@@ -374,12 +376,44 @@ def t3_thread_create(ctx: Any, raw_args: Any) -> dict[str, Any]:
         if "initial_message" in args
         else None
     )
-    branch = _normalize_optional_string(args.get("branch"), "branch", MAX_BRANCH_CHARS)
-    worktree_path = _normalize_optional_string(
-        args.get("worktree_path"), "worktree_path", MAX_WORKTREE_PATH_CHARS
+    branch = (
+        normalize_string(args["branch"], "branch", max_chars=MAX_BRANCH_CHARS)
+        if "branch" in args
+        else None
+    )
+    worktree_path = (
+        normalize_string(
+            args["worktree_path"],
+            "worktree_path",
+            max_chars=MAX_WORKTREE_PATH_CHARS,
+        )
+        if "worktree_path" in args
+        else None
     )
 
     transport = _make_client(ctx)
+    transport._preflight_public_arguments(
+        {
+            "project_id": project_id,
+            "title": title,
+            "instance_id": (
+                explicit_selection["instanceId"]
+                if explicit_selection is not None
+                else None
+            ),
+            "model": (
+                explicit_selection["model"]
+                if explicit_selection is not None
+                else None
+            ),
+            "model_options": explicit_options,
+            "runtime_mode": runtime_mode,
+            "interaction_mode": interaction_mode,
+            "initial_message": initial_message,
+            "branch": branch,
+            "worktree_path": worktree_path,
+        }
+    )
     shell = transport.get_shell()
     project = next((item for item in shell["projects"] if item["id"] == project_id), None)
     if project is None:
@@ -492,6 +526,7 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     text = normalize_message(args["message"])
     transport = _make_client(ctx)
+    transport._preflight_public_arguments({"thread_id": thread_id, "message": text})
     before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
     stored = before["thread"]
     _ensure_mutable_thread(stored)
@@ -542,6 +577,9 @@ def t3_thread_set_mode(ctx: Any, raw_args: Any) -> dict[str, Any]:
         command_type = "thread.interaction-mode.set"
 
     transport = _make_client(ctx)
+    transport._preflight_public_arguments(
+        {"thread_id": thread_id, public_field: mode}
+    )
     before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
     stored = before["thread"]
     _ensure_mutable_thread(stored)
@@ -638,6 +676,9 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
         args["plan_id"], "plan_id", max_chars=MAX_IDENTIFIER_CHARS
     )
     transport = _make_client(ctx)
+    transport._preflight_public_arguments(
+        {"thread_id": thread_id, "plan_id": plan_id}
+    )
     before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
     plan = _require_plan_ready(before, plan_id)
     implementation_message = normalize_message(
@@ -733,6 +774,7 @@ def t3_turn_interrupt(ctx: Any, raw_args: Any) -> dict[str, Any]:
     args = _args(raw_args, allowed={"thread_id"}, required={"thread_id"})
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     transport = _make_client(ctx)
+    transport._preflight_public_arguments({"thread_id": thread_id})
     before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
     session = before["thread"]["session"]
     if (
@@ -794,6 +836,7 @@ def t3_session_stop(ctx: Any, raw_args: Any) -> dict[str, Any]:
     args = _args(raw_args, allowed={"thread_id"}, required={"thread_id"})
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     transport = _make_client(ctx)
+    transport._preflight_public_arguments({"thread_id": thread_id})
     before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
     session = before["thread"]["session"]
     if (
