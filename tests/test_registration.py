@@ -352,9 +352,9 @@ class RegistrationTests(unittest.TestCase):
 
     def test_manifest_and_public_schemas_are_exact(self) -> None:
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["manifest_version"], 2)
+        self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual(manifest["api_version"], 1)
-        self.assertEqual(manifest["version"], "1.1.0")
+        self.assertEqual(manifest["version"], "1.1.1")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"], "https://github.com/thetasigmaio/hermes-t3-control"

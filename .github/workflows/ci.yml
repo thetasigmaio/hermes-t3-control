@@ -29,7 +29,7 @@ jobs:
         run: python -B -m unittest discover -s tests -v
 
   doctor:
-    name: Plugin Doctor (Hermes ${{ matrix.hermes-version }})
+    name: Supported install + Doctor (Hermes ${{ matrix.hermes-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -57,10 +57,11 @@ jobs:
           python-version: "3.11"
       - name: Install pinned Hermes revision editably
         run: python -m pip install --editable .ci/hermes-agent
-      - name: Run Plugin Doctor
+      - name: Run supported pinned-ref install regression
         env:
+          HERMES_SUPPORTED_INSTALL_TEST: "1"
           PYTHONDONTWRITEBYTECODE: "1"
-        run: hermes plugins doctor . --ci
+        run: python -B -m unittest -v tests.test_supported_install
 
   package:
     name: Deterministic release package
@@ -78,13 +79,13 @@ jobs:
       - name: Build deterministic archive
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
-        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.1.0.tar.gz.sha256
+        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.1.1.tar.gz.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.1.0
+          name: hermes-t3-control-1.1.1
           path: |
-            dist/hermes-t3-control-1.1.0.tar.gz
-            dist/hermes-t3-control-1.1.0.tar.gz.sha256
+            dist/hermes-t3-control-1.1.1.tar.gz
+            dist/hermes-t3-control-1.1.1.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
