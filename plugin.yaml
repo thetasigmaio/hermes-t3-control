@@ -1,0 +1,44 @@
+{
+  "manifest_version": 2,
+  "api_version": 1,
+  "name": "hermes-t3-control",
+  "version": "1.1.0",
+  "description": "Bounded control of T3-owned Codex threads through the supported loopback orchestration HTTP API.",
+  "author": "Jakub Sladek",
+  "license": "MIT",
+  "homepage": "https://github.com/thetasigmaio/hermes-t3-control",
+  "kind": "standalone",
+  "requires_env": [
+    {
+      "name": "T3_ORCHESTRATION_TOKEN",
+      "description": "Operator-provisioned short-lived T3 token with orchestration read and operate scopes.",
+      "prompt": "T3 orchestration token",
+      "password": true,
+      "secret": true
+    }
+  ],
+  "provides_tools": [
+    "t3_threads",
+    "t3_thread_read",
+    "t3_thread_create",
+    "t3_thread_send",
+    "t3_thread_set_mode",
+    "t3_thread_implement_plan",
+    "t3_turn_interrupt",
+    "t3_session_stop"
+  ],
+  "python_dependencies": [],
+  "config_schema": {
+    "base_url": {
+      "type": "string",
+      "required": true,
+      "description": "Numeric loopback-only T3 orchestration origin, for example http://127.0.0.1:9137."
+    },
+    "default_runtime_mode": {
+      "type": "string",
+      "required": false,
+      "default": "approval-required",
+      "description": "Default runtime mode for newly created threads when the tool call does not supply one."
+    }
+  }
+}

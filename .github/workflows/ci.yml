@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run unit and mocked integration tests
+        run: python -B -m unittest discover -s tests -v
+
+  doctor:
+    name: Plugin Doctor (Hermes ${{ matrix.hermes-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - hermes-version: "0.20.4"
+            hermes-commit: e624e9fde561e1add9388384012b295fde669ade
+          - hermes-version: "0.20.5"
+            hermes-commit: fcbd1076a93841fa88855acce810e342a5b78101
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      - name: Install pinned Hermes revision
+        run: python -m pip install "git+https://github.com/NousResearch/hermes-agent.git@${{ matrix.hermes-commit }}"
+      - name: Run Plugin Doctor
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: hermes plugins doctor . --ci
+
+  package:
+    name: Deterministic release package
+    needs: [unit, doctor]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      - name: Build deterministic archive
+        run: python -B scripts/build_release.py --output-dir dist
+      - name: Verify detached checksum
+        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.1.0.tar.gz.sha256
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hermes-t3-control-1.1.0
+          path: |
+            dist/hermes-t3-control-1.1.0.tar.gz
+            dist/hermes-t3-control-1.1.0.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14

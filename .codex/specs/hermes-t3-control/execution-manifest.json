@@ -1,0 +1,846 @@
+{
+  "artifacts": {
+    "design": {
+      "path": "/home/jaymade/Projects/tools/hermes-t3-control/.codex/specs/hermes-t3-control/design.md",
+      "sha256": "1dd8abb0d509aa3281575a72b846599dc3bf39c87703b1f8dba78d75a8cc67cb"
+    },
+    "requirements": {
+      "path": "/home/jaymade/Projects/tools/hermes-t3-control/.codex/specs/hermes-t3-control/requirements.md",
+      "sha256": "12649d8ee8159f653aa005b3c9a42eddc632a3f3e524380be71dd04124869c13"
+    },
+    "tasks": {
+      "path": "/home/jaymade/Projects/tools/hermes-t3-control/.codex/specs/hermes-t3-control/tasks.md",
+      "sha256": "3ebf63a376a21ce01319a83f36204e18484c7d5c3ab8cde3b49d61da7d0ae1c0"
+    }
+  },
+  "command_execution_groups": [
+    {
+      "command": "env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci",
+      "condition": null,
+      "covers": [
+        "FR-1/AC-1",
+        "FR-1/AC-2",
+        "NFR-4/AC-3"
+      ],
+      "expected": "exits 0 with eight declared/registered tools and no manifest, import, registration, or network-on-registration error",
+      "id": "G-001",
+      "required": "yes",
+      "resources": [
+        "lock:hermes-plugin-doctor:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stages": [
+        "final"
+      ],
+      "verification_ids": [
+        "V-DOCTOR"
+      ]
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_client",
+      "condition": null,
+      "covers": [
+        "FR-10/AC-1",
+        "FR-10/AC-2",
+        "FR-10/AC-3",
+        "FR-10/AC-4",
+        "FR-10/AC-5",
+        "FR-10/AC-6",
+        "FR-11/AC-2",
+        "FR-11/AC-3",
+        "FR-12/AC-1",
+        "FR-12/AC-2",
+        "FR-12/AC-3",
+        "FR-2/AC-1",
+        "FR-2/AC-2",
+        "NFR-1/AC-4",
+        "NFR-2/AC-1",
+        "NFR-2/AC-2",
+        "NFR-2/AC-3",
+        "NFR-4/AC-2"
+      ],
+      "expected": "exits 0 and all response-contract, provenance, transport, deadline, size, retry, sticky-ambiguity, acceptance-required retry, active-token preflight, and readback tests pass",
+      "id": "G-002",
+      "required": "yes",
+      "resources": [
+        "network:loopback:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stages": [
+        "focused"
+      ],
+      "verification_ids": [
+        "V-CLIENT"
+      ]
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_readme",
+      "condition": null,
+      "covers": [
+        "NFR-1/AC-3",
+        "NFR-5/AC-5"
+      ],
+      "expected": "exits 0 and installation, least privilege, full-access warning, non-retroactivity, concurrency limits, Plan to Build, all tools, and repository-relative verification commands are documented",
+      "id": "G-003",
+      "required": "yes",
+      "resources": [
+        "workspace:read"
+      ],
+      "side_effect_class": "read-only",
+      "stages": [
+        "focused"
+      ],
+      "verification_ids": [
+        "V-README"
+      ]
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_release",
+      "condition": null,
+      "covers": [
+        "NFR-3/AC-2",
+        "NFR-4/AC-4",
+        "NFR-5/AC-1",
+        "NFR-5/AC-2",
+        "NFR-5/AC-3",
+        "NFR-5/AC-4",
+        "NFR-5/AC-6",
+        "NFR-5/AC-7"
+      ],
+      "expected": "exits 0 and version/license, tracked spec convention, byte-identical deterministic archive, symlink/hardlink/directory/FIFO target rejection with sentinel preservation, wrong-owner and group/world-writable output rejection before staging/publication, private same-filesystem staging with inode-rebinding rejection, verified final hashes, portable checksum verifier, pinned CI graph, and exact-read smoke-script assertions pass",
+      "id": "G-004",
+      "required": "yes",
+      "resources": [
+        "lock:release-tests:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stages": [
+        "focused"
+      ],
+      "verification_ids": [
+        "V-RELEASE"
+      ]
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_tools tests.test_registration",
+      "condition": null,
+      "covers": [
+        "FR-1/AC-1",
+        "FR-1/AC-2",
+        "FR-11/AC-1",
+        "FR-11/AC-2",
+        "FR-3/AC-1",
+        "FR-3/AC-2",
+        "FR-3/AC-3",
+        "FR-3/AC-4",
+        "FR-3/AC-5",
+        "FR-4/AC-1",
+        "FR-4/AC-2",
+        "FR-4/AC-3",
+        "FR-4/AC-4",
+        "FR-4/AC-5",
+        "FR-5/AC-1",
+        "FR-5/AC-2",
+        "FR-5/AC-3",
+        "FR-5/AC-4",
+        "FR-6/AC-1",
+        "FR-6/AC-2",
+        "FR-6/AC-3",
+        "FR-6/AC-4",
+        "FR-7/AC-1",
+        "FR-7/AC-2",
+        "FR-7/AC-3",
+        "FR-7/AC-4",
+        "FR-7/AC-5",
+        "FR-7/AC-6",
+        "FR-7/AC-7",
+        "FR-7/AC-8",
+        "FR-8/AC-1",
+        "FR-8/AC-2",
+        "FR-9/AC-1",
+        "FR-9/AC-2",
+        "NFR-1/AC-1",
+        "NFR-1/AC-2",
+        "NFR-3/AC-1",
+        "NFR-4/AC-1",
+        "NFR-4/AC-2",
+        "NFR-4/AC-3"
+      ],
+      "expected": "exits 0 and all eight-tool, configuration, create/turn, metadata/options, mode, acceptance-proven Plan to Build, concurrency-disclosure, interrupt/stop, and source-safety tests pass",
+      "id": "G-005",
+      "required": "yes",
+      "resources": [
+        "network:loopback:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stages": [
+        "focused"
+      ],
+      "verification_ids": [
+        "V-TOOLS"
+      ]
+    },
+    {
+      "command": "python3 -B -m unittest discover -s tests -v",
+      "condition": null,
+      "covers": [
+        "all"
+      ],
+      "expected": "exits 0 and every repository test passes",
+      "id": "G-006",
+      "required": "yes",
+      "resources": [
+        "network:loopback:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stages": [
+        "final"
+      ],
+      "verification_ids": [
+        "V-UNIT"
+      ]
+    },
+    {
+      "command": "python3 -B scripts/build_release.py --output-dir dist",
+      "condition": null,
+      "covers": [
+        "NFR-5/AC-1",
+        "NFR-5/AC-4",
+        "NFR-5/AC-6",
+        "NFR-5/AC-7"
+      ],
+      "expected": "exits 0 and writes only the versioned allowlisted archive and detached checksum under ignored `dist/`",
+      "id": "G-007",
+      "required": "yes",
+      "resources": [
+        "path:dist/:write"
+      ],
+      "side_effect_class": "workspace-write",
+      "stages": [
+        "final"
+      ],
+      "verification_ids": [
+        "V-PACKAGE"
+      ]
+    },
+    {
+      "command": "python3 -B scripts/live_smoke.py",
+      "condition": "the operator has set the required environment values for one explicitly designated isolated non-SolarSim test thread and current runtime authority permits its exact read",
+      "covers": [
+        "NFR-4/AC-4"
+      ],
+      "expected": "exits 0 after one exact-thread GET and prints only thread ID, snapshot sequence, runtime mode, interaction mode, and a success marker",
+      "id": "G-008",
+      "required": "conditional",
+      "resources": [
+        "network:t3-loopback:read"
+      ],
+      "side_effect_class": "external-read",
+      "stages": [
+        "final"
+      ],
+      "verification_ids": [
+        "V-LIVE"
+      ]
+    },
+    {
+      "command": "python3 -B scripts/verify_release.py dist/hermes-t3-control-1.1.0.tar.gz.sha256",
+      "condition": null,
+      "covers": [
+        "NFR-5/AC-1",
+        "NFR-5/AC-4"
+      ],
+      "expected": "exits 0 and reports the release archive checksum valid",
+      "id": "G-009",
+      "required": "yes",
+      "resources": [
+        "path:dist/:read"
+      ],
+      "side_effect_class": "read-only",
+      "stages": [
+        "final"
+      ],
+      "verification_ids": [
+        "V-CHECKSUM"
+      ]
+    }
+  ],
+  "declarative_limits": {
+    "dependency_frontiers": "not_an_execution_schedule",
+    "environment": "not_asserted",
+    "implementation_layers": "compatibility_alias_literal_broad_isolation_only_not_a_runtime_schedule",
+    "path_existence": "not_asserted",
+    "runtime_authority": "not_granted",
+    "runtime_schedule_requires": [
+      "canonical_path_resolution",
+      "symlink_escape_rejection",
+      "path_alias_detection",
+      "resource_revalidation"
+    ],
+    "safe_execution_tranches": "literal_broad_isolation_only_not_a_runtime_schedule",
+    "side_effects": "not_observed_or_authorized",
+    "working_directory": "not_asserted"
+  },
+  "deduplication_scope": {
+    "requires_same_environment": true,
+    "requires_same_runtime_tree_fingerprint": true
+  },
+  "dependency_frontiers": [
+    [
+      "T-1"
+    ],
+    [
+      "T-2"
+    ],
+    [
+      "T-3",
+      "T-4"
+    ]
+  ],
+  "implementation_layers": [
+    [
+      "T-1"
+    ],
+    [
+      "T-2"
+    ],
+    [
+      "T-3",
+      "T-4"
+    ]
+  ],
+  "instruction_discovery": {
+    "codex_home": "/home/jaymade/.codex_20x",
+    "config": {
+      "path": "/home/jaymade/.codex/config.toml",
+      "sha256": "31e8be3e3c46e6e4c3975b177b15f29afe5852d7b99d90e4dac07373c78578d6"
+    },
+    "fallback_filenames": [],
+    "repo_root": "/home/jaymade/Projects/tools/hermes-t3-control",
+    "repository_root_proof": {
+      "kind": "git",
+      "marker": "/home/jaymade/Projects/tools/hermes-t3-control/.git",
+      "root": "/home/jaymade/Projects/tools/hermes-t3-control"
+    },
+    "workdir": "/home/jaymade/Projects/tools/hermes-t3-control"
+  },
+  "instructions": [
+    {
+      "path": "/home/jaymade/.codex/AGENTS.md",
+      "sha256": "592c57a3cd09ef54fbea81e2c0e9bf34ee078466cf8c126471136219944433f8"
+    },
+    {
+      "path": "/home/jaymade/Projects/AGENTS.md",
+      "sha256": "3ef0d02c919bd3111c71fc4c1fe8ab548c4ff5652a836a89f5baa745108a96f3"
+    }
+  ],
+  "profile": "Strict",
+  "receipt": {
+    "path": "/home/jaymade/Projects/tools/hermes-t3-control/.codex/specs/hermes-t3-control/verification.json",
+    "sha256": "1118477217432117a32858079a481a6e19924f39d312f9f8223144b9af1e6116"
+  },
+  "review_gate": "T-REVIEW",
+  "safe_execution_tranches": [
+    [
+      "T-1"
+    ],
+    [
+      "T-2"
+    ],
+    [
+      "T-3",
+      "T-4"
+    ]
+  ],
+  "schema": "sdd-execution-manifest/v1",
+  "spec_id": "hermes-t3-control",
+  "tasks": [
+    {
+      "ac": [
+        "FR-10/AC-1",
+        "FR-10/AC-2",
+        "FR-10/AC-3",
+        "FR-10/AC-4",
+        "FR-10/AC-5",
+        "FR-10/AC-6",
+        "FR-11/AC-2",
+        "FR-11/AC-3",
+        "FR-12/AC-1",
+        "FR-12/AC-2",
+        "FR-12/AC-3",
+        "FR-2/AC-1",
+        "FR-2/AC-2",
+        "NFR-1/AC-4",
+        "NFR-2/AC-1",
+        "NFR-2/AC-2",
+        "NFR-2/AC-3",
+        "NFR-4/AC-2"
+      ],
+      "depends": [],
+      "design": [
+        "D-2",
+        "D-3",
+        "D-5",
+        "D-8",
+        "D-9"
+      ],
+      "id": "T-1",
+      "kind": "implementation",
+      "scope": null,
+      "source_markdown": "### T-1: Extend response contracts without weakening transport\nAdd proposed-plan and latest-turn provenance validation, retain forward compatibility and every existing transport/identity/secret/ambiguity control, reject active-token occurrences before all exact-thread reads and dispatches, preserve ambiguity history across accepted retries, and extend loopback fixtures and client regression tests.\n- **AC**: FR-2/AC-1, FR-2/AC-2, FR-10/AC-1, FR-10/AC-2, FR-10/AC-3, FR-10/AC-4, FR-10/AC-5, FR-10/AC-6, FR-11/AC-2, FR-11/AC-3, FR-12/AC-1, FR-12/AC-2, FR-12/AC-3, NFR-1/AC-4, NFR-2/AC-1, NFR-2/AC-2, NFR-2/AC-3, NFR-4/AC-2\n- **Design**: D-2, D-3, D-5, D-8, D-9\n- **Writes**: `client.py`, `tests/support.py`, `tests/test_client.py`\n- **Depends**: -\n- **Verify**: V-CLIENT\n",
+      "source_span": {
+        "end_line": 108,
+        "start_line": 101
+      },
+      "title": "Extend response contracts without weakening transport",
+      "verify": [
+        "V-CLIENT"
+      ],
+      "writes": [
+        "client.py",
+        "tests/support.py",
+        "tests/test_client.py"
+      ]
+    },
+    {
+      "ac": [
+        "FR-1/AC-1",
+        "FR-1/AC-2",
+        "FR-11/AC-1",
+        "FR-11/AC-2",
+        "FR-3/AC-1",
+        "FR-3/AC-2",
+        "FR-3/AC-3",
+        "FR-3/AC-4",
+        "FR-3/AC-5",
+        "FR-4/AC-1",
+        "FR-4/AC-2",
+        "FR-4/AC-3",
+        "FR-4/AC-4",
+        "FR-4/AC-5",
+        "FR-5/AC-1",
+        "FR-5/AC-2",
+        "FR-5/AC-3",
+        "FR-5/AC-4",
+        "FR-6/AC-1",
+        "FR-6/AC-2",
+        "FR-6/AC-3",
+        "FR-6/AC-4",
+        "FR-7/AC-1",
+        "FR-7/AC-2",
+        "FR-7/AC-3",
+        "FR-7/AC-4",
+        "FR-7/AC-5",
+        "FR-7/AC-6",
+        "FR-7/AC-7",
+        "FR-7/AC-8",
+        "FR-8/AC-1",
+        "FR-8/AC-2",
+        "FR-9/AC-1",
+        "FR-9/AC-2",
+        "NFR-1/AC-1",
+        "NFR-1/AC-2",
+        "NFR-3/AC-1",
+        "NFR-4/AC-1",
+        "NFR-4/AC-2",
+        "NFR-4/AC-3"
+      ],
+      "depends": [
+        "T-1"
+      ],
+      "design": [
+        "D-1",
+        "D-2",
+        "D-4",
+        "D-5",
+        "D-6",
+        "D-7",
+        "D-8",
+        "D-9"
+      ],
+      "id": "T-2",
+      "kind": "implementation",
+      "scope": null,
+      "source_markdown": "### T-2: Implement consistent create, typed modes, and Plan to Build\nUpdate manifest, schemas, registration, handlers, shared turn construction, configuration resolution, model/metadata preservation, composite workflow phase reporting, and focused tests for the exact eight-tool surface.\n- **AC**: FR-1/AC-1, FR-1/AC-2, FR-3/AC-1, FR-3/AC-2, FR-3/AC-3, FR-3/AC-4, FR-3/AC-5, FR-4/AC-1, FR-4/AC-2, FR-4/AC-3, FR-4/AC-4, FR-4/AC-5, FR-5/AC-1, FR-5/AC-2, FR-5/AC-3, FR-5/AC-4, FR-6/AC-1, FR-6/AC-2, FR-6/AC-3, FR-6/AC-4, FR-7/AC-1, FR-7/AC-2, FR-7/AC-3, FR-7/AC-4, FR-7/AC-5, FR-7/AC-6, FR-7/AC-7, FR-7/AC-8, FR-8/AC-1, FR-8/AC-2, FR-9/AC-1, FR-9/AC-2, FR-11/AC-1, FR-11/AC-2, NFR-1/AC-1, NFR-1/AC-2, NFR-3/AC-1, NFR-4/AC-1, NFR-4/AC-2, NFR-4/AC-3\n- **Design**: D-1, D-2, D-4, D-5, D-6, D-7, D-8, D-9\n- **Writes**: `plugin.yaml`, `__init__.py`, `schemas.py`, `tools.py`, `tests/test_tools.py`, `tests/test_registration.py`\n- **Depends**: T-1\n- **Verify**: V-CLIENT, V-TOOLS\n",
+      "source_span": {
+        "end_line": 116,
+        "start_line": 109
+      },
+      "title": "Implement consistent create, typed modes, and Plan to Build",
+      "verify": [
+        "V-CLIENT",
+        "V-TOOLS"
+      ],
+      "writes": [
+        "__init__.py",
+        "plugin.yaml",
+        "schemas.py",
+        "tests/test_registration.py",
+        "tests/test_tools.py",
+        "tools.py"
+      ]
+    },
+    {
+      "ac": [
+        "NFR-3/AC-2",
+        "NFR-4/AC-4",
+        "NFR-5/AC-1",
+        "NFR-5/AC-2",
+        "NFR-5/AC-3",
+        "NFR-5/AC-4",
+        "NFR-5/AC-6",
+        "NFR-5/AC-7"
+      ],
+      "depends": [
+        "T-2"
+      ],
+      "design": [
+        "D-10",
+        "D-9"
+      ],
+      "id": "T-3",
+      "kind": "implementation",
+      "scope": null,
+      "source_markdown": "### T-3: Add release hygiene, CI, and deterministic packaging\nAdd ignore rules, MIT license, changelog, full-SHA-pinned least-privilege CI matrices, deterministic allowlisted archive builder with owner/mode validation and private no-follow output staging, and release/CI contract tests including unsafe-directory, link, special-file, and name-rebinding sentinels.\n- **AC**: NFR-3/AC-2, NFR-4/AC-4, NFR-5/AC-1, NFR-5/AC-2, NFR-5/AC-3, NFR-5/AC-4, NFR-5/AC-6, NFR-5/AC-7\n- **Design**: D-9, D-10\n- **Writes**: `.gitignore`, `LICENSE`, `CHANGELOG.md`, `.github/workflows/ci.yml`, `scripts/build_release.py`, `scripts/verify_release.py`, `scripts/live_smoke.py`, `tests/test_release.py`\n- **Depends**: T-2\n- **Verify**: V-RELEASE\n",
+      "source_span": {
+        "end_line": 124,
+        "start_line": 117
+      },
+      "title": "Add release hygiene, CI, and deterministic packaging",
+      "verify": [
+        "V-RELEASE"
+      ],
+      "writes": [
+        ".github/workflows/ci.yml",
+        ".gitignore",
+        "CHANGELOG.md",
+        "LICENSE",
+        "scripts/build_release.py",
+        "scripts/live_smoke.py",
+        "scripts/verify_release.py",
+        "tests/test_release.py"
+      ]
+    },
+    {
+      "ac": [
+        "NFR-1/AC-3",
+        "NFR-5/AC-5"
+      ],
+      "depends": [
+        "T-2"
+      ],
+      "design": [
+        "D-11"
+      ],
+      "id": "T-4",
+      "kind": "implementation",
+      "scope": null,
+      "source_markdown": "### T-4: Document installation and strict operator workflows\nRewrite README for portable installation/configuration, exact eight tools, explicit full-access risk, create-plus-first-turn behavior, native same-thread Plan to Build, non-retroactive approval and race limitations, and local/release verification.\n- **AC**: NFR-1/AC-3, NFR-5/AC-5\n- **Design**: D-11\n- **Writes**: `README.md`, `tests/test_readme.py`\n- **Depends**: T-2\n- **Verify**: V-README\n",
+      "source_span": {
+        "end_line": 132,
+        "start_line": 125
+      },
+      "title": "Document installation and strict operator workflows",
+      "verify": [
+        "V-README"
+      ],
+      "writes": [
+        "README.md",
+        "tests/test_readme.py"
+      ]
+    },
+    {
+      "ac": "all",
+      "depends": [
+        "T-3",
+        "T-4"
+      ],
+      "design": "all",
+      "id": "T-REVIEW",
+      "kind": "review-gate",
+      "scope": "broad",
+      "source_markdown": "### T-REVIEW: Review the integrated 1.1.0 release candidate\nPerform independent correctness, security, release-artifact, and integration review, then run every final verification on one frozen checkpoint. Evaluate the conditional isolated live-smoke precondition without mutating unrelated or SolarSim state.\n- **AC**: all\n- **Design**: all\n- **Writes**: -\n- **Depends**: T-3, T-4\n- **Verify**: V-UNIT, V-DOCTOR, V-PACKAGE, V-CHECKSUM, V-LIVE\n- **Scope**: broad\n- **Kind**: review-gate",
+      "source_span": {
+        "end_line": 141,
+        "start_line": 133
+      },
+      "title": "Review the integrated 1.1.0 release candidate",
+      "verify": [
+        "V-CHECKSUM",
+        "V-DOCTOR",
+        "V-LIVE",
+        "V-PACKAGE",
+        "V-UNIT"
+      ],
+      "writes": []
+    }
+  ],
+  "verifications": [
+    {
+      "command": "python3 -B scripts/verify_release.py dist/hermes-t3-control-1.1.0.tar.gz.sha256",
+      "condition": null,
+      "covers": [
+        "NFR-5/AC-1",
+        "NFR-5/AC-4"
+      ],
+      "expected": "exits 0 and reports the release archive checksum valid",
+      "id": "V-CHECKSUM",
+      "provenance": [
+        "E-1",
+        "E-10"
+      ],
+      "required": "yes",
+      "resources": [
+        "path:dist/:read"
+      ],
+      "side_effect_class": "read-only",
+      "stage": "final",
+      "title": "Verify the generated release checksum"
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_client",
+      "condition": null,
+      "covers": [
+        "FR-10/AC-1",
+        "FR-10/AC-2",
+        "FR-10/AC-3",
+        "FR-10/AC-4",
+        "FR-10/AC-5",
+        "FR-10/AC-6",
+        "FR-11/AC-2",
+        "FR-11/AC-3",
+        "FR-12/AC-1",
+        "FR-12/AC-2",
+        "FR-12/AC-3",
+        "FR-2/AC-1",
+        "FR-2/AC-2",
+        "NFR-1/AC-4",
+        "NFR-2/AC-1",
+        "NFR-2/AC-2",
+        "NFR-2/AC-3",
+        "NFR-4/AC-2"
+      ],
+      "expected": "exits 0 and all response-contract, provenance, transport, deadline, size, retry, sticky-ambiguity, acceptance-required retry, active-token preflight, and readback tests pass",
+      "id": "V-CLIENT",
+      "provenance": [
+        "E-2",
+        "E-7",
+        "E-9"
+      ],
+      "required": "yes",
+      "resources": [
+        "network:loopback:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stage": "focused",
+      "title": "Run client schema, transport, and mutation tests"
+    },
+    {
+      "command": "env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci",
+      "condition": null,
+      "covers": [
+        "FR-1/AC-1",
+        "FR-1/AC-2",
+        "NFR-4/AC-3"
+      ],
+      "expected": "exits 0 with eight declared/registered tools and no manifest, import, registration, or network-on-registration error",
+      "id": "V-DOCTOR",
+      "provenance": [
+        "E-5",
+        "E-6",
+        "E-9"
+      ],
+      "required": "yes",
+      "resources": [
+        "lock:hermes-plugin-doctor:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stage": "final",
+      "title": "Run Hermes Plugin Doctor"
+    },
+    {
+      "command": "python3 -B scripts/live_smoke.py",
+      "condition": "the operator has set the required environment values for one explicitly designated isolated non-SolarSim test thread and current runtime authority permits its exact read",
+      "covers": [
+        "NFR-4/AC-4"
+      ],
+      "expected": "exits 0 after one exact-thread GET and prints only thread ID, snapshot sequence, runtime mode, interaction mode, and a success marker",
+      "id": "V-LIVE",
+      "provenance": [
+        "E-1",
+        "E-2",
+        "E-7"
+      ],
+      "required": "conditional",
+      "resources": [
+        "network:t3-loopback:read"
+      ],
+      "side_effect_class": "external-read",
+      "stage": "final",
+      "title": "Read one explicitly isolated live T3 thread"
+    },
+    {
+      "command": "python3 -B scripts/build_release.py --output-dir dist",
+      "condition": null,
+      "covers": [
+        "NFR-5/AC-1",
+        "NFR-5/AC-4",
+        "NFR-5/AC-6",
+        "NFR-5/AC-7"
+      ],
+      "expected": "exits 0 and writes only the versioned allowlisted archive and detached checksum under ignored `dist/`",
+      "id": "V-PACKAGE",
+      "provenance": [
+        "E-1",
+        "E-10"
+      ],
+      "required": "yes",
+      "resources": [
+        "path:dist/:write"
+      ],
+      "side_effect_class": "workspace-write",
+      "stage": "final",
+      "title": "Build the deterministic release archive and checksum"
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_readme",
+      "condition": null,
+      "covers": [
+        "NFR-1/AC-3",
+        "NFR-5/AC-5"
+      ],
+      "expected": "exits 0 and installation, least privilege, full-access warning, non-retroactivity, concurrency limits, Plan to Build, all tools, and repository-relative verification commands are documented",
+      "id": "V-README",
+      "provenance": [
+        "E-1",
+        "E-5",
+        "E-7"
+      ],
+      "required": "yes",
+      "resources": [
+        "workspace:read"
+      ],
+      "side_effect_class": "read-only",
+      "stage": "focused",
+      "title": "Run operator documentation contract tests"
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_release",
+      "condition": null,
+      "covers": [
+        "NFR-3/AC-2",
+        "NFR-4/AC-4",
+        "NFR-5/AC-1",
+        "NFR-5/AC-2",
+        "NFR-5/AC-3",
+        "NFR-5/AC-4",
+        "NFR-5/AC-6",
+        "NFR-5/AC-7"
+      ],
+      "expected": "exits 0 and version/license, tracked spec convention, byte-identical deterministic archive, symlink/hardlink/directory/FIFO target rejection with sentinel preservation, wrong-owner and group/world-writable output rejection before staging/publication, private same-filesystem staging with inode-rebinding rejection, verified final hashes, portable checksum verifier, pinned CI graph, and exact-read smoke-script assertions pass",
+      "id": "V-RELEASE",
+      "provenance": [
+        "E-1",
+        "E-10",
+        "E-5"
+      ],
+      "required": "yes",
+      "resources": [
+        "lock:release-tests:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stage": "focused",
+      "title": "Run release hygiene, artifact, CI-contract, and live-smoke script tests"
+    },
+    {
+      "command": "python3 -B -m unittest -v tests.test_tools tests.test_registration",
+      "condition": null,
+      "covers": [
+        "FR-1/AC-1",
+        "FR-1/AC-2",
+        "FR-11/AC-1",
+        "FR-11/AC-2",
+        "FR-3/AC-1",
+        "FR-3/AC-2",
+        "FR-3/AC-3",
+        "FR-3/AC-4",
+        "FR-3/AC-5",
+        "FR-4/AC-1",
+        "FR-4/AC-2",
+        "FR-4/AC-3",
+        "FR-4/AC-4",
+        "FR-4/AC-5",
+        "FR-5/AC-1",
+        "FR-5/AC-2",
+        "FR-5/AC-3",
+        "FR-5/AC-4",
+        "FR-6/AC-1",
+        "FR-6/AC-2",
+        "FR-6/AC-3",
+        "FR-6/AC-4",
+        "FR-7/AC-1",
+        "FR-7/AC-2",
+        "FR-7/AC-3",
+        "FR-7/AC-4",
+        "FR-7/AC-5",
+        "FR-7/AC-6",
+        "FR-7/AC-7",
+        "FR-7/AC-8",
+        "FR-8/AC-1",
+        "FR-8/AC-2",
+        "FR-9/AC-1",
+        "FR-9/AC-2",
+        "NFR-1/AC-1",
+        "NFR-1/AC-2",
+        "NFR-3/AC-1",
+        "NFR-4/AC-1",
+        "NFR-4/AC-2",
+        "NFR-4/AC-3"
+      ],
+      "expected": "exits 0 and all eight-tool, configuration, create/turn, metadata/options, mode, acceptance-proven Plan to Build, concurrency-disclosure, interrupt/stop, and source-safety tests pass",
+      "id": "V-TOOLS",
+      "provenance": [
+        "E-1",
+        "E-2",
+        "E-6",
+        "E-7",
+        "E-9"
+      ],
+      "required": "yes",
+      "resources": [
+        "network:loopback:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stage": "focused",
+      "title": "Run tool workflow, schema, registration, and safety tests"
+    },
+    {
+      "command": "python3 -B -m unittest discover -s tests -v",
+      "condition": null,
+      "covers": "all",
+      "expected": "exits 0 and every repository test passes",
+      "id": "V-UNIT",
+      "provenance": [
+        "E-1",
+        "E-9"
+      ],
+      "required": "yes",
+      "resources": [
+        "network:loopback:exclusive",
+        "workspace:read"
+      ],
+      "side_effect_class": "local-runtime",
+      "stage": "final",
+      "title": "Run the complete unit and mocked integration suite"
+    }
+  ]
+}
