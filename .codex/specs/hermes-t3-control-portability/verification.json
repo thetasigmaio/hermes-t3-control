@@ -1,0 +1,32 @@
+{
+  "schema": "sdd-audit/v2",
+  "spec_id": "hermes-t3-control-portability",
+  "verdict": "PASS",
+  "profile": "Strict",
+  "artifacts": {
+    "requirements": {
+      "path": "/home/jaymade/Projects/.worktrees/hermes-t3-control-v1.3-portability/.codex/specs/hermes-t3-control-portability/requirements.md",
+      "sha256": "e8638f14966e43a9da6c92532dbe1a126d458d32dcbb3365021542b4186dfec7"
+    },
+    "design": {
+      "path": "/home/jaymade/Projects/.worktrees/hermes-t3-control-v1.3-portability/.codex/specs/hermes-t3-control-portability/design.md",
+      "sha256": "14f72acc48ad08bbf362b4a5c76c8c77365e0943c2249297e1632d8db1489f22"
+    },
+    "tasks": {
+      "path": "/home/jaymade/Projects/.worktrees/hermes-t3-control-v1.3-portability/.codex/specs/hermes-t3-control-portability/tasks.md",
+      "sha256": "064e10fdc2b1a3af4ad48b6a5b9af8297c0bd3ea1bc4cba789c635f830d6a16b"
+    }
+  },
+  "instructions": [
+    {
+      "path": "/home/jaymade/.codex/AGENTS.md",
+      "sha256": "66b4ed21e42a52ef36a10c9ffcc2598d1ab4543c601294f03bfd33fcc8bc378a"
+    }
+  ],
+  "blocking_findings": [],
+  "material_open_decisions": [],
+  "audit": {
+    "independent": true,
+    "summary": "Independent Strict language/product and security audits passed the exact Phase A candidate with zero Critical or High findings; native local auth and native external-token evidence remain fail-closed unavailable dependencies for a newly frozen future phase."
+  }
+}
