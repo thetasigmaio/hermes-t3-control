@@ -1278,6 +1278,15 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
             else:
                 time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
                 continue
+            material_delta = {
+                "pending_requests": projected["pending_requests"],
+                "last_error": projected["last_error"],
+                "latest_user_update": projected["latest_user_update"],
+                "actionable_plan": projected["actionable_plan"],
+                "plan_progress": projected["plan_progress"],
+                "updated_at": projected["updated_at"],
+                "settled_at": projected["settled_at"],
+            }
             return {
                 "action": "thread_wait_observed",
                 "thread_id": thread_id,
@@ -1289,7 +1298,7 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "liveness": liveness,
                 "progress": progressed,
                 "latest_assistant_update": projected["latest_assistant_update"],
-                "material_delta": projected,
+                "material_delta": material_delta,
             }
 
     return _execute_operation(ctx, normalized, perform)
@@ -1537,6 +1546,7 @@ def t3_thread_respond(ctx: Any, raw_args: Any) -> dict[str, Any]:
             race_detector=conflicting_or_failed,
             require_accepted_sequence=True,
         )
+        result.pop("detail", None)
         return {
             "action": (
                 "pending_request_response_accepted"

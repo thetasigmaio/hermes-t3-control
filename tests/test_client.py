@@ -55,6 +55,12 @@ class OriginAndInputTests(unittest.TestCase):
             client.T3Client("http://127.0.0.1", token, response_limit=client.MAX_RESPONSE_BYTES + 1)
         with self.assertRaises(client.ConfigurationError):
             client.T3Client("http://127.0.0.1", token, dispatch_attempts=True)
+        with self.assertRaises(client.ConfigurationError):
+            client.T3Client(
+                "http://127.0.0.1",
+                token,
+                cumulative_response_limit=client.MAX_CUMULATIVE_RESPONSE_BYTES + 1,
+            )
 
     def test_credentials_with_outer_whitespace_fail_before_http(self) -> None:
         with LoopbackServer([]) as server:
@@ -587,6 +593,40 @@ class ReadAndSchemaTests(unittest.TestCase):
                 transport.get_shell()
             self.assertEqual(oversized.exception.error_code, "response_too_large")
 
+    def test_standards_valid_nonfinite_float_is_rejected_during_json_parse(self) -> None:
+        raw = json.dumps(shell_snapshot(extra=True)).replace(
+            '"futureTopLevelField": [1, 2, 3]',
+            '"futureTopLevelField": 1e999',
+        ).encode("utf-8")
+        self.assertIn(b"1e999", raw)
+        with LoopbackServer([Response(body=raw)]) as server:
+            transport = client.T3Client(server.base_url, server.token)
+            with self.assertRaises(client.ResponseSchemaError) as caught:
+                transport.get_shell()
+
+        self.assertEqual(caught.exception.error_code, "response_schema_error")
+        self.assertNotIn(server.token, json.dumps(caught.exception.to_dict()))
+
+    def test_cumulative_response_budget_is_enforced_across_valid_reads(self) -> None:
+        shell = shell_snapshot()
+        encoded = json.dumps(shell).encode("utf-8")
+        cumulative_limit = len(encoded) * 2 - 1
+        with LoopbackServer(
+            [Response(value=shell), Response(value=shell)]
+        ) as server:
+            transport = client.T3Client(
+                server.base_url,
+                server.token,
+                cumulative_response_limit=cumulative_limit,
+            )
+            self.assertEqual(transport.get_shell()["snapshotSequence"], 1)
+            with self.assertRaises(client.ResponseBudgetExceededError) as caught:
+                transport.get_shell()
+
+        self.assertEqual(caught.exception.error_code, "response_budget_exhausted")
+        self.assertNotIn(server.token, json.dumps(caught.exception.to_dict()))
+        self.assertEqual([item["method"] for item in server.requests], ["GET", "GET"])
+
     def test_slow_or_stalled_body_obeys_absolute_chunk_deadline(self) -> None:
         payload = json.dumps(shell_snapshot()).encode("utf-8")
         midpoint = len(payload) // 2
@@ -616,6 +656,36 @@ class ReadAndSchemaTests(unittest.TestCase):
             with self.assertRaises(client.NetworkError):
                 transport.get_shell()
             self.assertLess(time.monotonic() - started, 0.4)
+
+    def test_bytes_read_at_deadline_are_still_charged_to_cumulative_budget(self) -> None:
+        now = [0.0]
+
+        class DeadlineResponse:
+            length = None
+
+            def read1(self, maximum: int) -> bytes:
+                now[0] = 2.0
+                return b"data"[:maximum]
+
+        class Connection:
+            sock = None
+            timeout = None
+
+        transport = client.T3Client(
+            "http://127.0.0.1:9",
+            uuid.uuid4().hex,
+            cumulative_response_limit=8,
+            clock=lambda: now[0],
+        )
+        with self.assertRaises(client.NetworkError):
+            transport._read_bounded(
+                DeadlineResponse(),
+                Connection(),
+                deadline=1.0,
+                response_limit=8,
+            )
+
+        self.assertEqual(transport._response_bytes_remaining, 4)
 
     def test_http_taxonomy_and_known_field_sanitization(self) -> None:
         cases = (
@@ -698,6 +768,63 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(
                 [request["method"] for request in server.requests], ["POST", "GET", "GET"]
             )
+
+    def test_accepted_mutation_budget_exhaustion_is_pending_without_redispatch(self) -> None:
+        dispatch = {"sequence": 5}
+        unchanged = detail_snapshot(sequence=5)
+        dispatch_size = len(json.dumps(dispatch).encode("utf-8"))
+        detail_size = len(json.dumps(unchanged).encode("utf-8"))
+        cumulative_limit = dispatch_size + detail_size * 2 - 1
+        with LoopbackServer(
+            [
+                Response(value=dispatch),
+                Response(value=unchanged),
+                Response(value=unchanged),
+            ]
+        ) as server:
+            transport = client.T3Client(
+                server.base_url,
+                server.token,
+                cumulative_response_limit=cumulative_limit,
+                mutation_poll_timeout=0.2,
+                poll_interval=0.001,
+            )
+            result = transport.mutate("thread-1", self.command, self.predicate)
+
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(
+            result["projection_cause_code"], "response_budget_exhausted"
+        )
+        self.assertEqual(result["observed_snapshot_sequence"], 5)
+        self.assertNotIn(server.token, json.dumps(result))
+        self.assertEqual(
+            [item["method"] for item in server.requests], ["POST", "GET", "GET"]
+        )
+        self.assertEqual(
+            sum(item["method"] == "POST" for item in server.requests), 1
+        )
+
+    def test_accepted_mutation_nonfinite_projection_is_pending_without_redispatch(self) -> None:
+        projected = json.dumps(detail_snapshot(sequence=5))
+        projected = (projected[:-1] + ', "futureMetric": 1e999}').encode("utf-8")
+        with LoopbackServer(
+            [Response(value={"sequence": 5}), Response(body=projected)]
+        ) as server:
+            transport = client.T3Client(server.base_url, server.token)
+            result = transport.mutate("thread-1", self.command, self.predicate)
+
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["projection_cause_code"], "response_schema_error")
+        self.assertEqual(result["command_id"], self.command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertEqual(result["dispatch_sequence"], 5)
+        self.assertEqual(result["reconciliation"]["required_snapshot_sequence"], 5)
+        self.assertNotIn(server.token, json.dumps(result))
+        self.assertEqual([item["method"] for item in server.requests], ["POST", "GET"])
 
     def test_ambiguous_dispatch_reads_back_before_byte_identical_retry(self) -> None:
         dispatch_body = client.canonical_command_bytes(self.command)

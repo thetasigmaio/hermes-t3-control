@@ -77,7 +77,12 @@ T3_THREAD_READ_SCHEMA = _schema(
         "thread_id": dict(_ID),
         "view": {"type": "string", "enum": ["material", "raw"], "default": "material"},
         "turn_limit": {"type": "integer", "minimum": 1, "maximum": 150, "default": 20},
-        "before_cursor": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "before_cursor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "When supplied, requires turn_limit to be supplied explicitly.",
+        },
     },
     ["thread_id"],
 )
@@ -88,12 +93,19 @@ T3_THREAD_CREATE_SCHEMA = _schema(
     {
         "project_id": dict(_ID),
         "title": {"type": "string", "minLength": 1, "maxLength": 512},
-        "instance_id": dict(_ID),
-        "model": dict(_ID),
+        "instance_id": {
+            **_ID,
+            "description": "instance_id and model must be supplied together.",
+        },
+        "model": {
+            **_ID,
+            "description": "instance_id and model must be supplied together.",
+        },
         "model_options": {
             "type": "array",
             "items": _MODEL_OPTION,
             "maxItems": 64,
+            "description": "model_options requires instance_id and model.",
         },
         "runtime_mode": dict(_RUNTIME_MODE),
         "interaction_mode": dict(_INTERACTION_MODE),
@@ -120,7 +132,11 @@ T3_THREAD_WAIT_SCHEMA = _schema(
     "Wait at most 30 seconds for one thread to progress, require action, or settle.",
     {
         "thread_id": dict(_ID),
-        "after_thread_sequence": {"type": "integer", "minimum": 0},
+        "after_thread_sequence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2**63 - 1,
+        },
         "until": {
             "type": "string",
             "enum": ["change", "running", "blocked", "terminal", "error"],

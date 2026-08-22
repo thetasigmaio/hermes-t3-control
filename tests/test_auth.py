@@ -5,6 +5,7 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -319,6 +320,27 @@ class CompatibilityModeTests(unittest.TestCase):
 
 
 class LocalRuntimeDiscoveryTests(unittest.TestCase):
+    def _resolve_fixture(self, base_dir: Path) -> auth.LocalRuntime:
+        node_path = base_dir / "bin" / "node"
+        cli_path = (
+            base_dir
+            / "userdata"
+            / "wsl-server-tree"
+            / SERVER_VERSION
+            / "apps"
+            / "server"
+            / "dist"
+            / "bin.mjs"
+        )
+        with mock.patch.object(
+            auth, "_process_uid", return_value=os.getuid()
+        ), mock.patch.object(
+            auth,
+            "_process_argv",
+            return_value=(str(node_path), str(cli_path), "--bootstrap-fd", "0"),
+        ), mock.patch.object(auth, "_process_exe", return_value=node_path):
+            return auth.resolve_local_runtime(base_dir)
+
     def test_resolves_numeric_loopback_live_same_uid_and_exact_server_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base_dir = Path(directory)
@@ -412,15 +434,110 @@ class LocalRuntimeDiscoveryTests(unittest.TestCase):
                     with self.assertRaises(client.ConfigurationError):
                         auth.resolve_local_runtime(base_dir)
 
+    def test_runtime_metadata_fifo_fails_closed_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            write_runtime_fixture(base_dir)
+            state_path = base_dir / "userdata" / "server-runtime.json"
+            valid_state = state_path.read_bytes()
+            state_path.unlink()
+            os.mkfifo(state_path, 0o600)
+            result: list[auth.LocalRuntime] = []
+            errors: list[BaseException] = []
+
+            def resolve() -> None:
+                try:
+                    result.append(self._resolve_fixture(base_dir))
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=resolve, daemon=True)
+            worker.start()
+            worker.join(timeout=1.0)
+            completed_without_writer = not worker.is_alive()
+            if worker.is_alive():
+                writer = os.open(state_path, os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    os.write(writer, valid_state)
+                finally:
+                    os.close(writer)
+                worker.join(timeout=1.0)
+
+            self.assertTrue(
+                completed_without_writer,
+                "local runtime discovery blocked on a metadata FIFO",
+            )
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, [])
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], client.ConfigurationError)
+            self.assertNotIn(str(state_path), str(errors[0]))
+
+    def test_runtime_metadata_rejects_symlink_and_special_file(self) -> None:
+        cases = ("symlink", "socket")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                base_dir = Path(directory)
+                _, cli_path = write_runtime_fixture(base_dir)
+                if case == "symlink":
+                    package_path = cli_path.parents[3] / "package.json"
+                    replacement = package_path.with_name("package-valid-decoy.json")
+                    replacement.write_bytes(package_path.read_bytes())
+                    package_path.unlink()
+                    package_path.symlink_to(replacement)
+                    bound_socket = None
+                else:
+                    environment_path = base_dir / "userdata" / "environment-id"
+                    environment_path.unlink()
+                    bound_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    bound_socket.bind(os.fspath(environment_path))
+                try:
+                    with self.assertRaises(client.ConfigurationError) as caught:
+                        self._resolve_fixture(base_dir)
+                finally:
+                    if bound_socket is not None:
+                        bound_socket.close()
+                self.assertNotIn(str(base_dir), str(caught.exception))
+
+    def test_local_metadata_requires_current_user_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text("{}", encoding="utf-8")
+            actual = os.stat(path)
+            foreign = os.stat_result(
+                (
+                    actual.st_mode,
+                    actual.st_ino,
+                    actual.st_dev,
+                    actual.st_nlink,
+                    os.getuid() + 1,
+                    actual.st_gid,
+                    actual.st_size,
+                    actual.st_atime,
+                    actual.st_mtime,
+                    actual.st_ctime,
+                )
+            )
+            with mock.patch.object(auth.os, "fstat", return_value=foreign):
+                with self.assertRaises(client.ConfigurationError):
+                    auth._read_local_metadata_file(path, 16)
+
+    def test_rejects_relative_base_dir_before_path_resolution(self) -> None:
+        with mock.patch.object(auth.pathlib.Path, "resolve") as resolve:
+            with self.assertRaises(client.ConfigurationError):
+                auth._base_directory("relative/t3")
+        resolve.assert_not_called()
+
 
 class LocalCliTests(unittest.TestCase):
     def test_issue_uses_exact_five_minute_session_and_safe_subprocess(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = local_runtime(Path(directory))
             session = issued_session()
+            list_process = FakeProcess("[]")
             process = FakeProcess(json.dumps(issued_payload(session)))
             with mock.patch.object(
-                auth.subprocess, "Popen", return_value=process
+                auth.subprocess, "Popen", side_effect=[list_process, process]
             ) as popen:
                 actual = auth.issue_local_session(runtime)
 
@@ -443,8 +560,12 @@ class LocalCliTests(unittest.TestCase):
                 "--base-dir",
                 str(runtime.base_dir),
             ]
-            self.assertEqual(popen.call_args.args[0], expected_argv)
-            options = popen.call_args.kwargs
+            self.assertEqual(
+                popen.call_args_list[0].args[0][2:6],
+                ["auth", "session", "list", "--json"],
+            )
+            self.assertEqual(popen.call_args_list[1].args[0], expected_argv)
+            options = popen.call_args_list[1].kwargs
             self.assertIs(options["shell"], False)
             self.assertEqual(options["stdin"], subprocess.DEVNULL)
             self.assertEqual(options["stdout"], subprocess.PIPE)
@@ -496,13 +617,14 @@ class LocalCliTests(unittest.TestCase):
                 with self.subTest(failure=type(failure).__name__):
                     stdout = io.StringIO()
                     stderr = io.StringIO()
-                    behavior = (
-                        {"return_value": failure}
-                        if isinstance(failure, FakeProcess)
-                        else {"side_effect": failure}
+                    cleanup_processes = (
+                        [FakeProcess(), FakeProcess("[]")]
+                        if failure in {failures[2], failures[3]}
+                        else [FakeProcess("[]")]
                     )
+                    process_sequence = [FakeProcess("[]"), failure, *cleanup_processes]
                     with mock.patch.object(
-                        auth.subprocess, "Popen", **behavior
+                        auth.subprocess, "Popen", side_effect=process_sequence
                     ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                         with self.assertRaises(client.ConfigurationError) as caught:
                             auth.issue_local_session(runtime)
@@ -607,6 +729,122 @@ class LocalCliTests(unittest.TestCase):
             ):
                 with self.assertRaises(client.ConfigurationError):
                     auth.revoke_local_session(runtime, "session-private")
+
+    def test_invalid_or_missing_issued_id_revokes_the_single_new_session(self) -> None:
+        invalid_outputs = ("missing", "unsafe", "malformed-json")
+        for invalid_output in invalid_outputs:
+            with self.subTest(invalid_output=invalid_output), tempfile.TemporaryDirectory() as directory:
+                runtime = local_runtime(Path(directory))
+                secret = uuid.uuid4().hex
+                expiry = (
+                    datetime.now(timezone.utc) + timedelta(minutes=5)
+                ).isoformat().replace("+00:00", "Z")
+                active: set[str] = set()
+                argv_seen: list[list[str]] = []
+
+                def run_cli(
+                    _runtime: auth.LocalRuntime,
+                    arguments: list[str],
+                    *,
+                    capture: bool,
+                ) -> str:
+                    del capture
+                    argv_seen.append(list(arguments))
+                    operation = tuple(arguments[:4])
+                    if operation == ("auth", "session", "list", "--json"):
+                        return json.dumps(
+                            [{"sessionId": session_id} for session_id in sorted(active)]
+                        )
+                    if operation == ("auth", "session", "issue", "--json"):
+                        active.add("new-session")
+                        if invalid_output == "malformed-json":
+                            return "not-json-" + secret
+                        payload: dict[str, object] = {
+                            "token": secret,
+                            "expiresAt": expiry,
+                        }
+                        if invalid_output == "unsafe":
+                            payload["sessionId"] = "unsafe/" + secret
+                        return json.dumps(payload)
+                    if tuple(arguments[:3]) == ("auth", "session", "revoke"):
+                        active.remove(arguments[3])
+                        return ""
+                    self.fail("unexpected private CLI operation")
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    auth, "_run_cli", side_effect=run_cli
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(client.ConfigurationError) as caught:
+                        auth.issue_local_session(runtime)
+
+                self.assertEqual(active, set())
+                self.assertTrue(
+                    any(args[:4] == ["auth", "session", "list", "--json"] for args in argv_seen)
+                )
+                self.assertEqual(
+                    sum(args[:3] == ["auth", "session", "revoke"] for args in argv_seen),
+                    1,
+                )
+                encoded = json.dumps(caught.exception.to_dict())
+                self.assertNotIn(secret, encoded + stdout.getvalue() + stderr.getvalue())
+                self.assertFalse(any(secret in argument for args in argv_seen for argument in args))
+
+    def test_unidentified_session_cleanup_failure_reports_only_safe_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = local_runtime(Path(directory))
+            secret = uuid.uuid4().hex
+            expiry = (
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat().replace("+00:00", "Z")
+            calls = 0
+
+            def run_cli(
+                _runtime: auth.LocalRuntime,
+                arguments: list[str],
+                *,
+                capture: bool,
+            ) -> str:
+                nonlocal calls
+                del arguments, capture
+                calls += 1
+                if calls == 1:
+                    return "[]"
+                if calls == 2:
+                    return json.dumps({"token": secret, "expiresAt": expiry})
+                raise client.ConfigurationError("private list failure " + secret)
+
+            with mock.patch.object(auth, "_run_cli", side_effect=run_cli):
+                with self.assertRaises(client.ConfigurationError) as caught:
+                    auth.issue_local_session(runtime)
+
+            encoded = json.dumps(caught.exception.to_dict())
+            self.assertIn('"auth_cleanup": "failed"', encoded)
+            self.assertIn(expiry, encoded)
+            self.assertNotIn(secret, encoded)
+
+    def test_unexpected_post_issue_validation_error_is_cleaned_and_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = local_runtime(Path(directory))
+            session = issued_session()
+            with mock.patch.object(
+                auth,
+                "_run_cli",
+                side_effect=["[]", json.dumps(issued_payload(session))],
+            ), mock.patch.object(
+                auth,
+                "is_valid_bearer_credential",
+                side_effect=RuntimeError("private validation " + session.token),
+            ), mock.patch.object(auth, "revoke_local_session") as revoke:
+                with self.assertRaises(client.ConfigurationError) as caught:
+                    auth.issue_local_session(runtime)
+
+            revoke.assert_called_once_with(runtime, session.session_id)
+            encoded = json.dumps(caught.exception.to_dict())
+            self.assertNotIn(session.session_id, encoded)
+            self.assertNotIn(session.token, encoded)
+            self.assertNotIn("private validation", encoded)
 
 
 class OperationLeaseTests(unittest.TestCase):
@@ -804,7 +1042,7 @@ class OperationLeaseTests(unittest.TestCase):
             payload = issued_payload(session)
             payload["scopes"] = list(EXPECTED_ADMIN_SCOPES[:-1])
             with mock.patch.object(
-                auth, "_run_cli", return_value=json.dumps(payload)
+                auth, "_run_cli", side_effect=["[]", json.dumps(payload)]
             ), mock.patch.object(auth, "revoke_local_session") as revoke:
                 with self.assertRaises(client.ConfigurationError):
                     auth.issue_local_session(runtime)
@@ -818,7 +1056,7 @@ class OperationLeaseTests(unittest.TestCase):
             payload = issued_payload(session)
             payload["scopes"] = []
             with mock.patch.object(
-                auth, "_run_cli", return_value=json.dumps(payload)
+                auth, "_run_cli", side_effect=["[]", json.dumps(payload)]
             ), mock.patch.object(
                 auth,
                 "revoke_local_session",

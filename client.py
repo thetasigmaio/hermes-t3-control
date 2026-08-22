@@ -26,6 +26,9 @@ MAX_MESSAGE_UTF16_UNITS = 120_000
 MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024
 MAX_ENVIRONMENT_RESPONSE_BYTES = 1 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Four maximum-sized responses cover the normal shell/pre-read/dispatch/readback
+# path while bounding a long polling operation independently of its deadline.
+MAX_CUMULATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_TURN_LIMIT = 150
 DEFAULT_TURN_LIMIT = 20
 REQUEST_TIMEOUT_SECONDS = 10.0
@@ -127,6 +130,11 @@ class ResponseTooLargeError(T3ClientError):
     default_message = "The T3 response exceeded the configured byte limit."
 
 
+class ResponseBudgetExceededError(T3ClientError):
+    error_code = "response_budget_exhausted"
+    default_message = "The T3 operation exceeded its cumulative response byte limit."
+
+
 class ResponseSchemaError(T3ClientError):
     error_code = "response_schema_error"
     default_message = "The successful T3 response did not match the required schema."
@@ -175,6 +183,13 @@ def _sanitize_text(value: Any, *, secret: str | None = None) -> str:
         text = text.replace(secret, "[redacted]")
     text = _CONTROL_RE.sub(" ", text)
     return text[:ERROR_VALUE_CHARS]
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
 
 
 def is_valid_bearer_credential(value: Any) -> bool:
@@ -600,6 +615,7 @@ class T3Client:
         mutation_timeout: float = MUTATION_TIMEOUT_SECONDS,
         mutation_poll_timeout: float = MUTATION_POLL_SECONDS,
         response_limit: int = MAX_RESPONSE_BYTES,
+        cumulative_response_limit: int = MAX_CUMULATIVE_RESPONSE_BYTES,
         request_body_limit: int = MAX_REQUEST_BODY_BYTES,
         dispatch_attempts: int = MAX_DISPATCH_ATTEMPTS,
         poll_interval: float = 0.05,
@@ -624,6 +640,12 @@ class T3Client:
             mutation_poll_timeout, MUTATION_POLL_SECONDS, "mutation_poll_timeout"
         )
         self.response_limit = _bounded_int(response_limit, MAX_RESPONSE_BYTES, "response_limit")
+        self.cumulative_response_limit = _bounded_int(
+            cumulative_response_limit,
+            MAX_CUMULATIVE_RESPONSE_BYTES,
+            "cumulative_response_limit",
+        )
+        self._response_bytes_remaining = self.cumulative_response_limit
         self.request_body_limit = _bounded_int(
             request_body_limit, MAX_REQUEST_BODY_BYTES, "request_body_limit"
         )
@@ -790,6 +812,7 @@ class T3Client:
                 if exc.error_code not in {
                     "network_error",
                     "server_error",
+                    "response_budget_exhausted",
                     "response_too_large",
                     "response_schema_error",
                     "internal_error",
@@ -1034,6 +1057,8 @@ class T3Client:
             )
         if body is not None and (not isinstance(body, bytes) or len(body) > self.request_body_limit):
             raise InvalidInputError("request body exceeds its byte limit.")
+        if self._response_bytes_remaining <= 0:
+            raise ResponseBudgetExceededError()
         operation_deadline = deadline if deadline is not None else self.clock() + self.request_timeout
         request_deadline = min(operation_deadline, self.clock() + self.request_timeout)
         connection: Any = None
@@ -1064,6 +1089,12 @@ class T3Client:
             response_limit = self.response_limit
             if path == _ENVIRONMENT_DESCRIPTOR_PATH:
                 response_limit = min(response_limit, MAX_ENVIRONMENT_RESPONSE_BYTES)
+            declared_length = getattr(response, "length", None)
+            if isinstance(declared_length, int):
+                if declared_length > response_limit:
+                    raise ResponseTooLargeError()
+                if declared_length > self._response_bytes_remaining:
+                    raise ResponseBudgetExceededError()
             raw = self._read_bounded(
                 response,
                 connection,
@@ -1095,6 +1126,7 @@ class T3Client:
         try:
             decoded = json.loads(
                 raw.decode("utf-8"),
+                parse_float=_parse_finite_float,
                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
             )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, MemoryError) as exc:
@@ -1127,12 +1159,24 @@ class T3Client:
         total = 0
         while True:
             self._set_socket_timeout(connection, deadline)
+            if getattr(response, "length", None) == 0:
+                break
+            if self._response_bytes_remaining <= 0:
+                raise ResponseBudgetExceededError()
             remaining_capacity = response_limit - total
-            chunk = response.read1(min(READ_CHUNK_BYTES, remaining_capacity + 1))
+            chunk = response.read1(
+                min(
+                    READ_CHUNK_BYTES,
+                    remaining_capacity + 1,
+                    self._response_bytes_remaining,
+                )
+            )
+            if chunk:
+                total += len(chunk)
+                self._response_bytes_remaining -= len(chunk)
             self._remaining(deadline)
             if not chunk:
                 break
-            total += len(chunk)
             if total > response_limit:
                 raise ResponseTooLargeError()
             chunks.append(chunk)

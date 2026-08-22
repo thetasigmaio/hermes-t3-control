@@ -89,6 +89,7 @@ class AgentFacingSchemaTests(unittest.TestCase):
             {"type": "string", "enum": ["material", "raw"], "default": "material"},
         )
         self.assertEqual(read["turn_limit"]["maximum"], 150)
+        self.assertIn("requires turn_limit", read["before_cursor"]["description"])
         self.assertEqual(
             schemas.SCHEMAS["t3_thread_read"]["parameters"]["required"],
             ["thread_id"],
@@ -113,7 +114,7 @@ class AgentFacingSchemaTests(unittest.TestCase):
         )
         self.assertEqual(
             wait["after_thread_sequence"],
-            {"type": "integer", "minimum": 0},
+            {"type": "integer", "minimum": 0, "maximum": 2**63 - 1},
         )
         self.assertEqual(
             wait["until"],
@@ -130,6 +131,15 @@ class AgentFacingSchemaTests(unittest.TestCase):
         self.assertEqual(
             schemas.SCHEMAS["t3_thread_wait"]["parameters"]["required"],
             ["thread_id"],
+        )
+
+    def test_cross_field_runtime_invariants_are_documented_in_the_public_schema(self) -> None:
+        create = self.properties("t3_thread_create")
+        self.assertIn("supplied together", create["instance_id"]["description"])
+        self.assertIn("supplied together", create["model"]["description"])
+        self.assertIn(
+            "requires instance_id and model",
+            create["model_options"]["description"],
         )
 
     def test_respond_schema_is_an_exact_approval_or_user_input_union(self) -> None:

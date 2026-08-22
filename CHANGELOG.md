@@ -16,6 +16,8 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Recognizes T3's persisted queued user message with a null turn link and never redispatches after a successful dispatch response.
 - Waits within the request deadline for a delayed server-side socket accept before authentication and preserves a sanitized cleanup warning even when a handler fails unexpectedly.
 - Makes release output permissions deterministic across caller umasks and isolates the supported-install harness from ambient credentials, Git configuration, hooks, and proxies.
+- Caps cumulative response bodies to 64 MiB per logical operation, rejects non-finite JSON numbers, and preserves accepted-pending reconciliation without redispatch when projection polling exhausts that budget.
+- Reads local T3 metadata through nonblocking, no-follow regular-file descriptors and cleans up newly issued sessions even when post-issuance CLI output is malformed or lacks a safe session ID.
 
 ### Changed
 

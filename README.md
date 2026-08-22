@@ -121,9 +121,11 @@ Example for `t3_thread_wait`:
 }
 ```
 
-The result reports progress, action required, settlement, or timeout with only a material delta and latest assistant update. A timeout says nothing was observed in the bounded window; it does not declare provider failure.
+The result reports progress, action required, settlement, or timeout with a compact material delta and one non-duplicated latest assistant update; it never embeds the full thread snapshot. A timeout says nothing was observed in the bounded window; it does not declare provider failure.
 
 Pending actions are typed and exact-request scoped. Use `decision` for an approval request or `answers` for a user-input request; a stale, mismatched, missing, or ambiguous request is rejected before dispatch. For an approval, replace `answers` below with `"decision": "accept"` or `"decision": "decline"`.
+
+The response is a compact receipt containing the exact request, thread, command, and verification/reconciliation IDs. It never embeds the raw thread detail.
 
 Example for `t3_thread_respond`:
 
@@ -206,6 +208,7 @@ Use these distinctions:
 
 - `mutation_ambiguous`: the transport failed before acceptance could be established; exact-read before any retry.
 - `network_error`: a read did not complete; check the live T3 process and loopback origin.
+- `response_budget_exhausted`: one operation consumed its 64 MiB cumulative response budget; narrow the read or retry a fresh bounded observation.
 - `conflict`: the target is busy, stale, archived, ambiguous, or not in the required state; re-read it.
 - `auth_cleanup: failed`: the accepted operation remains authoritative, but revocation confirmation failed; wait for lease expiry and reconcile rather than repeat it.
 
@@ -236,7 +239,7 @@ hermes config unset plugins.entries.hermes-t3-control
 
 ## Security and credential handling
 
-Local mode resolves same-user bounded runtime metadata, a numeric loopback origin, the running Node executable, the exact T3 server entrypoint and package version, and the live environment descriptor. Before sending a bearer value, it pins the process identity, proves ownership of the listener, and proves the connected socket belongs to that pinned process. Its temporary bearer value stays in process memory, never enters argv, never persists, is not logged, and is revoked in `finally`. HTTP permits only `GET /.well-known/t3/environment`, `GET /api/orchestration/shell`, `GET /api/orchestration/threads/:threadId`, and `POST /api/orchestration/dispatch`. All proxies and redirects are disabled; origins must be numeric loopback. Responses are bounded to 1 MiB for environment metadata and 16 MiB for orchestration projections.
+Local mode resolves same-user bounded runtime metadata, a numeric loopback origin, the running Node executable, the exact T3 server entrypoint and package version, and the live environment descriptor. Before sending a bearer value, it pins the process identity, proves ownership of the listener, and proves the connected socket belongs to that pinned process. Its temporary bearer value stays in process memory, never enters argv, never persists, is not logged, and is revoked in `finally`. HTTP permits only `GET /.well-known/t3/environment`, `GET /api/orchestration/shell`, `GET /api/orchestration/threads/:threadId`, and `POST /api/orchestration/dispatch`. All proxies and redirects are disabled; origins must be numeric loopback. Responses are bounded to 1 MiB for environment metadata and 16 MiB for orchestration projections. Each public operation also has a 64 MiB cumulative response-body budget—four maximum-sized projections—so polling cannot accumulate unbounded input.
 
 `local-cli` currently requires Linux with `/proc` and `pidfd` support, including WSL2. It assumes a single-user WSL trust boundary and trusts the upstream T3 bundle owned by the current Windows account. Neither auth mode makes a plain shared loopback listener safe from mutually untrusted local users; `external-token` is not a multi-user isolation mechanism. Isolate the operating-system user and T3 service instead.
 

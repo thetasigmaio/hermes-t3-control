@@ -168,6 +168,17 @@ class ReadToolTests(unittest.TestCase):
                 "/api/orchestration/threads/thread-1?turnLimit=7&beforeCursor=older",
             )
 
+    def test_nonfinite_additive_json_never_reaches_public_result_serialization(self) -> None:
+        raw = json.dumps(shell_snapshot(extra=True)).replace(
+            '"futureTopLevelField": [1, 2, 3]',
+            '"futureTopLevelField": 1e999',
+        ).encode("utf-8")
+        with LoopbackServer([Response(body=raw)]) as server:
+            result = invoke(server, tools.t3_threads, {"view": "raw"})
+
+        self.assertEqual(result["error_code"], "response_schema_error")
+        self.assertNotIn(server.token, json.dumps(result))
+
     def test_validation_and_secret_fail_closed_before_http(self) -> None:
         with LoopbackServer([]) as server:
             invalid = invoke(server, tools.t3_thread_read, {"thread_id": "x", "unknown": True})
@@ -725,6 +736,46 @@ class AgentFacingReadToolTests(unittest.TestCase):
 
 
 class PublicArgumentPreflightTests(unittest.TestCase):
+    def test_cross_field_runtime_invariants_reject_before_http(self) -> None:
+        invalid_cases = (
+            (
+                "t3_thread_read",
+                {"thread_id": "thread-1", "before_cursor": "older"},
+            ),
+            (
+                "t3_thread_create",
+                {
+                    "project_id": "project-1",
+                    "title": "Missing model",
+                    "instance_id": "codex-main",
+                },
+            ),
+            (
+                "t3_thread_create",
+                {
+                    "project_id": "project-1",
+                    "title": "Missing instance",
+                    "model": "gpt-current",
+                },
+            ),
+            (
+                "t3_thread_create",
+                {
+                    "project_id": "project-1",
+                    "title": "Detached options",
+                    "model_options": [
+                        {"id": "reasoning_effort", "value": "ultra"}
+                    ],
+                },
+            ),
+        )
+        with LoopbackServer([]) as server:
+            for tool_name, args in invalid_cases:
+                with self.subTest(tool=tool_name, fields=tuple(sorted(args))):
+                    result = invoke(server, tools.OPERATIONS[tool_name], args)
+                    self.assertEqual(result["error_code"], "invalid_input")
+                    self.assertEqual(server.requests, [])
+
     def test_active_credential_in_every_public_string_path_makes_no_http_request(self) -> None:
         base_args = {
             "t3_threads": {"view": "compact"},
@@ -1137,6 +1188,31 @@ class AgentFacingWaitToolTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "invalid_input")
         self.assertEqual(server.requests, [])
 
+    def test_wait_cumulative_response_budget_failure_is_sanitized(self) -> None:
+        shell = shell_snapshot(sequence=4)
+        detail = detail_snapshot(sequence=4)
+        shell_size = len(json.dumps(shell).encode("utf-8"))
+        detail_size = len(json.dumps(detail).encode("utf-8"))
+        with LoopbackServer(
+            [Response(value=shell), Response(value=detail)]
+        ) as server:
+            transport = tools.T3Client(
+                server.base_url,
+                server.token,
+                cumulative_response_limit=shell_size + detail_size - 1,
+            )
+            with mock.patch.object(tools, "_make_client", return_value=transport):
+                result = invoke(
+                    server,
+                    tools.OPERATIONS["t3_thread_wait"],
+                    {"thread_id": "thread-1", "timeout_seconds": 0},
+                )
+
+        self.assertEqual(result["error_code"], "response_budget_exhausted")
+        self.assertFalse(result["outcome_ambiguous"])
+        self.assertNotIn(server.token, json.dumps(result))
+        self.assertEqual([item["method"] for item in server.requests], ["GET", "GET"])
+
     def test_wait_reports_per_thread_progress_and_latest_assistant_delta(self) -> None:
         detail = with_projection_fields(
             detail_snapshot(
@@ -1170,10 +1246,69 @@ class AgentFacingWaitToolTests(unittest.TestCase):
         self.assertEqual(result["liveness"], "working")
         self.assertTrue(result["progress"])
         self.assertEqual(result["latest_assistant_update"]["id"], "assistant-progress")
-        self.assertEqual(
-            result["material_delta"]["latest_assistant_update"]["text"],
-            "Implemented the first step",
+
+    def test_wait_returns_a_compact_delta_without_snapshot_or_duplicate_update(self) -> None:
+        messages = [
+            projected_message(
+                message_id=f"assistant-{index}",
+                role="assistant",
+                text=f"historical-material-{index}",
+                turn_id=f"turn-{index}",
+                created_at=f"2026-08-21T12:{index // 60:02d}:{index % 60:02d}Z",
+            )
+            for index in range(149)
+        ]
+        messages.append(
+            projected_message(
+                message_id="assistant-latest",
+                role="assistant",
+                text="Only this latest material update belongs in the wait receipt.",
+                turn_id="turn-current",
+                created_at="2026-08-21T15:00:00Z",
+            )
         )
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=150,
+                messages=messages,
+                turn=latest_turn(turn_id="turn-current", state="running"),
+                current_session=session(
+                    status="running", active_turn_id="turn-current"
+                ),
+            ),
+            thread_sequence=150,
+        )
+
+        result, _server = self._invoke_wait(
+            detail,
+            {
+                "thread_id": "thread-1",
+                "after_thread_sequence": 149,
+                "until": "change",
+                "timeout_seconds": 0,
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["latest_assistant_update"]["id"], "assistant-latest")
+        self.assertEqual(
+            set(result["material_delta"]),
+            {
+                "pending_requests",
+                "last_error",
+                "latest_user_update",
+                "actionable_plan",
+                "plan_progress",
+                "updated_at",
+                "settled_at",
+            },
+        )
+        encoded = json.dumps(result)
+        self.assertNotIn("latest_assistant_update", result["material_delta"])
+        self.assertNotIn("historical-material-0", encoded)
+        self.assertNotIn("model_selection", result["material_delta"])
+        self.assertNotIn("worktree_path", result["material_delta"])
+        self.assertLess(len(encoded), 12_000)
 
     def test_wait_distinguishes_action_required_settled_and_timeout(self) -> None:
         blocked = with_projection_fields(
@@ -1395,6 +1530,64 @@ class AgentFacingRespondToolTests(unittest.TestCase):
                 self.assertEqual(commands[0]["requestId"], response_args["request_id"])
                 for key, value in command_payload.items():
                     self.assertEqual(commands[0][key], value)
+
+                self.assertNotIn("detail", result)
+                self.assertEqual(
+                    {
+                        "request_id": result["request_id"],
+                        "request_kind": result["request_kind"],
+                        "thread_id": result["thread_id"],
+                        "command_id": result["command_id"],
+                        "dispatch_sequence": result["dispatch_sequence"],
+                    },
+                    {
+                        "request_id": response_args["request_id"],
+                        "request_kind": (
+                            "approval"
+                            if resolved_kind == "approval.resolved"
+                            else "user_input"
+                        ),
+                        "thread_id": "thread-1",
+                        "command_id": commands[0]["commandId"],
+                        "dispatch_sequence": 5,
+                    },
+                )
+
+    def test_respond_pending_projection_is_compact_and_keeps_reconciliation_ids(self) -> None:
+        requested = activity(
+            activity_id="approval-open",
+            kind="approval.requested",
+            payload={
+                "requestId": "approval-open",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        before = self._pending_detail(requested, sequence=4)
+        delayed = self._pending_detail(requested, sequence=4)
+
+        result, commands = self._invoke_with_short_projection_window(
+            before,
+            delayed,
+            {"request_id": "approval-open", "decision": "decline"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["request_id"], "approval-open")
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertEqual(result["command_id"], commands[0]["commandId"])
+        self.assertEqual(result["dispatch_sequence"], 5)
+        self.assertEqual(result["reconciliation"]["required_snapshot_sequence"], 5)
+        self.assertEqual(
+            result["reconciliation"]["arguments"]["thread_id"], "thread-1"
+        )
+        self.assertNotIn("detail", result)
+        self.assertLess(len(json.dumps(result)), 4_000)
 
     def test_respond_preserves_javascript_safe_integer_boundaries(self) -> None:
         safe = 2**53 - 1

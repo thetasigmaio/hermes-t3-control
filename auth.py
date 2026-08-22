@@ -117,25 +117,70 @@ def _configuration_error(message: str) -> ConfigurationError:
     return ConfigurationError(message)
 
 
-def _read_limited_file(path: pathlib.Path, maximum: int) -> bytes:
+def _read_bounded_descriptor(descriptor: int, maximum: int) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    while size <= maximum:
+        chunk = os.read(descriptor, min(8_192, maximum + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    value = b"".join(chunks)
+    if len(value) > maximum:
+        raise _configuration_error("Local T3 metadata exceeds its safe size limit.")
+    return value
+
+
+def _read_proc_file(path: pathlib.Path, maximum: int) -> bytes:
+    """Read a bounded procfs pseudo-file, whose size and owner are not file-like."""
     descriptor: int | None = None
     try:
         descriptor = os.open(
             os.fspath(path),
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
         )
-        chunks: list[bytes] = []
-        size = 0
-        while size <= maximum:
-            chunk = os.read(descriptor, min(8_192, maximum + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-        value = b"".join(chunks)
-        if len(value) > maximum:
-            raise _configuration_error("Local T3 metadata exceeds its safe size limit.")
-        return value
+        return _read_bounded_descriptor(descriptor, maximum)
+    except ConfigurationError:
+        raise
+    except Exception:
+        raise _configuration_error("The local T3 process metadata is unavailable.") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _read_local_metadata_file(path: pathlib.Path, maximum: int) -> bytes:
+    """Read one same-user regular metadata file through its pinned descriptor."""
+    descriptor: int | None = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if not no_follow:
+            before = os.stat(os.fspath(path), follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode):
+                raise _configuration_error("Local T3 metadata is unavailable or unsafe.")
+        descriptor = os.open(os.fspath(path), flags | no_follow)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size < 0
+            or metadata.st_size > maximum
+        ):
+            raise _configuration_error("Local T3 metadata is unavailable or unsafe.")
+        if not no_follow and (
+            metadata.st_dev != before.st_dev or metadata.st_ino != before.st_ino
+        ):
+            raise _configuration_error("Local T3 metadata is unavailable or unsafe.")
+        return _read_bounded_descriptor(descriptor, maximum)
     except ConfigurationError:
         raise
     except Exception:
@@ -148,9 +193,9 @@ def _read_limited_file(path: pathlib.Path, maximum: int) -> bytes:
                 pass
 
 
-def _read_json_file(path: pathlib.Path, maximum: int) -> Any:
+def _read_local_json_file(path: pathlib.Path, maximum: int) -> Any:
     try:
-        return json.loads(_read_limited_file(path, maximum).decode("utf-8"))
+        return json.loads(_read_local_metadata_file(path, maximum).decode("utf-8"))
     except ConfigurationError:
         raise
     except Exception:
@@ -176,7 +221,7 @@ def _process_uid(pid: int) -> int | None:
 
 def _process_argv(pid: int) -> tuple[str, ...]:
     try:
-        raw = _read_limited_file(
+        raw = _read_proc_file(
             pathlib.Path(f"{PROC_ROOT}{pid}/cmdline"), MAX_PROCESS_ARGV_BYTES
         )
         parts = raw.split(b"\0")
@@ -196,7 +241,7 @@ def _process_exe(pid: int) -> pathlib.Path:
 
 def _process_start_time(pid: int) -> int:
     try:
-        raw = _read_limited_file(
+        raw = _read_proc_file(
             pathlib.Path(f"{PROC_ROOT}{pid}/stat"), MAX_PROCESS_ARGV_BYTES
         ).decode("ascii")
         closing_parenthesis = raw.rfind(")")
@@ -210,7 +255,7 @@ def _process_start_time(pid: int) -> int:
 
 
 def _runtime_pid(runtime: LocalRuntime) -> int:
-    state = _read_json_file(
+    state = _read_local_json_file(
         runtime.base_dir / "userdata" / "server-runtime.json",
         MAX_RUNTIME_JSON_BYTES,
     )
@@ -288,7 +333,7 @@ def _listener_socket_inodes(runtime: LocalRuntime) -> set[str]:
     target = f"{_proc_address(address)}:{port:04X}"
     wildcard = f"{'0' * len(_proc_address(address))}:{port:04X}"
     try:
-        lines = _read_limited_file(
+        lines = _read_proc_file(
             pathlib.Path(PROC_ROOT) / "net" / table_name, MAX_PROC_NET_BYTES
         ).decode("ascii").splitlines()
     except ConfigurationError:
@@ -367,7 +412,7 @@ def _connected_socket_inodes(sock: Any) -> set[str]:
     local = f"{_proc_address(server_address)}:{server_port:04X}"
     remote = f"{_proc_address(client_address)}:{client_port:04X}"
     try:
-        lines = _read_limited_file(
+        lines = _read_proc_file(
             pathlib.Path(PROC_ROOT) / "net" / table_name, MAX_PROC_NET_BYTES
         ).decode("ascii").splitlines()
     except ConfigurationError:
@@ -451,6 +496,8 @@ def _base_directory(value: Any) -> pathlib.Path:
         path = pathlib.Path(value).expanduser()
     else:
         raise _configuration_error("The configured T3 base directory is invalid.")
+    if not path.is_absolute():
+        raise _configuration_error("The configured T3 base directory is invalid.")
     try:
         return path.resolve(strict=False)
     except (OSError, RuntimeError):
@@ -504,7 +551,7 @@ def resolve_local_runtime(base_dir: Any = None) -> LocalRuntime:
     """Resolve a same-user live T3 runtime without performing network I/O."""
     root = _base_directory(base_dir)
     state_dir = root / "userdata"
-    runtime_state = _read_json_file(
+    runtime_state = _read_local_json_file(
         state_dir / "server-runtime.json", MAX_RUNTIME_JSON_BYTES
     )
     if not isinstance(runtime_state, dict):
@@ -538,7 +585,9 @@ def resolve_local_runtime(base_dir: Any = None) -> LocalRuntime:
         raise _configuration_error("The local T3 CLI entrypoint is unavailable.")
 
     package_root = cli_path.parents[3]
-    package = _read_json_file(package_root / "package.json", MAX_PACKAGE_JSON_BYTES)
+    package = _read_local_json_file(
+        package_root / "package.json", MAX_PACKAGE_JSON_BYTES
+    )
     if not isinstance(package, dict) or package.get("name") != "t3code-server":
         raise _configuration_error("The local T3 CLI package metadata is invalid.")
     server_version = _bounded_text(
@@ -548,7 +597,7 @@ def resolve_local_runtime(base_dir: Any = None) -> LocalRuntime:
         raise _configuration_error("The local T3 CLI version metadata is inconsistent.")
 
     try:
-        environment_id = _read_limited_file(
+        environment_id = _read_local_metadata_file(
             state_dir / "environment-id", MAX_ENVIRONMENT_ID_BYTES
         ).decode("utf-8").strip()
     except ConfigurationError:
@@ -734,41 +783,109 @@ def _safe_session_id(value: Any) -> str:
     return value
 
 
-def issue_local_session(runtime: LocalRuntime) -> LocalSession:
-    """Issue one validated five-minute administrative session in private memory."""
+def _list_local_session_ids(runtime: LocalRuntime) -> frozenset[str]:
     output = _run_cli(
         runtime,
         [
             "auth",
             "session",
-            "issue",
+            "list",
             "--json",
-            "--ttl",
-            "5m",
-            "--label",
-            "hermes-t3-control",
-            "--subject",
-            "hermes-t3-control",
             "--base-dir",
             str(runtime.base_dir),
         ],
         capture=True,
     )
     try:
-        issued = json.loads(output)
+        active = json.loads(output)
+        if not isinstance(active, list):
+            raise ValueError
+        session_ids = tuple(
+            _safe_session_id(item.get("sessionId"))
+            for item in active
+            if isinstance(item, dict)
+        )
+        if len(session_ids) != len(active) or len(set(session_ids)) != len(session_ids):
+            raise ValueError
+        return frozenset(session_ids)
     except Exception:
-        raise _configuration_error("The private T3 CLI returned an invalid session.") from None
-    if not isinstance(issued, dict):
-        raise _configuration_error("The private T3 CLI returned an invalid session.")
-    session_id = _safe_session_id(issued.get("sessionId"))
-    token = issued.get("token")
-    scopes = issued.get("scopes")
-    client_metadata = issued.get("client")
-    expires_at = issued.get("expiresAt")
+        raise _configuration_error(
+            "The private T3 session list was invalid."
+        ) from None
+
+
+def _cleanup_issued_session(
+    runtime: LocalRuntime,
+    previous_session_ids: frozenset[str],
+    session_id: str | None,
+) -> bool:
+    try:
+        if session_id is not None:
+            revoke_local_session(runtime, session_id)
+            return True
+        new_session_ids = _list_local_session_ids(runtime) - previous_session_ids
+        if not new_session_ids:
+            return True
+        # Never guess among concurrent issuances; the caller reports the bounded
+        # lease expiry when one exact cleanup target cannot be established.
+        if len(new_session_ids) != 1:
+            return False
+        revoke_local_session(runtime, next(iter(new_session_ids)))
+        return True
+    except Exception:
+        return False
+
+
+def issue_local_session(runtime: LocalRuntime) -> LocalSession:
+    """Issue one validated five-minute administrative session in private memory."""
+    previous_session_ids = _list_local_session_ids(runtime)
+    session_id: str | None = None
     safe_expiry: str | None = None
     try:
-        expiry = _parse_rfc3339(expires_at)
-        safe_expiry = expires_at
+        output = _run_cli(
+            runtime,
+            [
+                "auth",
+                "session",
+                "issue",
+                "--json",
+                "--ttl",
+                "5m",
+                "--label",
+                "hermes-t3-control",
+                "--subject",
+                "hermes-t3-control",
+                "--base-dir",
+                str(runtime.base_dir),
+            ],
+            capture=True,
+        )
+        try:
+            issued = json.loads(output)
+        except Exception:
+            raise _configuration_error(
+                "The private T3 CLI returned an invalid session."
+            ) from None
+        if not isinstance(issued, dict):
+            raise _configuration_error("The private T3 CLI returned an invalid session.")
+
+        expires_at = issued.get("expiresAt")
+        expiry: datetime | None = None
+        expiry_error: ConfigurationError | None = None
+        try:
+            expiry = _parse_rfc3339(expires_at)
+            safe_expiry = expires_at
+        except ConfigurationError as error:
+            expiry_error = error
+        session_id = _safe_session_id(issued.get("sessionId"))
+        if expiry_error is not None:
+            raise expiry_error
+        if expiry is None:
+            raise _configuration_error("The private T3 CLI returned an invalid session.")
+
+        token = issued.get("token")
+        scopes = issued.get("scopes")
+        client_metadata = issued.get("client")
         if (
             not is_valid_bearer_credential(token)
             or issued.get("method") != "bearer-access-token"
@@ -785,13 +902,20 @@ def issue_local_session(runtime: LocalRuntime) -> LocalSession:
             raise _configuration_error(
                 "The private T3 CLI returned an invalid session expiry."
             )
+        return LocalSession(
+            session_id=session_id,
+            token=token,
+            expires_at=expires_at,
+        )
     except ConfigurationError as error:
-        try:
-            revoke_local_session(runtime, session_id)
-        except Exception:
+        if not _cleanup_issued_session(runtime, previous_session_ids, session_id):
             _annotate_cleanup_error(error, safe_expiry)
         raise
-    return LocalSession(session_id=session_id, token=token, expires_at=expires_at)
+    except Exception:
+        error = _configuration_error("The private T3 CLI returned an invalid session.")
+        if not _cleanup_issued_session(runtime, previous_session_ids, session_id):
+            _annotate_cleanup_error(error, safe_expiry)
+        raise error from None
 
 
 def revoke_local_session(runtime: LocalRuntime, session_id: str) -> None:
@@ -820,28 +944,8 @@ def revoke_local_session(runtime: LocalRuntime, session_id: str) -> None:
         revoke_failed = True
 
     try:
-        output = _run_cli(
-            runtime,
-            [
-                "auth",
-                "session",
-                "list",
-                "--json",
-                "--base-dir",
-                str(runtime.base_dir),
-            ],
-            capture=True,
-        )
-        active = json.loads(output)
-        if not isinstance(active, list):
-            confirmed_absent = False
-        else:
-            active_ids = [
-                _safe_session_id(item.get("sessionId"))
-                for item in active
-                if isinstance(item, dict)
-            ]
-            confirmed_absent = len(active_ids) == len(active) and session_id not in active_ids
+        active_ids = _list_local_session_ids(runtime)
+        confirmed_absent = session_id not in active_ids
     except Exception:
         confirmed_absent = False
     if revoke_failed or not confirmed_absent:
