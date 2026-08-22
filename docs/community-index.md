@@ -25,7 +25,7 @@ Do not submit the entry to the non-existent repository or present the unmerged t
 
 ## Prepared entry
 
-[`community-index-entry.json`](community-index-entry.json) is valid schema-v1 entry metadata and pins the current public supported v1.2.0 release commit. It declares only the discovery capability `tools`; the plugin has no hooks, commands, dashboard, or tool overrides.
+[`community-index-entry.json`](community-index-entry.json) is valid schema-v1 entry metadata and pins the current public supported v1.2.1 release commit. It declares only the discovery capability `tools`; the plugin has no hooks, commands, dashboard, or tool overrides.
 
 When an official target exists:
 
