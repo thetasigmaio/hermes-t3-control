@@ -6,6 +6,10 @@ The mental model is ten tools in four steps: find a thread with `t3_threads`, in
 
 Compatibility: Hermes 0.20.4 and 0.20.5, Python 3.11-3.13, and T3 server contract `0.0.34-nightly.20260820.1141`. Manifest version 1 is deliberate because it is the newest manifest accepted by both supported Hermes installers. Released under the [MIT License](LICENSE).
 
+### v1.2 migration
+
+v1.2 intentionally replaces model-hostile legacy defaults with bounded agent views. A caller that still needs the v1.0/v1.1 shell result must request `t3_threads {"view":"raw"}`; a caller that needs the legacy exact detail must request `t3_thread_read {"thread_id":"...","view":"raw"}`. The tool names and legacy raw payloads remain available, but omitted `view` now means compact/material. Sending also becomes fail-closed: default `reject` is observation-only, while an explicit `queue` acknowledges that T3 may start or queue the exact message.
+
 ## Quick setup
 
 Work in the intended Hermes profile and keep the default scanner enabled:
@@ -65,7 +69,7 @@ Use this literal non-thread-mutating first check operator prompt. Local authenti
 
 ## Find and read the right thread
 
-`t3_threads` returns compact summaries by default. Filters are optional and combined. A human selector such as project `solarsim` plus a title query can require exactly one result; zero or multiple matches fail closed, and the plugin never silently chooses by fuzzy title.
+`t3_threads` returns compact project summaries—including projects with no threads—and compact thread summaries by default. Filters are optional and combined. A human selector such as project `solarsim` plus a title query can require exactly one thread result; zero or multiple matches fail closed, and the plugin never silently chooses by fuzzy title.
 
 Example for `t3_threads`:
 
@@ -94,7 +98,7 @@ The material summary includes project/workspace, title, model and modes, lifecyc
 
 ## Continue and monitor one exact thread
 
-Sending continues the same stored thread. It preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree, and it never creates a replacement thread. `busy_policy` defaults to `reject`; select `queue` only when an additional accepted turn is intentional.
+Sending continues the same stored thread. It preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree, and it never creates a replacement thread. `busy_policy` defaults to `reject`, which is an observation-only check and never dispatches: pinned T3 has no atomic idle guard, so a pre-read cannot promise that an idle thread stays idle. An explicit `queue` acknowledges that T3 may start or queue the exact message and is required for every actual send.
 
 Example for `t3_thread_send`:
 
@@ -102,11 +106,11 @@ Example for `t3_thread_send`:
 {
   "thread_id": "exact-thread-id",
   "message": "Continue the assigned goal and report only material progress.",
-  "busy_policy": "reject"
+  "busy_policy": "queue"
 }
 ```
 
-Observed command states distinguish `started`, `queued`, `completed`, `blocked`, `error`, and `accepted_pending_projection`. A busy rejection is unambiguous and performs no dispatch.
+Observed command states distinguish `started`, `queued`, `completed`, `blocked`, `error`, and `accepted_pending_projection`. A `reject` result is unambiguous and performs no dispatch even after an idle observation. A full-access send repeats the file-modification/deletion warning at the point of action.
 
 Wait without dumping snapshots. `timeout_seconds` 0-30 is bounded; `after_thread_sequence` makes progress checks incremental. Provider liveness and work progress are separate fields.
 
@@ -123,7 +127,9 @@ Example for `t3_thread_wait`:
 
 The result reports progress, action required, settlement, or timeout with a compact material delta and one non-duplicated latest assistant update; it never embeds the full thread snapshot. A timeout says nothing was observed in the bounded window; it does not declare provider failure.
 
-Pending actions are typed and exact-request scoped. Use `decision` for an approval request or `answers` for a user-input request; a stale, mismatched, missing, or ambiguous request is rejected before dispatch. For an approval, replace `answers` below with `"decision": "accept"` or `"decision": "decline"`.
+Pending actions are typed and scoped by exact request ID and expected turn ID. Supply the pending request's exact `turn_id`; the handler checks it against the current active turn twice before dispatch. Pinned T3 has no atomic expected-turn guard in its response command, so this remains a disclosed best-effort current-session response with a narrow residual same-user race. A stale, mismatched, missing, changed, or ambiguous request is rejected before dispatch. Use `decision` for an approval request or `answers` for a user-input request.
+
+Approval decisions have distinct scope: `accept` answers this request once; `acceptForSession` also authorizes matching requests for the current provider session; `decline` refuses once; `cancel` requests cancellation where the provider supports it. For an approval, replace `answers` below with `"decision": "accept"` or `"decision": "decline"`.
 
 The response is a compact receipt containing the exact request, thread, command, and verification/reconciliation IDs. It never embeds the raw thread detail.
 
@@ -133,6 +139,7 @@ Example for `t3_thread_respond`:
 {
   "thread_id": "exact-thread-id",
   "request_id": "pending-user-input-request-id",
+  "turn_id": "pending-request-turn-id",
   "answers": {
     "scope": "Focused"
   }
@@ -175,7 +182,7 @@ Example for `t3_thread_implement_plan`:
 }
 ```
 
-The tool verifies the native transition to interaction mode `default`, revalidates the unchanged plan, and starts the same-thread turn with `sourceProposedPlan`. If the mode transition is only accepted pending projection, it stops before dispatching the implementation turn and returns a safe reconciliation path.
+The tool verifies the native transition to interaction mode `default`, revalidates the unchanged plan, and starts the same-thread turn with `sourceProposedPlan`. If the mode transition is only accepted pending projection, it stops before dispatching the implementation turn and returns a safe reconciliation path. A full-access Plan implementation repeats the file-modification/deletion warning at the point of action.
 
 ## Ten-tool reference
 
@@ -186,21 +193,23 @@ Every handler rejects unknown fields and returns sanitized JSON. Results contain
 | `t3_threads` | Filtered compact summaries by default; bounded explicit `raw` view. |
 | `t3_thread_read` | Exact bounded material summary by default; optional raw page and cursor. |
 | `t3_thread_create` | Create one native thread, optionally with one verified initial turn. |
-| `t3_thread_send` | Continue the same thread; `busy_policy` defaults to `reject`. |
+| `t3_thread_send` | `reject` is observation-only; explicit `queue` acknowledges start-or-queue. |
 | `t3_thread_set_mode` | Set exactly one stored runtime or interaction mode. |
 | `t3_thread_implement_plan` | Strict same-thread stored-plan transition and implementation. |
 | `t3_turn_interrupt` | Best-effort interrupt of the provider session current for the exact thread. |
 | `t3_session_stop` | Best-effort stop without deleting or replacing the thread. |
 | `t3_thread_wait` | Wait for change/running/blocked/terminal/error with `timeout_seconds` 0-30. |
-| `t3_thread_respond` | Answer one pending request by exact request ID and type. |
+| `t3_thread_respond` | Best-effort current-session response by request and expected turn IDs. |
 
-Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`. Messages are trimmed and limited to 120000 JavaScript UTF-16 code units. Identifiers and titles are limited to 512 characters, cursors and worktree paths to 4096, compact lists to 50, and model options to 64 unique entries.
+Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`. Messages are trimmed and limited to 120000 JavaScript UTF-16 code units. Identifiers and titles are limited to 512 characters, cursors and worktree paths to 4096, compact lists to 50, and model options to 64 unique entries. Default model-facing text is truncated with explicit metadata: latest messages and errors at 8192 UTF-16 units, actionable plan Markdown at 16384, and nested material collections at 32 items/depth 5. Explicit bounded `raw` reads remain available for the full server text.
 
 ## Safety and recovery
 
 `full-access` permits trusted provider work to execute commands and modify or delete files without approval. Use it only for a trusted provider and checkout. A persisted runtime-mode change cannot cancel or retroactively authorize an approval already pending for a started turn.
 
 Each mutation uses a fresh UUIDv4 command ID and immutable canonical body. A genuinely ambiguous transport retry reuses the same command ID and byte-identical command. Never resend after a successful dispatch response merely because read projection is late.
+
+The pinned T3 command schema has no atomic idle guard. Therefore `busy_policy: reject` never dispatches; use `queue` only when either immediate start or an exact verified queue is acceptable. Its pending-response commands also have no atomic expected-turn guard. `t3_thread_respond` performs two exact current-turn readbacks and labels every receipt best-effort; do not use it where a mutually distrusted local actor can race the same T3 thread.
 
 After acceptance, the plugin reconciles the exact command or message identity for a 15-second projection window. `accepted_pending_projection` is not a failure: it includes the command ID, message ID where applicable, target, and an exact bounded `t3_thread_read` raw reconciliation recipe with `required_snapshot_sequence` and, for a turn, `expected_message_id`. Retrying it as a new send can create duplicate work.
 
@@ -245,7 +254,15 @@ Local mode resolves same-user bounded runtime metadata, a numeric loopback origi
 
 The current upstream CLI issues eight administrative scopes, including `orchestration:read` and `orchestration:operate`; it cannot yet mint a narrower orchestration-only session. The plugin limits that credential to one bounded operation and its four HTTP routes. This upstream scope breadth is the main local-auth residual risk.
 
-For an operator-isolated headless or local deployment where `local-cli` is unavailable, select `external-token`, configure an explicit numeric-loopback `base_url`, and provision a profile-scoped `T3_ORCHESTRATION_TOKEN` through the deployment's Hermes secret facility. Prefer a short-lived token limited to `orchestration:read` and `orchestration:operate`. Do not place credentials in plugin settings, shell history, command arguments, logs, or repository files.
+For an operator-isolated headless or local deployment where `local-cli` is unavailable, configure the two non-secret settings exactly:
+
+```bash
+hermes config set plugins.entries.hermes-t3-control.settings.auth_mode external-token
+hermes config set plugins.entries.hermes-t3-control.settings.base_url http://127.0.0.1:3773
+hermes config env-path
+```
+
+Provision a profile-scoped `T3_ORCHESTRATION_TOKEN` at the printed environment path through the deployment's Hermes secret facility; do not paste it into the command line. Prefer a short-lived token limited to `orchestration:read` and `orchestration:operate`. Do not place credentials in plugin settings, shell history, command arguments, logs, or repository files.
 
 ## Published asset verification
 

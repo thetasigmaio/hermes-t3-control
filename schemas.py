@@ -118,11 +118,20 @@ T3_THREAD_CREATE_SCHEMA = _schema(
 
 T3_THREAD_SEND_SCHEMA = _schema(
     "t3_thread_send",
-    "Start a new turn on the supplied existing T3 thread, including after provider-session stop.",
+    "Continue one existing thread only with explicit start-or-queue acknowledgement; stored full-access can modify or delete files without approval.",
     {
         "thread_id": dict(_ID),
         "message": dict(_MESSAGE),
-        "busy_policy": {"type": "string", "enum": ["reject", "queue"], "default": "reject"},
+        "busy_policy": {
+            "type": "string",
+            "enum": ["reject", "queue"],
+            "default": "reject",
+            "description": (
+                "reject is an observation-only safety check and never dispatches because "
+                "T3 has no atomic idle guard; queue explicitly acknowledges that T3 may "
+                "start or queue the exact message."
+            ),
+        },
     },
     ["thread_id", "message"],
 )
@@ -149,13 +158,22 @@ T3_THREAD_WAIT_SCHEMA = _schema(
 
 T3_THREAD_RESPOND_SCHEMA = _schema(
     "t3_thread_respond",
-    "Respond to one exact pending approval or user-input request after fail-closed readback.",
+    "Perform a best-effort response to one request on the expected current provider session after two fail-closed readbacks; T3 has no atomic expected-turn guard.",
     {
         "thread_id": dict(_ID),
         "request_id": dict(_ID),
+        "turn_id": {
+            **_ID,
+            "description": "Exact current active turn observed with the pending request.",
+        },
         "decision": {
             "type": "string",
             "enum": ["accept", "acceptForSession", "decline", "cancel"],
+            "description": (
+                "accept answers once; acceptForSession authorizes matching requests for "
+                "the current provider session; decline refuses once; cancel cancels the "
+                "current request when the provider supports it."
+            ),
         },
         "answers": {
             "type": "object",
@@ -185,7 +203,7 @@ T3_THREAD_RESPOND_SCHEMA = _schema(
             },
         },
     },
-    ["thread_id", "request_id"],
+    ["thread_id", "request_id", "turn_id"],
 )
 T3_THREAD_RESPOND_SCHEMA["parameters"]["oneOf"] = [
     {"required": ["decision"]},
@@ -209,7 +227,7 @@ T3_THREAD_SET_MODE_SCHEMA["parameters"]["oneOf"] = [
 
 T3_THREAD_IMPLEMENT_PLAN_SCHEMA = _schema(
     "t3_thread_implement_plan",
-    "Verify and implement one stored unimplemented T3 proposed plan on the same thread through the native Plan-to-Build transition.",
+    "Verify and implement one stored plan on the same thread; stored full-access can modify or delete files without approval.",
     {"thread_id": dict(_ID), "plan_id": dict(_ID)},
     ["thread_id", "plan_id"],
 )

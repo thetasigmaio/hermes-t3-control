@@ -97,10 +97,12 @@ class AgentFacingSchemaTests(unittest.TestCase):
 
         send = self.properties("t3_thread_send")
         self.assertEqual(set(send), {"thread_id", "message", "busy_policy"})
-        self.assertEqual(
-            send["busy_policy"],
-            {"type": "string", "enum": ["reject", "queue"], "default": "reject"},
-        )
+        self.assertEqual(send["busy_policy"]["type"], "string")
+        self.assertEqual(send["busy_policy"]["enum"], ["reject", "queue"])
+        self.assertEqual(send["busy_policy"]["default"], "reject")
+        self.assertIn("never dispatches", send["busy_policy"]["description"])
+        self.assertIn("may start or queue", send["busy_policy"]["description"])
+        self.assertIn("full-access", schemas.SCHEMAS["t3_thread_send"]["description"])
         self.assertEqual(
             schemas.SCHEMAS["t3_thread_send"]["parameters"]["required"],
             ["thread_id", "message"],
@@ -150,7 +152,7 @@ class AgentFacingSchemaTests(unittest.TestCase):
         properties = parameters["properties"]
         self.assertEqual(
             set(properties),
-            {"thread_id", "request_id", "decision", "answers"},
+            {"thread_id", "request_id", "turn_id", "decision", "answers"},
         )
         self.assertEqual(
             properties["decision"]["enum"],
@@ -187,7 +189,12 @@ class AgentFacingSchemaTests(unittest.TestCase):
                 ]
             },
         )
-        self.assertEqual(parameters["required"], ["thread_id", "request_id"])
+        self.assertEqual(
+            parameters["required"], ["thread_id", "request_id", "turn_id"]
+        )
+        self.assertIn("best-effort", respond_schema["description"])
+        self.assertIn("current provider session", respond_schema["description"])
+        self.assertIn("session", properties["decision"]["description"])
         self.assertEqual(
             parameters["oneOf"],
             [
@@ -200,6 +207,9 @@ class AgentFacingSchemaTests(unittest.TestCase):
         description = schemas.SCHEMAS["t3_thread_set_mode"]["description"]
         self.assertIn("full-access", description)
         self.assertIn("modify or delete files without approval", description)
+        implement_description = schemas.SCHEMAS["t3_thread_implement_plan"]["description"]
+        self.assertIn("full-access", implement_description)
+        self.assertIn("modify or delete files without approval", implement_description)
 
     def test_every_public_string_remains_explicitly_preflight_compatible(self) -> None:
         string_paths: set[tuple[str, ...]] = set()
@@ -237,6 +247,7 @@ class AgentFacingSchemaTests(unittest.TestCase):
             ("t3_thread_wait", "properties", "until"),
             ("t3_thread_respond", "properties", "thread_id"),
             ("t3_thread_respond", "properties", "request_id"),
+            ("t3_thread_respond", "properties", "turn_id"),
             ("t3_thread_respond", "properties", "decision"),
         }
         self.assertTrue(required_new_paths <= string_paths)

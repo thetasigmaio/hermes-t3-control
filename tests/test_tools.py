@@ -363,6 +363,33 @@ class AgentFacingReadToolTests(unittest.TestCase):
         self.assertIn("interaction_mode", first)
         self.assertIn("latest_user_message_at", first)
 
+    def test_threads_compact_lists_empty_projects_without_raw_shell(self) -> None:
+        shell = self._compact_shell()
+        shell["projects"].append(
+            {
+                "id": "project-empty",
+                "title": "Empty fixture",
+                "workspaceRoot": "/work/empty",
+                "defaultModelSelection": copy.deepcopy(
+                    shell["projects"][0]["defaultModelSelection"]
+                ),
+            }
+        )
+        with LoopbackServer([Response(value=shell)]) as server:
+            result = invoke(server, tools.t3_threads, {"limit": 50})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["project_count"], 3)
+        self.assertFalse(result["projects_truncated"])
+        self.assertIn(
+            {
+                "id": "project-empty",
+                "title": "Empty fixture",
+                "workspace": "/work/empty",
+            },
+            result["projects"],
+        )
+
     def test_threads_explicit_raw_is_legacy_exact_and_require_one_fails_closed(self) -> None:
         shell = self._compact_shell()
         with LoopbackServer([Response(value=shell)]) as server:
@@ -564,6 +591,43 @@ class AgentFacingReadToolTests(unittest.TestCase):
             sorted(request["method"] for request in server.requests),
             ["GET", "GET"],
         )
+
+    def test_material_projection_truncates_model_facing_text_with_metadata(self) -> None:
+        oversized = "x" * 20_000
+        current_session = session(status="error")
+        current_session["lastError"] = oversized
+        detail = detail_snapshot(
+            sequence=12,
+            messages=[
+                message(
+                    message_id="assistant-large",
+                    text=oversized,
+                    turn_id="turn-1",
+                )
+            ],
+            turn=latest_turn(),
+            current_session=current_session,
+            proposed_plans=[proposed_plan(plan_markdown=oversized)],
+        )
+        detail["thread"]["messages"][0]["role"] = "assistant"
+        with LoopbackServer(
+            [Response(value=shell_snapshot(sequence=12)), Response(value=detail)]
+        ) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+
+        projected = result["thread"]
+        assistant = projected["latest_assistant_update"]
+        self.assertLessEqual(len(assistant["text"]), 8_192)
+        self.assertTrue(assistant["text_truncated"])
+        self.assertEqual(assistant["text_original_utf16_units"], 20_000)
+        self.assertLessEqual(len(projected["actionable_plan"]["plan_markdown"]), 16_384)
+        self.assertTrue(projected["actionable_plan"]["plan_markdown_truncated"])
+        self.assertLessEqual(len(projected["last_error"]), 8_192)
+        self.assertTrue(projected["last_error_truncated"])
 
     def test_material_read_drops_request_resolved_by_later_unsequenced_activity(self) -> None:
         requested = activity(
@@ -820,6 +884,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             "t3_thread_respond": {
                 "thread_id": "thread-1",
                 "request_id": "approval-1",
+                "turn_id": "turn-1",
                 "decision": "accept",
             },
         }
@@ -854,7 +919,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             ("t3_thread_wait", ("until",)): "terminal",
             ("t3_thread_respond", ("decision",)): "accept",
         }
-        self.assertEqual(len(public_string_paths), 35)
+        self.assertEqual(len(public_string_paths), 36)
 
         with LoopbackServer([]) as server:
             for tool_name, field_path in sorted(public_string_paths):
@@ -917,6 +982,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             "t3_thread_respond": {
                 "thread_id": "thread-1",
                 "request_id": "approval-1",
+                "turn_id": "turn-1",
                 "decision": "accept",
             },
         }
@@ -1022,6 +1088,77 @@ class AgentFacingSendToolTests(unittest.TestCase):
             )
         self.assertEqual(result["error_code"], "conflict")
         self.assertEqual([request["method"] for request in server.requests], ["GET"])
+
+    def test_send_reject_policy_never_dispatches_even_after_idle_observation(self) -> None:
+        idle = detail_snapshot(
+            sequence=3,
+            turn=latest_turn(turn_id="turn-old", state="completed"),
+            current_session=session(status="ready"),
+        )
+        with LoopbackServer(
+            [Response(value=idle), Response(status=400, value={"code": "must-not-post"})]
+        ) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Only send with explicit start-or-queue acknowledgement",
+                    "busy_policy": "reject",
+                },
+            )
+
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertIn("busy_policy queue", result["error"])
+        self.assertEqual([request["method"] for request in server.requests], ["GET"])
+
+    def test_send_queue_discloses_full_access_and_concurrent_queue_semantics(self) -> None:
+        commands: list[dict] = []
+        before = detail_snapshot(
+            sequence=3,
+            turn=latest_turn(turn_id="turn-old", state="completed"),
+            current_session=session(status="ready"),
+        )
+        before["thread"]["runtimeMode"] = "full-access"
+
+        def dispatch(request: dict) -> Response:
+            commands.append(json.loads(request["body"]))
+            return Response(value={"sequence": 4})
+
+        def queued(_request: dict) -> Response:
+            command = commands[0]
+            after = detail_snapshot(
+                sequence=4,
+                messages=[
+                    projected_message(
+                        message_id=command["message"]["messageId"],
+                        role="user",
+                        text=command["message"]["text"],
+                        turn_id=None,
+                        created_at=command["createdAt"],
+                    )
+                ],
+                turn=latest_turn(turn_id="turn-raced", state="running"),
+                current_session=session(status="running", active_turn_id="turn-raced"),
+            )
+            after["thread"]["runtimeMode"] = "full-access"
+            return Response(value=after)
+
+        with LoopbackServer([Response(value=before), dispatch, queued]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Explicitly allow start or queue",
+                    "busy_policy": "queue",
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["command_state"], "queued")
+        self.assertIn("may start immediately or queue", result["queue_semantics"])
+        self.assertIn("modify or delete files without approval", result["warning"])
 
     def test_send_queue_accepts_only_exact_persisted_unlinked_message(self) -> None:
         commands: list[dict] = []
@@ -1156,7 +1293,11 @@ class AgentFacingSendToolTests(unittest.TestCase):
                     result = invoke(
                         server,
                         tools.t3_thread_send,
-                        {"thread_id": "thread-1", "message": "Run"},
+                        {
+                            "thread_id": "thread-1",
+                            "message": "Run",
+                            "busy_policy": "queue",
+                        },
                     )
                 self.assertTrue(result["ok"])
                 self.assertIn("command_state", result)
@@ -1295,10 +1436,14 @@ class AgentFacingWaitToolTests(unittest.TestCase):
             set(result["material_delta"]),
             {
                 "pending_requests",
+                "pending_requests_truncated",
                 "last_error",
+                "last_error_truncated",
+                "last_error_original_utf16_units",
                 "latest_user_update",
                 "actionable_plan",
                 "plan_progress",
+                "plan_progress_truncated",
                 "updated_at",
                 "settled_at",
             },
@@ -1414,7 +1559,8 @@ class AgentFacingRespondToolTests(unittest.TestCase):
             return Response(value={"sequence": 5})
 
         with LoopbackServer(
-            [Response(value=before), dispatch] + [Response(value=after)] * 12
+            [Response(value=before), Response(value=before), dispatch]
+            + [Response(value=after)] * 12
         ) as server:
             transport = tools.T3Client(
                 server.base_url,
@@ -1429,9 +1575,81 @@ class AgentFacingRespondToolTests(unittest.TestCase):
                 result = invoke(
                     server,
                     tools.OPERATIONS["t3_thread_respond"],
-                    {"thread_id": "thread-1", **response_args},
+                    {
+                        "thread_id": "thread-1",
+                        "turn_id": "turn-1",
+                        **response_args,
+                    },
                 )
         return result, commands
+
+    def test_respond_requires_explicit_expected_turn_before_http(self) -> None:
+        with LoopbackServer([]) as server:
+            result = invoke(
+                server,
+                tools.OPERATIONS["t3_thread_respond"],
+                {
+                    "thread_id": "thread-1",
+                    "request_id": "approval-open",
+                    "decision": "accept",
+                },
+            )
+
+        self.assertEqual(result["error_code"], "invalid_input")
+        self.assertEqual(server.requests, [])
+
+    def test_respond_revalidates_current_turn_before_non_atomic_dispatch(self) -> None:
+        old_request = activity(
+            activity_id="approval-old",
+            kind="approval.requested",
+            payload={
+                "requestId": "reused-request",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+            turn_id="turn-1",
+        )
+        newer_request = copy.deepcopy(old_request)
+        newer_request.update(
+            {
+                "id": "approval-new",
+                "sequence": 5,
+                "createdAt": "2026-08-21T12:00:01Z",
+                "turnId": "turn-2",
+            }
+        )
+        before = self._pending_detail(old_request, sequence=4)
+        changed = with_projection_fields(
+            detail_snapshot(
+                sequence=5,
+                turn=latest_turn(turn_id="turn-2", state="running"),
+                current_session=session(status="running", active_turn_id="turn-2"),
+            ),
+            thread_sequence=5,
+        )
+        changed["thread"]["activities"] = [newer_request]
+
+        with LoopbackServer(
+            [Response(value=before), Response(value=changed)]
+        ) as server:
+            result = invoke(
+                server,
+                tools.OPERATIONS["t3_thread_respond"],
+                {
+                    "thread_id": "thread-1",
+                    "request_id": "reused-request",
+                    "turn_id": "turn-1",
+                    "decision": "accept",
+                },
+            )
+
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertEqual(
+            [request["method"] for request in server.requests],
+            ["GET", "GET"],
+        )
 
     def test_respond_dispatches_exact_typed_approval_or_user_input_command(self) -> None:
         approval = activity(
@@ -1466,14 +1684,22 @@ class AgentFacingRespondToolTests(unittest.TestCase):
         cases = (
             (
                 approval,
-                {"request_id": "approval-open", "decision": "acceptForSession"},
+                {
+                    "request_id": "approval-open",
+                    "turn_id": "turn-1",
+                    "decision": "acceptForSession",
+                },
                 "thread.approval.respond",
                 {"decision": "acceptForSession"},
                 "approval.resolved",
             ),
             (
                 user_input,
-                {"request_id": "input-open", "answers": {"scope": "Focused"}},
+                {
+                    "request_id": "input-open",
+                    "turn_id": "turn-1",
+                    "answers": {"scope": "Focused"},
+                },
                 "thread.user-input.respond",
                 {"answers": {"scope": "Focused"}},
                 "user-input.resolved",
@@ -1512,12 +1738,16 @@ class AgentFacingRespondToolTests(unittest.TestCase):
                     )
 
                 with LoopbackServer(
-                    [Response(value=before), dispatch, readback]
+                    [Response(value=before), Response(value=before), dispatch, readback]
                 ) as server:
                     result = invoke(
                         server,
                         tools.OPERATIONS["t3_thread_respond"],
-                        {"thread_id": "thread-1", **response_args},
+                        {
+                            "thread_id": "thread-1",
+                            "turn_id": "turn-1",
+                            **response_args,
+                        },
                     )
                 self.assertTrue(result["ok"])
                 self.assertTrue(result["accepted"])
@@ -2073,6 +2303,13 @@ class AgentFacingRespondToolTests(unittest.TestCase):
             late_old_resolution,
             sequence=5,
         )
+        for detail in (before, after):
+            detail["thread"]["latestTurn"] = latest_turn(
+                turn_id="turn-new", state="running"
+            )
+            detail["thread"]["session"] = session(
+                status="running", active_turn_id="turn-new"
+            )
         with mock.patch.object(
             tools,
             "_now_rfc3339",
@@ -2081,7 +2318,11 @@ class AgentFacingRespondToolTests(unittest.TestCase):
             result, commands = self._invoke_with_short_projection_window(
                 before,
                 after,
-                {"request_id": "reused-id", "decision": "accept"},
+                {
+                    "request_id": "reused-id",
+                    "turn_id": "turn-new",
+                    "decision": "accept",
+                },
             )
 
         self.assertTrue(result["ok"])
@@ -2250,7 +2491,11 @@ class AgentFacingRespondToolTests(unittest.TestCase):
                     result = invoke(
                         server,
                         tools.OPERATIONS["t3_thread_respond"],
-                        {"thread_id": "thread-1", **response_args},
+                        {
+                            "thread_id": "thread-1",
+                            "turn_id": "turn-1",
+                            **response_args,
+                        },
                     )
                 self.assertEqual(result["error_code"], "conflict")
                 self.assertEqual([request["method"] for request in server.requests], ["GET"])
@@ -2712,8 +2957,16 @@ class MutationToolTests(unittest.TestCase):
                 observed(1),
             ]
         ) as server:
-            first = invoke(server, tools.t3_thread_send, {"thread_id": "thread-1", "message": " one "})
-            second = invoke(server, tools.t3_thread_send, {"thread_id": "thread-1", "message": "two"})
+            first = invoke(
+                server,
+                tools.t3_thread_send,
+                {"thread_id": "thread-1", "message": " one ", "busy_policy": "queue"},
+            )
+            second = invoke(
+                server,
+                tools.t3_thread_send,
+                {"thread_id": "thread-1", "message": "two", "busy_policy": "queue"},
+            )
         self.assertTrue(first["ok"] and second["ok"])
         self.assertEqual([item["type"] for item in commands], ["thread.turn.start"] * 2)
         self.assertNotEqual(commands[0]["commandId"], commands[1]["commandId"])
@@ -2739,7 +2992,11 @@ class MutationToolTests(unittest.TestCase):
             result = invoke(
                 server,
                 tools.t3_thread_send,
-                {"thread_id": "thread-1", "message": "Continue"},
+                {
+                    "thread_id": "thread-1",
+                    "message": "Continue",
+                    "busy_policy": "queue",
+                },
             )
         self.assertEqual(result["error_code"], "mutation_ambiguous")
         self.assertTrue(result["outcome_ambiguous"])
@@ -2871,10 +3128,12 @@ class MutationToolTests(unittest.TestCase):
         plan = proposed_plan(plan_markdown="  ## Exact plan\n\nDo the work.  ")
         before = detail_snapshot(sequence=1, proposed_plans=[plan])
         before["thread"]["interactionMode"] = "default"
+        before["thread"]["runtimeMode"] = "full-access"
 
         def mode_readback(request: dict) -> Response:
             detail = detail_snapshot(sequence=1, proposed_plans=[plan])
             detail["thread"]["interactionMode"] = "default"
+            detail["thread"]["runtimeMode"] = "full-access"
             return Response(value=detail)
 
         def implementation_readback(request: dict) -> Response:
@@ -2900,6 +3159,7 @@ class MutationToolTests(unittest.TestCase):
                 proposed_plans=[implemented],
             )
             detail["thread"]["interactionMode"] = "default"
+            detail["thread"]["runtimeMode"] = "full-access"
             return Response(value=detail)
 
         with LoopbackServer(
@@ -2939,6 +3199,7 @@ class MutationToolTests(unittest.TestCase):
             commands[1]["sourceProposedPlan"],
         )
         self.assertIn("at-most-once", result["race_semantics"])
+        self.assertIn("modify or delete files without approval", result["warning"])
 
     def test_plan_halts_when_mode_is_accepted_pending_projection(self) -> None:
         commands: list[dict] = []

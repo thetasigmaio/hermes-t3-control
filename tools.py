@@ -87,6 +87,19 @@ MAX_UPDATED_WITHIN_MINUTES = 10_080
 MAX_COMPACT_LIMIT = 50
 MAX_WAIT_SECONDS = 30
 MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
+MAX_MODEL_TEXT_UTF16_UNITS = 8_192
+MAX_MODEL_PLAN_UTF16_UNITS = 16_384
+MAX_MODEL_COLLECTION_ITEMS = 32
+MAX_MODEL_PROJECTION_DEPTH = 5
+QUEUE_SEMANTICS = (
+    "Explicit busy_policy queue acknowledges that T3 may start immediately or queue "
+    "the exact persisted message; the server has no atomic idle guard."
+)
+RESPONSE_RACE_WARNING = (
+    "T3 has no atomic expected-turn guard for pending responses. This best-effort "
+    "current provider session response was revalidated immediately before dispatch; "
+    "a residual same-user race remains."
+)
 AUTH_CLEANUP_FAILURE_WARNING = (
     "Temporary T3 authentication cleanup could not be confirmed. The short-lived "
     "session expires automatically. Do not repeat an accepted mutation before "
@@ -380,9 +393,62 @@ def _normalized_project(project: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _truncate_utf16(value: str, maximum: int) -> tuple[str, bool, int]:
+    units = sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+    if units <= maximum:
+        return value, False, units
+    consumed = 0
+    end = 0
+    for end, character in enumerate(value, start=1):
+        width = 2 if ord(character) > 0xFFFF else 1
+        if consumed + width > maximum:
+            end -= 1
+            break
+        consumed += width
+    return value[:end], True, units
+
+
+def _bounded_model_value(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
+    if isinstance(value, str):
+        projected, truncated, _units = _truncate_utf16(
+            value, MAX_MODEL_TEXT_UTF16_UNITS
+        )
+        return projected, truncated
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    if depth >= MAX_MODEL_PROJECTION_DEPTH:
+        return None, True
+    if isinstance(value, list):
+        projected_items: list[Any] = []
+        truncated = len(value) > MAX_MODEL_COLLECTION_ITEMS
+        for item in value[:MAX_MODEL_COLLECTION_ITEMS]:
+            projected, item_truncated = _bounded_model_value(item, depth=depth + 1)
+            projected_items.append(projected)
+            truncated = truncated or item_truncated
+        return projected_items, truncated
+    if isinstance(value, dict):
+        projected_items: dict[str, Any] = {}
+        entries = list(value.items())
+        truncated = len(entries) > MAX_MODEL_COLLECTION_ITEMS
+        for key, item in entries[:MAX_MODEL_COLLECTION_ITEMS]:
+            projected, item_truncated = _bounded_model_value(item, depth=depth + 1)
+            projected_items[key] = projected
+            truncated = truncated or item_truncated
+        return projected_items, truncated
+    return None, True
+
+
 def _normalized_session(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
+    last_error = value["lastError"]
+    projected_error: Any = last_error
+    error_truncated = False
+    error_units = 0
+    if isinstance(last_error, str):
+        projected_error, error_truncated, error_units = _truncate_utf16(
+            last_error, MAX_MODEL_TEXT_UTF16_UNITS
+        )
     return {
         "thread_id": value["threadId"],
         "status": value["status"],
@@ -390,7 +456,9 @@ def _normalized_session(value: Any) -> dict[str, Any] | None:
         "provider_instance_id": value.get("providerInstanceId"),
         "runtime_mode": value["runtimeMode"],
         "active_turn_id": value["activeTurnId"],
-        "last_error": value["lastError"],
+        "last_error": projected_error,
+        "last_error_truncated": error_truncated,
+        "last_error_original_utf16_units": error_units,
         "updated_at": value["updatedAt"],
     }
 
@@ -418,9 +486,14 @@ def _normalized_latest_turn(value: Any) -> dict[str, Any] | None:
 def _normalized_message(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
+    text, truncated, original_units = _truncate_utf16(
+        value["text"], MAX_MODEL_TEXT_UTF16_UNITS
+    )
     return {
         "id": value["id"],
-        "text": value["text"],
+        "text": text,
+        "text_truncated": truncated,
+        "text_original_utf16_units": original_units,
         "turn_id": value["turnId"],
         "streaming": value["streaming"],
         "created_at": value["createdAt"],
@@ -587,10 +660,15 @@ def _actionable_plan(thread: dict[str, Any]) -> dict[str, Any] | None:
     if not candidates:
         return None
     value = max(candidates, key=lambda item: (item["updatedAt"], item["id"]))
+    markdown, truncated, original_units = _truncate_utf16(
+        value["planMarkdown"], MAX_MODEL_PLAN_UTF16_UNITS
+    )
     return {
         "id": value["id"],
         "turn_id": value["turnId"],
-        "plan_markdown": value["planMarkdown"],
+        "plan_markdown": markdown,
+        "plan_markdown_truncated": truncated,
+        "plan_markdown_original_utf16_units": original_units,
         "implemented_at": value["implementedAt"],
         "implementation_thread_id": value["implementationThreadId"],
         "created_at": value["createdAt"],
@@ -598,11 +676,14 @@ def _actionable_plan(thread: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _plan_progress(thread: dict[str, Any]) -> Any:
+def _plan_progress(thread: dict[str, Any]) -> tuple[Any, bool]:
     updates = [item for item in thread.get("activities", []) if item["kind"] == "turn.plan.updated"]
     if not updates:
-        return None
-    return copy.deepcopy(max(updates, key=_activity_order)["payload"])
+        return None, False
+    projected, truncated = _bounded_model_value(
+        max(updates, key=_activity_order)["payload"]
+    )
+    return projected, truncated
 
 
 def _last_error(thread: dict[str, Any]) -> str | None:
@@ -619,6 +700,13 @@ def _last_error(thread: dict[str, Any]) -> str | None:
         if isinstance(payload.get(field), str):
             return payload[field]
     return None
+
+
+def _projected_last_error(thread: dict[str, Any]) -> tuple[str | None, bool, int]:
+    value = _last_error(thread)
+    if value is None:
+        return None, False, 0
+    return _truncate_utf16(value, MAX_MODEL_TEXT_UTF16_UNITS)
 
 
 def _thread_state(
@@ -649,6 +737,7 @@ def _compact_thread(thread: dict[str, Any], project: dict[str, Any]) -> dict[str
     lifecycle, liveness = _thread_state(thread)
     latest = thread.get("latestTurn")
     settled_at = latest.get("completedAt") if isinstance(latest, dict) else None
+    last_error, error_truncated, error_units = _projected_last_error(thread)
     return {
         "id": thread["id"],
         "project": _normalized_project(project),
@@ -662,7 +751,9 @@ def _compact_thread(thread: dict[str, Any], project: dict[str, Any]) -> dict[str
         "liveness": liveness,
         "latest_turn": _normalized_latest_turn(latest),
         "session": _normalized_session(thread.get("session")),
-        "last_error": _last_error(thread),
+        "last_error": last_error,
+        "last_error_truncated": error_truncated,
+        "last_error_original_utf16_units": error_units,
         "latest_user_message_at": thread.get("latestUserMessageAt"),
         "has_pending_approvals": bool(thread.get("hasPendingApprovals", False)),
         "has_pending_user_input": bool(thread.get("hasPendingUserInput", False)),
@@ -700,6 +791,9 @@ def _material_projection(detail: dict[str, Any], project: dict[str, Any]) -> dic
     latest_assistant = _latest_message(thread, "assistant")
     latest = thread.get("latestTurn")
     page, thread_sequence = _normalized_page(detail)
+    projected_pending, pending_truncated = _bounded_model_value(pending)
+    plan_progress, plan_progress_truncated = _plan_progress(thread)
+    last_error, error_truncated, error_units = _projected_last_error(thread)
     return {
         "view": "material",
         "snapshot_sequence": detail["snapshotSequence"],
@@ -718,12 +812,16 @@ def _material_projection(detail: dict[str, Any], project: dict[str, Any]) -> dic
             "liveness": liveness,
             "latest_turn": _normalized_latest_turn(latest),
             "session": _normalized_session(thread.get("session")),
-            "pending_requests": pending,
-            "last_error": _last_error(thread),
+            "pending_requests": projected_pending,
+            "pending_requests_truncated": pending_truncated,
+            "last_error": last_error,
+            "last_error_truncated": error_truncated,
+            "last_error_original_utf16_units": error_units,
             "latest_user_update": latest_user,
             "latest_assistant_update": latest_assistant,
             "actionable_plan": _actionable_plan(thread),
-            "plan_progress": _plan_progress(thread),
+            "plan_progress": plan_progress,
+            "plan_progress_truncated": plan_progress_truncated,
             "created_at": thread["createdAt"],
             "updated_at": thread["updatedAt"],
             "settled_at": latest.get("completedAt") if isinstance(latest, dict) else None,
@@ -818,6 +916,33 @@ def t3_threads(ctx: Any, raw_args: Any) -> dict[str, Any]:
         if view == "raw":
             return {"shell": shell}
         projects = {item["id"]: item for item in shell["projects"]}
+
+        def project_matches(project: dict[str, Any]) -> bool:
+            if project_filter is not None:
+                needle = project_filter.casefold()
+                identities = {
+                    project["id"].casefold(),
+                    project["title"].casefold(),
+                    os.path.basename(project["workspaceRoot"].rstrip("/")).casefold(),
+                }
+                if needle not in identities:
+                    return False
+            if workspace_filter is not None:
+                needle = workspace_filter.casefold()
+                identities = {
+                    project["workspaceRoot"].casefold(),
+                    os.path.basename(project["workspaceRoot"].rstrip("/")).casefold(),
+                }
+                if needle not in identities:
+                    return False
+            return True
+
+        matching_projects = [
+            project for project in shell["projects"] if project_matches(project)
+        ]
+        matching_projects.sort(
+            key=lambda project: (project["title"].casefold(), project["id"])
+        )
         matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
         cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=updated_within)
@@ -828,23 +953,8 @@ def t3_threads(ctx: Any, raw_args: Any) -> dict[str, Any]:
             project = projects.get(thread["projectId"])
             if project is None:
                 continue
-            if project_filter is not None:
-                needle = project_filter.casefold()
-                identities = {
-                    project["id"].casefold(),
-                    project["title"].casefold(),
-                    os.path.basename(project["workspaceRoot"].rstrip("/")).casefold(),
-                }
-                if needle not in identities:
-                    continue
-            if workspace_filter is not None:
-                needle = workspace_filter.casefold()
-                identities = {
-                    project["workspaceRoot"].casefold(),
-                    os.path.basename(project["workspaceRoot"].rstrip("/")).casefold(),
-                }
-                if needle not in identities:
-                    continue
+            if not project_matches(project):
+                continue
             if title_query is not None and title_query.casefold() not in thread["title"].casefold():
                 continue
             state, _liveness = _thread_state(thread)
@@ -862,6 +972,11 @@ def t3_threads(ctx: Any, raw_args: Any) -> dict[str, Any]:
             "view": "compact",
             "snapshot_sequence": shell["snapshotSequence"],
             "updated_at": shell["updatedAt"],
+            "project_count": len(matching_projects),
+            "projects_truncated": len(matching_projects) > limit,
+            "projects": [
+                _normalized_project(project) for project in matching_projects[:limit]
+            ],
             "matched_count": matched_count,
             "threads": [_compact_thread(thread, project) for thread, project in matches[:limit]],
         }
@@ -1140,8 +1255,18 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             isinstance(current_session, dict)
             and current_session.get("status") in {"starting", "running"}
         ) or _active_turn_id(stored) is not None
-        if busy and busy_policy == "reject":
-            raise ConflictError("The target thread is busy; select busy_policy queue explicitly.")
+        if busy_policy == "reject":
+            if busy:
+                raise ConflictError(
+                    "The target thread is busy; busy_policy reject performed no dispatch. "
+                    "Select busy_policy queue explicitly to accept start-or-queue semantics."
+                )
+            raise ConflictError(
+                "The target appears idle, but T3 has no atomic idle guard; busy_policy "
+                "reject never dispatches. Select busy_policy queue explicitly to accept "
+                "start-or-queue semantics."
+            )
+        warning = FULL_ACCESS_WARNING if stored["runtimeMode"] == "full-access" else None
         try:
             command, message_id = _build_turn_command(transport, stored, text)
 
@@ -1163,15 +1288,25 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
 
             result = transport.mutate(thread_id, command, message_observed)
         except T3ClientError as exc:
-            raise _annotate_error(exc, race_semantics=MODE_RACE_SEMANTICS)
+            details: dict[str, Any] = {
+                "race_semantics": MODE_RACE_SEMANTICS,
+                "queue_semantics": QUEUE_SEMANTICS,
+            }
+            if warning is not None:
+                details["warning"] = warning
+            raise _annotate_error(exc, **details)
         if result["verification"] == "accepted_pending_projection":
-            return {
+            payload = {
                 "action": "new_turn_accepted_pending_projection",
                 "command_state": "accepted_pending_projection",
                 "message_id": message_id,
                 **result,
                 "race_semantics": MODE_RACE_SEMANTICS,
+                "queue_semantics": QUEUE_SEMANTICS,
             }
+            if warning is not None:
+                payload["warning"] = warning
+            return payload
         detail = result["detail"]
         if not isinstance(detail, dict):
             raise T3ClientError()
@@ -1195,7 +1330,7 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             }[latest["state"]]
         else:
             raise T3ClientError()
-        return {
+        payload = {
             "action": "new_turn_same_thread",
             "message_id": message_id,
             **result,
@@ -1204,7 +1339,11 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             "provider_session": observed["session"],
             "latest_turn": observed["latestTurn"],
             "race_semantics": MODE_RACE_SEMANTICS,
+            "queue_semantics": QUEUE_SEMANTICS,
         }
+        if warning is not None:
+            payload["warning"] = warning
+        return payload
 
     return _execute_operation(ctx, normalized, perform)
 
@@ -1280,10 +1419,20 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 continue
             material_delta = {
                 "pending_requests": projected["pending_requests"],
+                "pending_requests_truncated": projected[
+                    "pending_requests_truncated"
+                ],
                 "last_error": projected["last_error"],
+                "last_error_truncated": projected["last_error_truncated"],
+                "last_error_original_utf16_units": projected[
+                    "last_error_original_utf16_units"
+                ],
                 "latest_user_update": projected["latest_user_update"],
                 "actionable_plan": projected["actionable_plan"],
                 "plan_progress": projected["plan_progress"],
+                "plan_progress_truncated": projected[
+                    "plan_progress_truncated"
+                ],
                 "updated_at": projected["updated_at"],
                 "settled_at": projected["settled_at"],
             }
@@ -1389,8 +1538,8 @@ def _canonical_user_input_answers(value: Any) -> Any:
 def t3_thread_respond(ctx: Any, raw_args: Any) -> dict[str, Any]:
     args = _args(
         raw_args,
-        allowed={"thread_id", "request_id", "decision", "answers"},
-        required={"thread_id", "request_id"},
+        allowed={"thread_id", "request_id", "turn_id", "decision", "answers"},
+        required={"thread_id", "request_id", "turn_id"},
     )
     has_decision = "decision" in args
     has_answers = "answers" in args
@@ -1398,6 +1547,9 @@ def t3_thread_respond(ctx: Any, raw_args: Any) -> dict[str, Any]:
         _invalid("Supply exactly one of decision or answers.")
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     request_id = normalize_string(args["request_id"], "request_id", max_chars=MAX_IDENTIFIER_CHARS)
+    expected_turn_id = normalize_string(
+        args["turn_id"], "turn_id", max_chars=MAX_IDENTIFIER_CHARS
+    )
     decision = (
         _enum(args["decision"], "decision", APPROVAL_DECISIONS) if has_decision else None
     )
@@ -1405,42 +1557,75 @@ def t3_thread_respond(ctx: Any, raw_args: Any) -> dict[str, Any]:
     normalized = {
         "thread_id": thread_id,
         "request_id": request_id,
+        "turn_id": expected_turn_id,
         "decision": decision,
         "answers": answers,
     }
 
     def perform(transport: T3Client) -> dict[str, Any]:
+        def exact_pending(
+            stored: dict[str, Any],
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            _ensure_mutable_thread(stored)
+            if _active_turn_id(stored) != expected_turn_id:
+                raise ConflictError(
+                    "The expected request turn is not the thread's current active turn."
+                )
+            request_matches = [
+                item
+                for item in _pending_requests(stored)
+                if item["request_id"] == request_id
+            ]
+            if len(request_matches) != 1:
+                raise ConflictError(
+                    "The request is stale or does not resolve uniquely on the thread."
+                )
+            pending = request_matches[0]
+            if pending.get("turn_id") != expected_turn_id:
+                raise ConflictError(
+                    "The request does not belong to the expected current turn."
+                )
+            if (pending["kind"] == "approval") != has_decision:
+                raise ConflictError(
+                    "The response type does not match the exact pending request."
+                )
+            requested_kind = (
+                "approval.requested"
+                if pending["kind"] == "approval"
+                else "user-input.requested"
+            )
+            request_activity: dict[str, Any] | None = None
+            for item in stored.get("activities", []):
+                payload = item.get("payload")
+                if (
+                    item.get("kind") != requested_kind
+                    or not isinstance(payload, dict)
+                    or payload.get("requestId") != request_id
+                    or item.get("turnId") != expected_turn_id
+                ):
+                    continue
+                if request_activity is None or _activity_is_after(
+                    item, request_activity
+                ):
+                    request_activity = item
+            if request_activity is None:
+                raise ConflictError("The exact pending request activity is unavailable.")
+            return pending, request_activity
+
         before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
-        stored = before["thread"]
-        _ensure_mutable_thread(stored)
-        matches = [item for item in _pending_requests(stored) if item["request_id"] == request_id]
-        if len(matches) != 1:
-            raise ConflictError("The request is stale or does not resolve uniquely on the thread.")
-        pending = matches[0]
-        if (pending["kind"] == "approval") != has_decision:
-            raise ConflictError("The response type does not match the exact pending request.")
-        request_turn_id = pending.get("turn_id")
-        if not isinstance(request_turn_id, str) or not request_turn_id:
-            raise ConflictError("The exact pending request turn is unavailable.")
-        requested_kind = (
-            "approval.requested"
-            if pending["kind"] == "approval"
-            else "user-input.requested"
-        )
-        request_activity: dict[str, Any] | None = None
-        for item in stored.get("activities", []):
-            payload = item.get("payload")
-            if (
-                item.get("kind") != requested_kind
-                or not isinstance(payload, dict)
-                or payload.get("requestId") != request_id
-                or item.get("turnId") != request_turn_id
-            ):
-                continue
-            if request_activity is None or _activity_is_after(item, request_activity):
-                request_activity = item
-        if request_activity is None:
-            raise ConflictError("The exact pending request activity is unavailable.")
+        initial_pending, initial_activity = exact_pending(before["thread"])
+        revalidated = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
+        stored = revalidated["thread"]
+        pending, request_activity = exact_pending(stored)
+        if (
+            pending["kind"] != initial_pending["kind"]
+            or request_activity["id"] != initial_activity["id"]
+            or _activity_order(request_activity) != _activity_order(initial_activity)
+        ):
+            raise ConflictError(
+                "The exact pending request changed during pre-dispatch revalidation."
+            )
+        request_turn_id = expected_turn_id
         command: dict[str, Any] = {
             "type": (
                 "thread.approval.respond"
@@ -1539,13 +1724,21 @@ def t3_thread_respond(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 for item in new_terminals(detail)
             )
 
-        result = transport.mutate(
-            thread_id,
-            command,
-            resolved,
-            race_detector=conflicting_or_failed,
-            require_accepted_sequence=True,
-        )
+        try:
+            result = transport.mutate(
+                thread_id,
+                command,
+                resolved,
+                race_detector=conflicting_or_failed,
+                require_accepted_sequence=True,
+            )
+        except T3ClientError as exc:
+            raise _annotate_error(
+                exc,
+                expected_turn_id=expected_turn_id,
+                response_scope="best_effort_current_provider_session",
+                warning=RESPONSE_RACE_WARNING,
+            )
         result.pop("detail", None)
         return {
             "action": (
@@ -1554,7 +1747,10 @@ def t3_thread_respond(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 else "pending_request_responded"
             ),
             "request_id": request_id,
+            "turn_id": expected_turn_id,
             "request_kind": pending["kind"],
+            "response_scope": "best_effort_current_provider_session",
+            "warning": RESPONSE_RACE_WARNING,
             **result,
         }
 
@@ -1696,6 +1892,11 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
     def perform(transport: T3Client) -> dict[str, Any]:
         before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
         plan = _require_plan_ready(before, plan_id)
+        warning = (
+            FULL_ACCESS_WARNING
+            if before["thread"]["runtimeMode"] == "full-access"
+            else None
+        )
         implementation_message = normalize_message(
             PLAN_IMPLEMENT_PREFIX + plan["planMarkdown"].strip()
         )
@@ -1720,13 +1921,15 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 require_accepted_sequence=True,
             )
         except T3ClientError as exc:
-            raise _annotate_error(
-                exc,
-                workflow_phase="interaction_mode_transition",
-                race_semantics=PLAN_RACE_SEMANTICS,
-            )
+            details: dict[str, Any] = {
+                "workflow_phase": "interaction_mode_transition",
+                "race_semantics": PLAN_RACE_SEMANTICS,
+            }
+            if warning is not None:
+                details["warning"] = warning
+            raise _annotate_error(exc, **details)
         if mode_result["verification"] == "accepted_pending_projection":
-            return {
+            payload = {
                 "action": "plan_mode_transition_accepted_pending_projection",
                 **mode_result,
                 "mode_command_id": mode_result["command_id"],
@@ -1734,19 +1937,24 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "mode_dispatch_attempts": mode_result["dispatch_attempts"],
                 "race_semantics": PLAN_RACE_SEMANTICS,
             }
+            if warning is not None:
+                payload["warning"] = warning
+            return payload
 
         try:
             _require_plan_ready(
                 mode_result["detail"], plan_id, expected_plan=plan_identity
             )
         except T3ClientError as exc:
-            raise _annotate_error(
-                exc,
-                workflow_phase="post_mode_revalidation",
-                completed_phase="interaction_mode_set",
-                verified_mode_command_id=mode_result["command_id"],
-                race_semantics=PLAN_RACE_SEMANTICS,
-            )
+            details = {
+                "workflow_phase": "post_mode_revalidation",
+                "completed_phase": "interaction_mode_set",
+                "verified_mode_command_id": mode_result["command_id"],
+                "race_semantics": PLAN_RACE_SEMANTICS,
+            }
+            if warning is not None:
+                details["warning"] = warning
+            raise _annotate_error(exc, **details)
         source_plan = {"threadId": thread_id, "planId": plan_id}
         try:
             turn_command, message_id = _build_turn_command(
@@ -1768,15 +1976,17 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 thread_id, turn_command, implementation_observed
             )
         except T3ClientError as exc:
-            raise _annotate_error(
-                exc,
-                workflow_phase="implementation_turn",
-                completed_phase="interaction_mode_set",
-                verified_mode_command_id=mode_result["command_id"],
-                race_semantics=PLAN_RACE_SEMANTICS,
-            )
+            details = {
+                "workflow_phase": "implementation_turn",
+                "completed_phase": "interaction_mode_set",
+                "verified_mode_command_id": mode_result["command_id"],
+                "race_semantics": PLAN_RACE_SEMANTICS,
+            }
+            if warning is not None:
+                details["warning"] = warning
+            raise _annotate_error(exc, **details)
         if turn_result["verification"] == "accepted_pending_projection":
-            return {
+            payload = {
                 "action": "plan_implementation_accepted_pending_projection",
                 **turn_result,
                 "mode_command_id": mode_result["command_id"],
@@ -1784,8 +1994,11 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "source_proposed_plan": source_plan,
                 "race_semantics": PLAN_RACE_SEMANTICS,
             }
+            if warning is not None:
+                payload["warning"] = warning
+            return payload
         observed = turn_result["detail"]["thread"]
-        return {
+        payload = {
             "action": "same_thread_plan_implementation_started",
             **turn_result,
             "mode_command_id": mode_result["command_id"],
@@ -1801,6 +2014,9 @@ def t3_thread_implement_plan(ctx: Any, raw_args: Any) -> dict[str, Any]:
             "latest_turn": observed["latestTurn"],
             "race_semantics": PLAN_RACE_SEMANTICS,
         }
+        if warning is not None:
+            payload["warning"] = warning
+        return payload
 
     return _execute_operation(ctx, normalized, perform)
 

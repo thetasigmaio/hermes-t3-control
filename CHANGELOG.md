@@ -18,10 +18,14 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Makes release output permissions deterministic across caller umasks and isolates the supported-install harness from ambient credentials, Git configuration, hooks, and proxies.
 - Caps cumulative response bodies to 64 MiB per logical operation, rejects non-finite JSON numbers, and preserves accepted-pending reconciliation without redispatch when projection polling exhausts that budget.
 - Reads local T3 metadata through nonblocking, no-follow regular-file descriptors and cleans up newly issued sessions even when post-issuance CLI output is malformed or lacks a safe session ID.
+- Makes `busy_policy: reject` observation-only because pinned T3 has no atomic idle guard; actual sends now require explicit start-or-queue acknowledgement and disclose full-access at the action point.
+- Requires an expected active turn for pending responses, revalidates it twice, labels the immutable-upstream residual race as best-effort, and documents every approval decision scope.
+- Adds bounded compact discovery for projects with no threads and explicit model-facing truncation metadata for messages, errors, plans, pending actions, and plan progress.
 
 ### Changed
 
 - Expanded the registered surface from eight to ten tools; list/read results now default to bounded compact/material views with explicit `raw` compatibility views.
+- Documented the v1.2 migration for compact/material defaults and the preserved explicit legacy `raw` views.
 - Pinned supported Hermes CI to each revision's frozen `uv.lock` dependency graph and hardened published-asset verification around a fresh private HTTPS-only download directory.
 
 ### Security

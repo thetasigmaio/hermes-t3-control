@@ -73,6 +73,8 @@ class ReadmeContractTests(unittest.TestCase):
             "explicit `raw` view",
             "material summary by default",
             "`busy_policy` defaults to `reject`",
+            "observation-only",
+            "explicit `queue` acknowledges that T3 may start or queue",
             "`timeout_seconds` 0-30",
             "exact request ID",
             "approval-required`, `auto-accept-edits`, `auto`, and `full-access`",
@@ -121,7 +123,23 @@ class ReadmeContractTests(unittest.TestCase):
 
         examples_by_tool = dict(named_examples)
         self.assertIn("answers", examples_by_tool["t3_thread_respond"])
+        self.assertIn("turn_id", examples_by_tool["t3_thread_respond"])
         self.assertNotIn("decision", examples_by_tool["t3_thread_respond"])
+
+    def test_v12_migration_and_immutable_upstream_races_are_explicit(self) -> None:
+        for phrase in (
+            "v1.2 migration",
+            '`t3_threads {"view":"raw"}`',
+            '`t3_thread_read {"thread_id":"...","view":"raw"}`',
+            "no atomic idle guard",
+            "no atomic expected-turn guard",
+            "best-effort current-session response",
+            "full-access send",
+            "full-access Plan",
+            "model-facing text is truncated",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, README)
 
     def test_workflows_cover_exact_selector_continuation_wait_response_and_plan(self) -> None:
         for phrase in (
@@ -204,6 +222,15 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertNotIn("hermes plugins uninstall hermes-t3-control", README)
         self.assertIn("operator-isolated headless or local deployment", LOWER)
         self.assertIn("base_url", README)
+        self.assertIn(
+            "hermes config set plugins.entries.hermes-t3-control.settings.auth_mode external-token",
+            README,
+        )
+        self.assertIn(
+            "hermes config set plugins.entries.hermes-t3-control.settings.base_url http://127.0.0.1:3773",
+            README,
+        )
+        self.assertIn("hermes config env-path", README)
         self.assertIn("orchestration:read", README)
         self.assertIn("orchestration:operate", README)
         self.assertNotIn("use explicit `external-token` mode in a multi-user distro", README)
