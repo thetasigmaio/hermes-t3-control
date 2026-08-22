@@ -27,18 +27,20 @@ ARCHIVE_FILES = {
     "LICENSE",
     "README.md",
     "__init__.py",
+    "auth.py",
     "client.py",
     "plugin.yaml",
     "schemas.py",
     "tools.py",
 }
-ARCHIVE_NAME = "hermes-t3-control-1.1.0.tar.gz"
+ARCHIVE_NAME = "hermes-t3-control-1.2.0.tar.gz"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
 RELEASE_ARTIFACT_NAMES = (ARCHIVE_NAME, CHECKSUM_NAME)
 ACTION_PINS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",
     "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "astral-sh/setup-uv": "c771a70e6277c0a99b617c7a806ffedaca235ff9",
 }
 HERMES_COMMITS = {
     "e624e9fde561e1add9388384012b295fde669ade",
@@ -79,12 +81,6 @@ def _load_smoke_module():
     return module
 
 
-def _uses_codex_spec_convention(root: pathlib.Path) -> bool:
-    return (root / ".codex" / "specs").is_dir() and not (
-        root / ".claude" / "specs"
-    ).exists()
-
-
 class ReleaseMetadataTests(unittest.TestCase):
     def test_version_license_homepage_and_changelog_agree(self) -> None:
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
@@ -92,22 +88,31 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
-        self.assertEqual(manifest["version"], "1.1.0")
+        self.assertEqual(manifest["version"], "1.2.0")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"],
             "https://github.com/thetasigmaio/hermes-t3-control",
         )
-        self.assertIn("## [1.1.0] - 2026-08-21", changelog)
-        self.assertIn("1.1.0", readme)
+        self.assertIn("## [1.2.0] - 2026-08-22", changelog)
+        self.assertIn("1.2.0", readme)
         self.assertIn("MIT", readme)
         self.assertTrue(license_text.startswith("MIT License\n"))
         self.assertIn("Copyright (c) 2026 Jakub Sladek", license_text)
         self.assertIn("Permission is hereby granted, free of charge", license_text)
 
-    def test_spec_convention_and_ignore_hygiene(self) -> None:
+    def test_repository_and_ignore_hygiene(self) -> None:
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-        self.assertTrue(_uses_codex_spec_convention(ROOT))
+        for spec_root in (
+            ROOT / ".codex" / "specs" / "hermes-t3-control",
+            ROOT / ".claude" / "specs" / "hermes-t3-control",
+        ):
+            self.assertFalse(
+                any(
+                    entry.is_file() or entry.is_symlink()
+                    for entry in spec_root.rglob("*")
+                )
+            )
         self.assertNotIn(".codex", ignore)
         for required in (
             "__pycache__/",
@@ -119,17 +124,6 @@ class ReleaseMetadataTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, ignore)
-
-        # Exercise the rejected legacy layout without ever creating a sentinel
-        # in the repository under test. TemporaryDirectory owns cleanup even if
-        # an assertion raises.
-        with tempfile.TemporaryDirectory() as temporary:
-            isolated_root = pathlib.Path(temporary)
-            (isolated_root / ".codex" / "specs").mkdir(parents=True)
-            self.assertTrue(_uses_codex_spec_convention(isolated_root))
-            (isolated_root / ".claude" / "specs").mkdir(parents=True)
-            self.assertFalse(_uses_codex_spec_convention(isolated_root))
-
 
 class DeterministicArtifactTests(unittest.TestCase):
     def _build(self, directory: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -154,6 +148,23 @@ class DeterministicArtifactTests(unittest.TestCase):
             )
         )
         return result
+
+    @unittest.skipUnless(hasattr(os, "umask"), "POSIX umask support is required")
+    def test_new_output_directory_is_private_under_permissive_caller_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary) / "new-release-directory"
+            original_umask = os.umask(0o002)
+            try:
+                result = _run(str(BUILD_SCRIPT), "--output-dir", str(output))
+            finally:
+                os.umask(original_umask)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+            self.assertEqual(
+                {entry.name for entry in output.iterdir()},
+                set(RELEASE_ARTIFACT_NAMES),
+            )
 
     @unittest.skipUnless(hasattr(os, "geteuid"), "effective UID support is required")
     def test_output_directory_metadata_rejects_wrong_owner(self) -> None:
@@ -413,6 +424,16 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
 
         self.assertIn('python-version: ["3.11", "3.12", "3.13"]', workflow)
         self.assertIn('python-version: "3.11"', workflow)
+        unit_gate = """      - name: Run unit and mocked integration tests
+        env:
+          PYTHONWARNINGS: "error"
+        run: python -B -m unittest discover -s tests -v
+"""
+        self.assertEqual(workflow.count(unit_gate), 1)
+        self.assertIn(
+            "name: Supported install + Doctor (Hermes ${{ matrix.hermes-version }})",
+            workflow,
+        )
         for commit in HERMES_COMMITS:
             self.assertIn(commit, workflow)
         hermes_bootstrap = """      - name: Check out pinned Hermes revision
@@ -426,14 +447,29 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
-      - name: Install pinned Hermes revision editably
-        run: python -m pip install --editable .ci/hermes-agent
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.12.0"
+          enable-cache: false
+      - name: Sync frozen Hermes dependency graph
+        run: uv sync --frozen --project .ci/hermes-agent --python 3.11
 """
         self.assertEqual(
             workflow.count(hermes_bootstrap),
             1,
         )
         self.assertNotIn("git+https://github.com/NousResearch/hermes-agent", workflow)
+        self.assertNotIn("pip install --editable .ci/hermes-agent", workflow)
+        supported_install = """      - name: Run supported pinned-ref install regression
+        env:
+          HERMES_SUPPORTED_INSTALL_TEST: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONWARNINGS: "error"
+        run: uv run --frozen --project .ci/hermes-agent python -B -m unittest -v tests.test_supported_install
+"""
+        self.assertEqual(workflow.count(supported_install), 1)
+        self.assertNotIn("--force", supported_install)
         self.assertRegex(workflow, r"(?m)^  package:\n(?:.*\n)*?    needs: \[unit, doctor\]$")
         self.assertLess(workflow.index("needs: [unit, doctor]"), workflow.index("Upload release artifacts"))
 
@@ -444,15 +480,15 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         upload = workflow.split("- name: Upload release artifacts", 1)[1]
         self.assertIn("python -B scripts/build_release.py --output-dir dist", workflow)
         self.assertIn(
-            "python -B scripts/verify_release.py dist/hermes-t3-control-1.1.0.tar.gz.sha256",
+            "python -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256",
             workflow,
         )
         paths = re.findall(r"(?m)^            (dist/\S+)$", upload)
         self.assertEqual(
             paths,
             [
-                "dist/hermes-t3-control-1.1.0.tar.gz",
-                "dist/hermes-t3-control-1.1.0.tar.gz.sha256",
+                "dist/hermes-t3-control-1.2.0.tar.gz",
+                "dist/hermes-t3-control-1.2.0.tar.gz.sha256",
             ],
         )
 

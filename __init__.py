@@ -4,14 +4,14 @@ from __future__ import annotations
 
 try:
     from .schemas import SCHEMAS, TOOL_NAMES
-    from .tools import OPERATIONS, TOKEN_ENV, TOOLSET, bind_handler, check_t3_available
+    from .tools import OPERATIONS, TOOLSET, bind_handler, check_t3_available
 except ImportError:  # Direct repository import used by unit tests.
     from schemas import SCHEMAS, TOOL_NAMES
-    from tools import OPERATIONS, TOKEN_ENV, TOOLSET, bind_handler, check_t3_available
+    from tools import OPERATIONS, TOOLSET, bind_handler, check_t3_available
 
 
 def register(ctx) -> None:
-    """Register eight synchronous tools without constructing a client or doing I/O."""
+    """Register ten synchronous tools without constructing a client or doing I/O."""
     for name in TOOL_NAMES:
         schema = SCHEMAS[name]
         ctx.register_tool(
@@ -20,7 +20,7 @@ def register(ctx) -> None:
             schema=schema,
             handler=bind_handler(ctx, OPERATIONS[name]),
             check_fn=check_t3_available,
-            requires_env=[TOKEN_ENV],
+            requires_env=[],
             is_async=False,
             description=schema["description"],
             override=False,

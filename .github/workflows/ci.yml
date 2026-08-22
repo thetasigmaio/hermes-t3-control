@@ -26,10 +26,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run unit and mocked integration tests
+        env:
+          PYTHONWARNINGS: "error"
         run: python -B -m unittest discover -s tests -v
 
   doctor:
-    name: Plugin Doctor (Hermes ${{ matrix.hermes-version }})
+    name: Supported install + Doctor (Hermes ${{ matrix.hermes-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -55,12 +57,19 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
-      - name: Install pinned Hermes revision editably
-        run: python -m pip install --editable .ci/hermes-agent
-      - name: Run Plugin Doctor
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.12.0"
+          enable-cache: false
+      - name: Sync frozen Hermes dependency graph
+        run: uv sync --frozen --project .ci/hermes-agent --python 3.11
+      - name: Run supported pinned-ref install regression
         env:
+          HERMES_SUPPORTED_INSTALL_TEST: "1"
           PYTHONDONTWRITEBYTECODE: "1"
-        run: hermes plugins doctor . --ci
+          PYTHONWARNINGS: "error"
+        run: uv run --frozen --project .ci/hermes-agent python -B -m unittest -v tests.test_supported_install
 
   package:
     name: Deterministic release package
@@ -78,13 +87,13 @@ jobs:
       - name: Build deterministic archive
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
-        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.1.0.tar.gz.sha256
+        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.1.0
+          name: hermes-t3-control-1.2.0
           path: |
-            dist/hermes-t3-control-1.1.0.tar.gz
-            dist/hermes-t3-control-1.1.0.tar.gz.sha256
+            dist/hermes-t3-control-1.2.0.tar.gz
+            dist/hermes-t3-control-1.2.0.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14

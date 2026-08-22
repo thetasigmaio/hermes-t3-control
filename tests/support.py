@@ -218,12 +218,17 @@ def shell_snapshot(*, sequence: int = 1, extra: bool = False) -> dict[str, Any]:
     return value
 
 
-def message(*, message_id: str = "message-1", text: str = "hello") -> dict[str, Any]:
+def message(
+    *,
+    message_id: str = "message-1",
+    text: str = "hello",
+    turn_id: str | None = "turn-1",
+) -> dict[str, Any]:
     return {
         "id": message_id,
         "role": "user",
         "text": text,
-        "turnId": "turn-1",
+        "turnId": turn_id,
         "streaming": False,
         "createdAt": NOW,
         "updatedAt": NOW,
