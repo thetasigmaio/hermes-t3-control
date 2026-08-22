@@ -24,8 +24,15 @@ RELEASE_FILES = (
     "LICENSE",
     "README.md",
     "__init__.py",
+    "after-install.md",
     "auth.py",
     "client.py",
+    "docs/community-index-entry.json",
+    "docs/community-index.md",
+    "docs/compatibility.md",
+    "docs/operations.md",
+    "docs/security.md",
+    "docs/tools.md",
     "plugin.yaml",
     "schemas.py",
     "tools.py",
@@ -37,11 +44,10 @@ class ReleaseBuildError(Exception):
     """A sanitized release-build failure."""
 
 
-def _manifest_version() -> str:
-    manifest_path = SOURCE_ROOT / "plugin.yaml"
+def _manifest_version(content: bytes) -> str:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        manifest = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ReleaseBuildError("plugin.yaml is missing or invalid JSON.") from exc
     version = manifest.get("version")
     if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
@@ -49,17 +55,65 @@ def _manifest_version() -> str:
     return version
 
 
+def _read_release_input(relative_name: str) -> bytes:
+    relative = Path(relative_name)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ReleaseBuildError(f"Required release input is unsafe: {relative_name}")
+
+    directory_descriptors: list[int] = []
+    descriptor = -1
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    file_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory_descriptors.append(os.open(SOURCE_ROOT, directory_flags))
+        for component in relative.parts[:-1]:
+            directory_descriptors.append(
+                os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directory_descriptors[-1],
+                )
+            )
+        descriptor = os.open(
+            relative.parts[-1],
+            file_flags,
+            dir_fd=directory_descriptors[-1],
+        )
+        entry = os.fstat(descriptor)
+        if not stat.S_ISREG(entry.st_mode):
+            raise ReleaseBuildError(
+                f"Required release input is unsafe: {relative_name}"
+            )
+        content = bytearray()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            content.extend(chunk)
+        return bytes(content)
+    except ReleaseBuildError:
+        raise
+    except OSError as exc:
+        raise ReleaseBuildError(
+            f"Required release input is unsafe: {relative_name}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        for directory_descriptor in reversed(directory_descriptors):
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
+
+
 def _release_inputs() -> list[tuple[str, bytes]]:
+    _require_secure_publish_primitives()
     inputs: list[tuple[str, bytes]] = []
     for relative_name in sorted(RELEASE_FILES):
-        source = SOURCE_ROOT / relative_name
-        if source.is_symlink() or not source.is_file():
-            raise ReleaseBuildError(f"Required release input is missing: {relative_name}")
-        try:
-            content = source.read_bytes()
-        except OSError as exc:
-            raise ReleaseBuildError(f"Could not read release input: {relative_name}") from exc
-        inputs.append((relative_name, content))
+        inputs.append((relative_name, _read_release_input(relative_name)))
     return inputs
 
 
@@ -514,10 +568,11 @@ def _publish_artifacts(
 
 
 def build_release(output_dir: Path) -> tuple[Path, Path]:
-    version = _manifest_version()
+    inputs = _release_inputs()
+    version = _manifest_version(dict(inputs)["plugin.yaml"])
     archive_name = f"{ARCHIVE_ROOT}-{version}.tar.gz"
     checksum_name = f"{archive_name}.sha256"
-    archive_bytes = _gzip_bytes(_tar_bytes(_release_inputs()))
+    archive_bytes = _gzip_bytes(_tar_bytes(inputs))
     digest = hashlib.sha256(archive_bytes).hexdigest()
     checksum_bytes = f"{digest}  {archive_name}\n".encode("ascii")
     resolved_output_dir = _publish_artifacts(

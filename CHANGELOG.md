@@ -2,6 +2,20 @@
 
 All notable changes to Hermes T3 Control are documented in this file.
 
+## [1.2.1] - 2026-08-22
+
+### Changed
+
+- Reworked the primary README around purpose, evidence-based compatibility, a signer-verified install, the first non-thread-mutating prompt, and the everyday find/read/send/wait workflow.
+- Added a supported `after-install.md` next-step panel so a disabled installation leads directly to Doctor, explicit enablement, owner-specific restart, and a non-thread-mutating first check without token setup.
+- Moved the complete ten-tool reference, security internals, recovery/release operations, and provider/OS evidence into focused documentation pages.
+- Replaced the personal project selector with a neutral example and made Codex, OpenCode, other-provider, Linux/WSL2, native Windows, and macOS claims explicit.
+
+### Added
+
+- Added validated community-index entry metadata pinned to the immutable v1.2.0 release commit, plus the exact external blocker and submission/readback procedure for a future official index.
+- Added provider and operating-system acceptance gates for the separate v1.3 portability wave; v1.2.1 makes no new non-Codex or native Windows/macOS support claim.
+
 ## [1.2.0] - 2026-08-22
 
 ### Added
@@ -64,6 +78,7 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Rejects active-token reflection in request targets or mutation data before any HTTP request.
 - Publishes release artifacts through owner-private, inode-bound no-follow staging and rejects unsafe directories, links, or special files.
 
+[1.2.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.1
 [1.2.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.0
 [1.1.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.1.1
 [1.1.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.1.0
