@@ -21,6 +21,8 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Makes `busy_policy: reject` observation-only because pinned T3 has no atomic idle guard; actual sends now require explicit start-or-queue acknowledgement and disclose full-access at the action point.
 - Requires an expected active turn for pending responses, revalidates it twice, labels the immutable-upstream residual race as best-effort, and documents every approval decision scope.
 - Adds bounded compact discovery for projects with no threads and explicit model-facing truncation metadata for messages, errors, plans, pending actions, and plan progress.
+- Uses canonical T3 background liveness and plan progress for terminal waits, caps each complete agent projection to 262144 UTF-8 bytes, and rejects aggregate response answers above 524288 bytes before HTTP.
+- Runs normalized public-argument credential-reflection preflight before every local-mode T3 HTTP probe while retaining pinned process, listener, and connected-socket validation.
 
 ### Changed
 

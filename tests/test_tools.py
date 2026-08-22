@@ -390,6 +390,28 @@ class AgentFacingReadToolTests(unittest.TestCase):
             result["projects"],
         )
 
+    def test_compact_uses_canonical_background_liveness(self) -> None:
+        for background_liveness in ("working", "monitoring"):
+            with self.subTest(background_liveness=background_liveness):
+                shell = self._compact_shell()
+                thread = shell["threads"][0]
+                thread["title"] = "Canonical background fixture"
+                current_session = session(status="ready")
+                current_session["threadId"] = thread["id"]
+                thread["session"] = current_session
+                thread["latestTurn"] = latest_turn(state="completed")
+                thread["backgroundLiveness"] = background_liveness
+                with LoopbackServer([Response(value=shell)]) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_threads,
+                        {"title_query": thread["title"], "require_one": True},
+                    )
+
+                projected = result["threads"][0]
+                self.assertEqual(projected["lifecycle"], "running")
+                self.assertEqual(projected["liveness"], background_liveness)
+
     def test_threads_explicit_raw_is_legacy_exact_and_require_one_fails_closed(self) -> None:
         shell = self._compact_shell()
         with LoopbackServer([Response(value=shell)]) as server:
@@ -542,6 +564,10 @@ class AgentFacingReadToolTests(unittest.TestCase):
                 created_at="2026-08-21T12:02:02Z",
             ),
         ]
+        detail["thread"]["planProgress"] = {
+            "plan": [{"step": "Implement", "status": "inProgress"}],
+            "explanation": "Working",
+        }
         detail["thread"]["projectId"] = "project-alpha"
         responder = projection_responder(shell, detail)
         with LoopbackServer([responder, responder]) as server:
@@ -592,6 +618,33 @@ class AgentFacingReadToolTests(unittest.TestCase):
             ["GET", "GET"],
         )
 
+    def test_material_uses_canonical_plan_progress_and_respects_clear(self) -> None:
+        shell = self._compact_shell()
+        canonical = {"step": "Canonical background work", "status": "inProgress"}
+        historical = activity(
+            activity_id="stale-plan-progress",
+            kind="turn.plan.updated",
+            payload={"step": "Stale historical work", "status": "completed"},
+            sequence=5,
+            created_at="2026-08-21T12:00:05Z",
+        )
+        for plan_progress, expected in ((canonical, canonical), (None, None)):
+            with self.subTest(plan_progress=plan_progress):
+                detail = with_projection_fields(detail_snapshot(sequence=55))
+                detail["thread"]["projectId"] = "project-alpha"
+                detail["thread"]["activities"] = [historical]
+                detail["thread"]["planProgress"] = plan_progress
+                responder = projection_responder(shell, detail)
+                with LoopbackServer([responder, responder]) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_thread_read,
+                        {"thread_id": "thread-1"},
+                    )
+
+                self.assertEqual(result["thread"]["plan_progress"], expected)
+                self.assertFalse(result["thread"]["plan_progress_truncated"])
+
     def test_material_projection_truncates_model_facing_text_with_metadata(self) -> None:
         oversized = "x" * 20_000
         current_session = session(status="error")
@@ -628,6 +681,66 @@ class AgentFacingReadToolTests(unittest.TestCase):
         self.assertTrue(projected["actionable_plan"]["plan_markdown_truncated"])
         self.assertLessEqual(len(projected["last_error"]), 8_192)
         self.assertTrue(projected["last_error_truncated"])
+
+    def test_compact_and_material_share_one_bounded_projection_budget(self) -> None:
+        shell = self._compact_shell()
+        template = shell["threads"][0]
+        large_options = [
+            {"id": f"option-{index}", "value": "x" * 512}
+            for index in range(64)
+        ]
+        shell["threads"] = []
+        for index in range(50):
+            thread = copy.deepcopy(template)
+            thread["id"] = f"thread-large-{index}"
+            thread["title"] = f"Large {index} " + "t" * 2_000
+            thread["modelSelection"]["options"] = copy.deepcopy(large_options)
+            thread["session"]["threadId"] = thread["id"]
+            shell["threads"].append(thread)
+
+        with LoopbackServer([Response(value=shell)]) as server:
+            compact = invoke(server, tools.t3_threads, {"limit": 50})
+        self.assertTrue(compact["ok"])
+        self.assertTrue(compact["projection_truncated"])
+        self.assertLessEqual(
+            len(json.dumps(compact, ensure_ascii=False).encode("utf-8")),
+            tools.MAX_MODEL_PROJECTION_UTF8_BYTES,
+        )
+
+        detail = with_projection_fields(detail_snapshot(sequence=88))
+        detail["thread"]["activities"] = [
+            activity(
+                activity_id=f"approval-{index}",
+                kind="approval.requested",
+                payload={
+                    "requestId": f"request-{index}",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                    "detail": "d" * 20_000,
+                },
+                sequence=index + 1,
+                created_at=f"2026-08-21T12:00:{index:02d}Z",
+                turn_id="turn-1",
+            )
+            for index in range(32)
+        ]
+        detail["thread"]["planProgress"] = {
+            "steps": ["p" * 20_000 for _ in range(32)]
+        }
+        with LoopbackServer(
+            [Response(value=shell_snapshot(sequence=88)), Response(value=detail)]
+        ) as server:
+            material = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+        self.assertTrue(material["ok"])
+        self.assertTrue(material["projection_truncated"])
+        self.assertLessEqual(
+            len(json.dumps(material, ensure_ascii=False).encode("utf-8")),
+            tools.MAX_MODEL_PROJECTION_UTF8_BYTES,
+        )
 
     def test_material_read_drops_request_resolved_by_later_unsequenced_activity(self) -> None:
         requested = activity(
@@ -1061,6 +1174,22 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                     "thread_id": "thread-1",
                     "request_id": "input-1",
                     "answers": {"scope": ["\ud800"]},
+                },
+            )
+
+        self.assertEqual(result["error_code"], "invalid_input")
+        self.assertEqual(server.requests, [])
+
+    def test_respond_rejects_aggregate_answer_budget_before_http(self) -> None:
+        with LoopbackServer([]) as server:
+            result = invoke(
+                server,
+                tools.OPERATIONS["t3_thread_respond"],
+                {
+                    "thread_id": "thread-1",
+                    "request_id": "input-1",
+                    "turn_id": "turn-1",
+                    "answers": {"scope": ["x" * 120_000 for _ in range(5)]},
                 },
             )
 
@@ -1531,6 +1660,74 @@ class AgentFacingWaitToolTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["wait_outcome"], outcome)
                 self.assertEqual(result["liveness"], liveness)
+
+    def test_wait_never_settles_while_canonical_background_work_is_live(self) -> None:
+        for background_liveness in ("working", "monitoring"):
+            with self.subTest(background_liveness=background_liveness):
+                detail = with_projection_fields(
+                    detail_snapshot(
+                        sequence=15,
+                        turn=latest_turn(turn_id="turn-1", state="completed"),
+                        current_session=session(status="ready"),
+                    ),
+                    thread_sequence=15,
+                )
+                detail["thread"]["backgroundLiveness"] = background_liveness
+                detail["thread"]["planProgress"] = {
+                    "step": "Background work remains",
+                    "status": "inProgress",
+                }
+                result, _server = self._invoke_wait(
+                    detail,
+                    {
+                        "thread_id": "thread-1",
+                        "until": "terminal",
+                        "timeout_seconds": 0,
+                    },
+                )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["wait_outcome"], "timeout")
+                self.assertEqual(result["lifecycle"], "running")
+                self.assertEqual(result["liveness"], background_liveness)
+                self.assertEqual(
+                    result["material_delta"]["plan_progress"],
+                    {
+                        "step": "Background work remains",
+                        "status": "inProgress",
+                    },
+                )
+
+    def test_wait_receipt_has_one_cumulative_projection_budget(self) -> None:
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=16,
+                messages=[
+                    projected_message(
+                        message_id="assistant-large",
+                        role="assistant",
+                        text="a" * 120_000,
+                        turn_id="turn-1",
+                    )
+                ],
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=session(status="running", active_turn_id="turn-1"),
+            ),
+            thread_sequence=16,
+        )
+        detail["thread"]["planProgress"] = {
+            "steps": ["p" * 20_000 for _ in range(32)]
+        }
+        result, _server = self._invoke_wait(
+            detail,
+            {"thread_id": "thread-1", "until": "change", "timeout_seconds": 0},
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["projection_truncated"])
+        self.assertLessEqual(
+            len(json.dumps(result, ensure_ascii=False).encode("utf-8")),
+            tools.MAX_MODEL_PROJECTION_UTF8_BYTES,
+        )
 
 
 class AgentFacingRespondToolTests(unittest.TestCase):

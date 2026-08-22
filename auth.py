@@ -475,14 +475,20 @@ def _bound_socket_validator(
 def _validate_unauthenticated_runtime(
     runtime: LocalRuntime, guard: RuntimeProcessGuard
 ) -> None:
-    _validate_runtime_process_guard(runtime, guard)
-    _validate_listener_process(runtime, guard.pid)
+    _validate_local_runtime_process(runtime, guard)
     descriptor = probe_environment_descriptor(runtime.origin)
     if (
         descriptor.get("environmentId") != runtime.environment_id
         or descriptor.get("serverVersion") != runtime.server_version
     ):
         raise _configuration_error("The live T3 environment does not match local metadata.")
+    _validate_local_runtime_process(runtime, guard)
+
+
+def _validate_local_runtime_process(
+    runtime: LocalRuntime, guard: RuntimeProcessGuard
+) -> None:
+    """Validate pinned process and listener identity without network I/O."""
     _validate_runtime_process_guard(runtime, guard)
     _validate_listener_process(runtime, guard.pid)
 
@@ -1012,7 +1018,7 @@ def operation_client(
         else resolve_local_runtime(configured_base_dir)
     )
     with _pinned_runtime_process(runtime) as process_guard:
-        _validate_unauthenticated_runtime(runtime, process_guard)
+        _validate_local_runtime_process(runtime, process_guard)
         session = issue_local_session(runtime)
         lease: ClientLease | None = None
         operation_error: BaseException | None = None
@@ -1026,7 +1032,7 @@ def operation_client(
             )
             lease = ClientLease(client=transport, _expires_at=session.expires_at)
             transport._preflight_public_arguments(public_arguments)
-            _validate_unauthenticated_runtime(runtime, process_guard)
+            _validate_local_runtime_process(runtime, process_guard)
             _validate_runtime_environment(transport, runtime)
             yield lease
         except BaseException as error:

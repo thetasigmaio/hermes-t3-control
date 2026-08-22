@@ -195,6 +195,7 @@ class AgentFacingSchemaTests(unittest.TestCase):
         self.assertIn("best-effort", respond_schema["description"])
         self.assertIn("current provider session", respond_schema["description"])
         self.assertIn("session", properties["decision"]["description"])
+        self.assertIn("524288 UTF-8 bytes", properties["answers"]["description"])
         self.assertEqual(
             parameters["oneOf"],
             [

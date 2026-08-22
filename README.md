@@ -94,7 +94,7 @@ Example for `t3_thread_read`:
 }
 ```
 
-The material summary includes project/workspace, title, model and modes, lifecycle and provider liveness, latest turn/session, pending approval or user-input requests, last error, latest user and assistant updates, actionable plan, plan progress, timestamps, and sequence cursors. An explicit `raw` view preserves the bounded legacy projection when diagnostics require it.
+The material summary includes project/workspace, title, model and modes, lifecycle, canonical provider liveness and background liveness, latest turn/session, pending approval or user-input requests, last error, latest user and assistant updates, canonical plan progress, timestamps, and sequence cursors. Non-null T3 background liveness (`working` or `monitoring`) remains running and cannot satisfy a terminal wait; a cleared canonical `planProgress` stays cleared. An explicit `raw` view preserves the bounded legacy projection when diagnostics require it.
 
 ## Continue and monitor one exact thread
 
@@ -201,7 +201,7 @@ Every handler rejects unknown fields and returns sanitized JSON. Results contain
 | `t3_thread_wait` | Wait for change/running/blocked/terminal/error with `timeout_seconds` 0-30. |
 | `t3_thread_respond` | Best-effort current-session response by request and expected turn IDs. |
 
-Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`. Messages are trimmed and limited to 120000 JavaScript UTF-16 code units. Identifiers and titles are limited to 512 characters, cursors and worktree paths to 4096, compact lists to 50, and model options to 64 unique entries. Default model-facing text is truncated with explicit metadata: latest messages and errors at 8192 UTF-16 units, actionable plan Markdown at 16384, and nested material collections at 32 items/depth 5. Explicit bounded `raw` reads remain available for the full server text.
+Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`. Messages are trimmed and limited to 120000 JavaScript UTF-16 code units. Identifiers and titles are limited to 512 characters, cursors and worktree paths to 4096, compact lists to 50, and model options to 64 unique entries. Default model-facing text is truncated with explicit metadata: latest messages and errors at 8192 UTF-16 units, actionable plan Markdown at 16384, and nested material collections at 32 items/depth 5. Each complete compact, material, or wait result also has one 262144-byte UTF-8 projection limit and reports `projection_truncated`, its original size, and its limit. Pending-response answers have a 524288-byte aggregate UTF-8 limit before command construction. Explicit bounded `raw` reads remain available for the full server text.
 
 ## Safety and recovery
 
@@ -248,7 +248,7 @@ hermes config unset plugins.entries.hermes-t3-control
 
 ## Security and credential handling
 
-Local mode resolves same-user bounded runtime metadata, a numeric loopback origin, the running Node executable, the exact T3 server entrypoint and package version, and the live environment descriptor. Before sending a bearer value, it pins the process identity, proves ownership of the listener, and proves the connected socket belongs to that pinned process. Its temporary bearer value stays in process memory, never enters argv, never persists, is not logged, and is revoked in `finally`. HTTP permits only `GET /.well-known/t3/environment`, `GET /api/orchestration/shell`, `GET /api/orchestration/threads/:threadId`, and `POST /api/orchestration/dispatch`. All proxies and redirects are disabled; origins must be numeric loopback. Responses are bounded to 1 MiB for environment metadata and 16 MiB for orchestration projections. Each public operation also has a 64 MiB cumulative response-body budget—four maximum-sized projections—so polling cannot accumulate unbounded input.
+Local mode resolves same-user bounded runtime metadata, a numeric loopback origin, the running Node executable, the exact T3 server entrypoint and package version, and the live environment descriptor. After client construction, the normalized public-argument credential-reflection preflight runs before every T3 HTTP request. Before sending a bearer value, the plugin pins the process identity, proves ownership of the listener, and proves the connected socket belongs to that pinned process. Its temporary bearer value stays in process memory, never enters argv, never persists, is not logged, and is revoked in `finally`. HTTP permits only `GET /.well-known/t3/environment`, `GET /api/orchestration/shell`, `GET /api/orchestration/threads/:threadId`, and `POST /api/orchestration/dispatch`. All proxies and redirects are disabled; origins must be numeric loopback. Responses are bounded to 1 MiB for environment metadata and 16 MiB for orchestration projections. Each public operation also has a 64 MiB cumulative response-body budget—four maximum-sized projections—so polling cannot accumulate unbounded input.
 
 `local-cli` currently requires Linux with `/proc` and `pidfd` support, including WSL2. It assumes a single-user WSL trust boundary and trusts the upstream T3 bundle owned by the current Windows account. Neither auth mode makes a plain shared loopback listener safe from mutually untrusted local users; `external-token` is not a multi-user isolation mechanism. Isolate the operating-system user and T3 service instead.
 
@@ -279,14 +279,37 @@ python3 -B scripts/verify_release.py "$RELEASE_DIR/hermes-t3-control-1.2.0.tar.g
 
 ## Development verification
 
-Run the dependency-free suite and release gates from a clean checkout:
+Run the dependency-free suite and local release gates from a clean checkout:
 
 ```bash
 PYTHONWARNINGS=error python3.11 -B -m unittest discover -s tests -v
-env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3.11 -B -m unittest -v tests.test_supported_install
 env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci
 python3 -B scripts/build_release.py --output-dir dist
 python3 -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256
 ```
 
-CI checks out each exact Hermes revision and runs `uv sync --frozen` before the supported installer regression. That regression uses an allowlisted environment with private temporary HOME/XDG paths and neutral Git configuration. Its fresh-process socket guard permits only the expected loopback TCP connection to a fixture server; it is not a general no-egress sandbox.
+The supported-install regression must run inside each exact Hermes lockfile environment. Set `UV_BIN` to a trusted uv 0.12.0 executable, then run this copyable gate from the plugin checkout:
+
+```bash
+set -eu
+umask 077
+UV_BIN="${UV_BIN:-uv}"
+test "$("$UV_BIN" --version)" = "uv 0.12.0"
+HERMES_GATES="$(mktemp -d)"
+trap 'rm -rf -- "$HERMES_GATES"' EXIT
+while read -r HERMES_VERSION HERMES_COMMIT; do
+  HERMES_TREE="$HERMES_GATES/hermes-$HERMES_VERSION"
+  git init -q "$HERMES_TREE"
+  git -C "$HERMES_TREE" remote add origin https://github.com/NousResearch/hermes-agent.git
+  GIT_TERMINAL_PROMPT=0 git -C "$HERMES_TREE" fetch --depth=1 origin "$HERMES_COMMIT"
+  git -C "$HERMES_TREE" checkout -q --detach FETCH_HEAD
+  "$UV_BIN" sync --frozen --project "$HERMES_TREE" --python 3.11
+  env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error \
+    "$UV_BIN" run --frozen --project "$HERMES_TREE" python -B -m unittest -v tests.test_supported_install
+done <<'EOF'
+0.20.4 e624e9fde561e1add9388384012b295fde669ade
+0.20.5 fcbd1076a93841fa88855acce810e342a5b78101
+EOF
+```
+
+CI performs the same SHA-pinned uv setup and `uv sync --frozen` gate. The regression itself uses an allowlisted environment with private temporary HOME/XDG paths and neutral Git configuration. Its fresh-process socket guard permits only the expected loopback TCP connection to a fixture server; it is not a general no-egress sandbox.

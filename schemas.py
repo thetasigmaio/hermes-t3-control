@@ -179,6 +179,10 @@ T3_THREAD_RESPOND_SCHEMA = _schema(
             "type": "object",
             "minProperties": 1,
             "maxProperties": 64,
+            "description": (
+                "Typed answers whose aggregate JSON encoding must not exceed "
+                "524288 UTF-8 bytes."
+            ),
             "propertyNames": dict(_ID),
             "additionalProperties": {
                 "oneOf": [

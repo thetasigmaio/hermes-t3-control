@@ -87,10 +87,27 @@ MAX_UPDATED_WITHIN_MINUTES = 10_080
 MAX_COMPACT_LIMIT = 50
 MAX_WAIT_SECONDS = 30
 MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
+MAX_ANSWERS_UTF8_BYTES = 524_288
 MAX_MODEL_TEXT_UTF16_UNITS = 8_192
 MAX_MODEL_PLAN_UTF16_UNITS = 16_384
 MAX_MODEL_COLLECTION_ITEMS = 32
 MAX_MODEL_PROJECTION_DEPTH = 5
+MAX_MODEL_PROJECTION_UTF8_BYTES = 262_144
+_MODEL_PROJECTION_METADATA_RESERVE = 8_192
+_MODEL_PROJECTION_PROTECTED_KEYS = frozenset(
+    {
+        "id",
+        "thread_id",
+        "project_id",
+        "request_id",
+        "turn_id",
+        "message_id",
+        "plan_id",
+        "command_id",
+        "target_id",
+        "before_cursor",
+    }
+)
 QUEUE_SEMANTICS = (
     "Explicit busy_policy queue acknowledges that T3 may start immediately or queue "
     "the exact persisted message; the server has no atomic idle guard."
@@ -438,6 +455,103 @@ def _bounded_model_value(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
     return None, True
 
 
+class _ProjectionBudget:
+    def __init__(self, *, text_bytes: int, collection_items: int) -> None:
+        self.text_bytes = text_bytes
+        self.collection_items = collection_items
+
+
+def _truncate_utf8(value: str, maximum: int) -> str:
+    raw = value.encode("utf-8")
+    if len(raw) <= maximum:
+        return value
+    return raw[:maximum].decode("utf-8", errors="ignore")
+
+
+def _project_with_shared_budget(
+    value: Any,
+    budget: _ProjectionBudget,
+    *,
+    key: str | None = None,
+) -> Any:
+    if isinstance(value, str):
+        encoded_size = len(value.encode("utf-8"))
+        if key in _MODEL_PROJECTION_PROTECTED_KEYS:
+            budget.text_bytes = max(0, budget.text_bytes - encoded_size)
+            return value
+        if encoded_size <= budget.text_bytes:
+            budget.text_bytes -= encoded_size
+            return value
+        projected = _truncate_utf8(value, max(0, budget.text_bytes))
+        budget.text_bytes = 0
+        return projected
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, list):
+        projected_items: list[Any] = []
+        for item in value:
+            if budget.collection_items <= 0:
+                break
+            budget.collection_items -= 1
+            projected_items.append(_project_with_shared_budget(item, budget))
+        return projected_items
+    if isinstance(value, dict):
+        return {
+            item_key: _project_with_shared_budget(
+                item_value,
+                budget,
+                key=item_key,
+            )
+            for item_key, item_value in value.items()
+        }
+    return None
+
+
+def _projection_bytes(value: dict[str, Any]) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _apply_model_projection_budget(payload: dict[str, Any]) -> dict[str, Any]:
+    original_bytes = _projection_bytes(payload)
+    target = MAX_MODEL_PROJECTION_UTF8_BYTES - _MODEL_PROJECTION_METADATA_RESERVE
+    if original_bytes <= target:
+        return {
+            **payload,
+            "projection_truncated": False,
+            "projection_original_utf8_bytes": original_bytes,
+            "projection_limit_utf8_bytes": MAX_MODEL_PROJECTION_UTF8_BYTES,
+        }
+    text_bytes = 160_000
+    collection_items = 512
+    while True:
+        budget = _ProjectionBudget(
+            text_bytes=text_bytes,
+            collection_items=collection_items,
+        )
+        candidate = _project_with_shared_budget(payload, budget)
+        candidate.update(
+            {
+                "projection_truncated": True,
+                "projection_original_utf8_bytes": original_bytes,
+                "projection_limit_utf8_bytes": MAX_MODEL_PROJECTION_UTF8_BYTES,
+            }
+        )
+        if _projection_bytes(candidate) <= target:
+            return candidate
+        text_bytes //= 2
+        collection_items //= 2
+        if text_bytes == 0 and collection_items == 0:
+            raise T3ClientError()
+
+
 def _normalized_session(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -677,12 +791,10 @@ def _actionable_plan(thread: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _plan_progress(thread: dict[str, Any]) -> tuple[Any, bool]:
-    updates = [item for item in thread.get("activities", []) if item["kind"] == "turn.plan.updated"]
-    if not updates:
+    value = thread.get("planProgress")
+    if not isinstance(value, dict):
         return None, False
-    projected, truncated = _bounded_model_value(
-        max(updates, key=_activity_order)["payload"]
-    )
+    projected, truncated = _bounded_model_value(value)
     return projected, truncated
 
 
@@ -720,12 +832,15 @@ def _thread_state(
     status = current_session.get("status") if isinstance(current_session, dict) else None
     latest = thread.get("latestTurn")
     turn_state = latest.get("state") if isinstance(latest, dict) else None
-    if status in {"starting", "running"}:
-        return status, "working"
-    if status == "stopped":
-        return "stopped", "stopped"
     if status == "error" or turn_state == "error":
         return "error", "error"
+    if status == "stopped":
+        return "stopped", "stopped"
+    background_liveness = thread.get("backgroundLiveness")
+    if background_liveness in {"working", "monitoring"}:
+        return "running", background_liveness
+    if status in {"starting", "running"}:
+        return status, "working"
     if turn_state == "interrupted":
         return "interrupted", "settled"
     if status == "ready":
@@ -968,7 +1083,7 @@ def t3_threads(ctx: Any, raw_args: Any) -> dict[str, Any]:
             raise ConflictError("The compact thread query did not resolve exactly one thread.")
         matches.sort(key=lambda pair: pair[0]["id"])
         matches.sort(key=lambda pair: pair[0]["updatedAt"], reverse=True)
-        return {
+        return _apply_model_projection_budget({
             "view": "compact",
             "snapshot_sequence": shell["snapshotSequence"],
             "updated_at": shell["updatedAt"],
@@ -979,7 +1094,7 @@ def t3_threads(ctx: Any, raw_args: Any) -> dict[str, Any]:
             ],
             "matched_count": matched_count,
             "threads": [_compact_thread(thread, project) for thread, project in matches[:limit]],
-        }
+        })
 
     return _execute_operation(ctx, normalized, perform)
 
@@ -1022,7 +1137,9 @@ def t3_thread_read(ctx: Any, raw_args: Any) -> dict[str, Any]:
             turn_limit=turn_limit,
             before_cursor=before_cursor,
         )
-        return _material_projection(detail, _project_for_thread(shell, detail["thread"]))
+        return _apply_model_projection_budget(
+            _material_projection(detail, _project_for_thread(shell, detail["thread"]))
+        )
 
     return _execute_operation(ctx, normalized, perform)
 
@@ -1436,7 +1553,7 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "updated_at": projected["updated_at"],
                 "settled_at": projected["settled_at"],
             }
-            return {
+            return _apply_model_projection_budget({
                 "action": "thread_wait_observed",
                 "thread_id": thread_id,
                 "wait_outcome": outcome,
@@ -1448,7 +1565,7 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "progress": progressed,
                 "latest_assistant_update": projected["latest_assistant_update"],
                 "material_delta": material_delta,
-            }
+            })
 
     return _execute_operation(ctx, normalized, perform)
 
@@ -1457,10 +1574,14 @@ def _normalize_answers(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or not value or len(value) > 64:
         _invalid("answers must be a non-empty object with at most 64 entries.")
     normalized: dict[str, Any] = {}
+    encoded_size = 2
     for key, answer in value.items():
         normalized_key = normalize_string(key, "answers key", max_chars=MAX_IDENTIFIER_CHARS)
         if normalized_key in normalized:
             _invalid("answers keys must be unique.")
+        encoded_size += len(
+            json.dumps(normalized_key, ensure_ascii=False).encode("utf-8")
+        ) + 2
         if isinstance(answer, str):
             if len(answer) > 120_000:
                 _invalid("answers string values exceed their character limit.")
@@ -1468,6 +1589,10 @@ def _normalize_answers(value: Any) -> dict[str, Any]:
                 answer.encode("utf-8")
             except UnicodeEncodeError:
                 _invalid("answers contain invalid Unicode.")
+            encoded_size += len(
+                json.dumps(answer, ensure_ascii=False).encode("utf-8")
+            )
+            normalized_answer: Any = answer
         elif isinstance(answer, list):
             if len(answer) > 64 or any(not isinstance(item, str) for item in answer):
                 _invalid("answers arrays must contain at most 64 strings.")
@@ -1478,6 +1603,16 @@ def _normalize_answers(value: Any) -> dict[str, Any]:
                     item.encode("utf-8")
             except UnicodeEncodeError:
                 _invalid("answers contain invalid Unicode.")
+            encoded_size += 2
+            normalized_items: list[str] = []
+            for item in answer:
+                encoded_size += len(
+                    json.dumps(item, ensure_ascii=False).encode("utf-8")
+                ) + 1
+                if encoded_size > MAX_ANSWERS_UTF8_BYTES:
+                    _invalid("answers exceed the aggregate UTF-8 byte limit.")
+                normalized_items.append(item)
+            normalized_answer = normalized_items
         elif isinstance(answer, (int, float)) and not isinstance(answer, bool):
             if (
                 isinstance(answer, float)
@@ -1488,9 +1623,16 @@ def _normalize_answers(value: Any) -> dict[str, Any]:
                 _invalid(
                     "answers numbers must be finite and within the exact JSON integer range."
                 )
+            encoded_size += len(json.dumps(answer).encode("ascii"))
+            normalized_answer = answer
         elif answer is not None and not isinstance(answer, (bool, int, float)):
             _invalid("answers contain an unsupported value.")
-        normalized[normalized_key] = copy.deepcopy(answer)
+        else:
+            encoded_size += len(json.dumps(answer).encode("ascii"))
+            normalized_answer = answer
+        if encoded_size > MAX_ANSWERS_UTF8_BYTES:
+            _invalid("answers exceed the aggregate UTF-8 byte limit.")
+        normalized[normalized_key] = normalized_answer
     return normalized
 
 

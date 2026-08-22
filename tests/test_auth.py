@@ -204,9 +204,9 @@ class CompatibilityModeTests(unittest.TestCase):
                 auth, "_pinned_runtime_process"
             ) as pinned, mock.patch.object(
                 auth,
-                "_validate_unauthenticated_runtime",
-                side_effect=lambda *_args: events.append("unauth-environment"),
-            ) as validate_unauthenticated, mock.patch.object(
+                "_validate_local_runtime_process",
+                side_effect=lambda *_args: events.append("local-identity"),
+            ) as validate_local, mock.patch.object(
                 auth,
                 "issue_local_session",
                 side_effect=lambda _runtime: (events.append("issue"), session)[1],
@@ -240,16 +240,16 @@ class CompatibilityModeTests(unittest.TestCase):
                 connected_socket_validator=mock.ANY,
             )
             validate.assert_called_once_with(transport, runtime)
-            self.assertEqual(validate_unauthenticated.call_count, 2)
+            self.assertEqual(validate_local.call_count, 2)
             revoke.assert_called_once_with(runtime, session.session_id)
             self.assertEqual(
                 events,
                 [
-                    "unauth-environment",
+                    "local-identity",
                     "issue",
                     "construct",
                     "preflight",
-                    "unauth-environment",
+                    "local-identity",
                     "environment",
                     "body",
                     "revoke",
@@ -862,7 +862,7 @@ class OperationLeaseTests(unittest.TestCase):
         pinned = stack.enter_context(mock.patch.object(auth, "_pinned_runtime_process"))
         pinned.return_value.__enter__.return_value = SimpleNamespace()
         stack.enter_context(
-            mock.patch.object(auth, "_validate_unauthenticated_runtime")
+            mock.patch.object(auth, "_validate_local_runtime_process")
         )
         stack.enter_context(
             mock.patch.object(auth, "issue_local_session", return_value=session)
@@ -871,7 +871,7 @@ class OperationLeaseTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(auth, "_validate_runtime_environment"))
         return stack
 
-    def test_environment_check_is_first_http_after_single_preflight(self) -> None:
+    def test_public_preflight_precedes_every_environment_http_probe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = local_runtime(Path(directory))
             session = issued_session()
@@ -881,10 +881,6 @@ class OperationLeaseTests(unittest.TestCase):
                 "preflight"
             )
             with self._local_patches(runtime, session, transport), mock.patch.object(
-                auth,
-                "_validate_unauthenticated_runtime",
-                side_effect=lambda *_args: events.append("environment-unauthenticated"),
-            ), mock.patch.object(
                 auth,
                 "_validate_runtime_environment",
                 side_effect=lambda *_args: events.append("environment-credentialed"),
@@ -897,9 +893,7 @@ class OperationLeaseTests(unittest.TestCase):
             self.assertEqual(
                 events,
                 [
-                    "environment-unauthenticated",
                     "preflight",
-                    "environment-unauthenticated",
                     "environment-credentialed",
                     "handler-http",
                 ],
@@ -907,6 +901,30 @@ class OperationLeaseTests(unittest.TestCase):
             transport._preflight_public_arguments.assert_called_once_with(
                 {"message": "public operation"}
             )
+
+    def test_failed_public_preflight_makes_zero_t3_http_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = local_runtime(Path(directory))
+            session = issued_session()
+            transport = mock.Mock()
+            transport._preflight_public_arguments.side_effect = client.InvalidInputError(
+                "sanitized preflight rejection"
+            )
+            with self._local_patches(runtime, session, transport), mock.patch.object(
+                auth, "_validate_unauthenticated_runtime"
+            ) as unauthenticated_http, mock.patch.object(
+                auth, "_validate_runtime_environment"
+            ) as credentialed_http, mock.patch.object(
+                auth, "revoke_local_session"
+            ):
+                with self.assertRaises(client.InvalidInputError):
+                    with auth.operation_client(
+                        FakeContext(), {"message": "public operation"}
+                    ):
+                        self.fail("preflight rejection yielded a client")
+
+            unauthenticated_http.assert_not_called()
+            credentialed_http.assert_not_called()
 
     def test_failed_post_issue_identity_recheck_sends_no_credential(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -916,9 +934,9 @@ class OperationLeaseTests(unittest.TestCase):
             stale = client.ConfigurationError("listener identity changed")
             with self._local_patches(runtime, session, transport), mock.patch.object(
                 auth,
-                "_validate_unauthenticated_runtime",
+                "_validate_local_runtime_process",
                 side_effect=[None, stale],
-            ) as validate_unauthenticated, mock.patch.object(
+            ) as validate_local, mock.patch.object(
                 auth, "_validate_runtime_environment"
             ) as credentialed_http, mock.patch.object(
                 auth, "revoke_local_session"
@@ -927,7 +945,7 @@ class OperationLeaseTests(unittest.TestCase):
                     with auth.operation_client(FakeContext(), {}):
                         self.fail("a stale listener received a credential")
 
-            self.assertEqual(validate_unauthenticated.call_count, 2)
+            self.assertEqual(validate_local.call_count, 2)
             credentialed_http.assert_not_called()
             revoke.assert_called_once_with(runtime, session.session_id)
 

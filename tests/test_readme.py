@@ -263,15 +263,29 @@ class ReadmeContractTests(unittest.TestCase):
     def test_development_gates_and_fresh_process_claim_are_precise(self) -> None:
         for command in (
             "PYTHONWARNINGS=error python3.11 -B -m unittest discover -s tests -v",
-            "env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3.11 -B -m unittest -v tests.test_supported_install",
             "env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci",
             "python3 -B scripts/build_release.py --output-dir dist",
             "python3 -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256",
         ):
             self.assertEqual(README.count(command), 1, command)
+        self.assertNotIn(
+            "HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3.11",
+            README,
+        )
         self.assertIn("`uv sync --frozen`", README)
         self.assertIn("expected loopback tcp connection", LOWER)
         self.assertNotIn("network-blocked", LOWER)
+
+    def test_supported_install_development_gate_builds_both_frozen_hermes_envs(self) -> None:
+        for phrase in (
+            'test "$("$UV_BIN" --version)" = "uv 0.12.0"',
+            "e624e9fde561e1add9388384012b295fde669ade",
+            "fcbd1076a93841fa88855acce810e342a5b78101",
+            '"$UV_BIN" sync --frozen --project "$HERMES_TREE" --python 3.11',
+            '"$UV_BIN" run --frozen --project "$HERMES_TREE" python -B -m unittest -v tests.test_supported_install',
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, README)
 
     def test_repository_paths_and_unpublished_status_are_safe(self) -> None:
         self.assertNotIn(".claude/spec", LOWER)
