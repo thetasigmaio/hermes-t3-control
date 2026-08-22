@@ -27,13 +27,20 @@ ARCHIVE_FILES = {
     "LICENSE",
     "README.md",
     "__init__.py",
+    "after-install.md",
     "auth.py",
     "client.py",
+    "docs/community-index-entry.json",
+    "docs/community-index.md",
+    "docs/compatibility.md",
+    "docs/operations.md",
+    "docs/security.md",
+    "docs/tools.md",
     "plugin.yaml",
     "schemas.py",
     "tools.py",
 }
-ARCHIVE_NAME = "hermes-t3-control-1.2.0.tar.gz"
+ARCHIVE_NAME = "hermes-t3-control-1.2.1.tar.gz"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
 RELEASE_ARTIFACT_NAMES = (ARCHIVE_NAME, CHECKSUM_NAME)
 ACTION_PINS = {
@@ -88,14 +95,15 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
-        self.assertEqual(manifest["version"], "1.2.0")
+        self.assertEqual(manifest["version"], "1.2.1")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"],
             "https://github.com/thetasigmaio/hermes-t3-control",
         )
-        self.assertIn("## [1.2.0] - 2026-08-22", changelog)
-        self.assertIn("1.2.0", readme)
+        self.assertIn("## [1.2.1] - 2026-08-22", changelog)
+        self.assertIn("1.2.1", readme)
+        self.assertIn("first non-thread-mutating prompt", changelog)
         self.assertIn("MIT", readme)
         self.assertTrue(license_text.startswith("MIT License\n"))
         self.assertIn("Copyright (c) 2026 Jakub Sladek", license_text)
@@ -103,10 +111,7 @@ class ReleaseMetadataTests(unittest.TestCase):
 
     def test_repository_and_ignore_hygiene(self) -> None:
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-        for spec_root in (
-            ROOT / ".codex" / "specs" / "hermes-t3-control",
-            ROOT / ".claude" / "specs" / "hermes-t3-control",
-        ):
+        for spec_root in (ROOT / ".codex" / "specs", ROOT / ".claude" / "specs"):
             self.assertFalse(
                 any(
                     entry.is_file() or entry.is_symlink()
@@ -148,6 +153,32 @@ class DeterministicArtifactTests(unittest.TestCase):
             )
         )
         return result
+
+    def test_release_inputs_reject_a_symlinked_parent_directory(self) -> None:
+        build = _load_build_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            source = base / "source"
+            source.mkdir()
+            external_docs = base / "external-docs"
+            external_docs.mkdir()
+            for relative_name in build.RELEASE_FILES:
+                relative = pathlib.Path(relative_name)
+                target_root = external_docs if relative.parts[0] == "docs" else source
+                target = target_root.joinpath(*relative.parts[1:]) if relative.parts[0] == "docs" else target_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"safe-release-input")
+            (source / "docs").symlink_to(external_docs, target_is_directory=True)
+
+            with mock.patch.object(build, "SOURCE_ROOT", source), self.assertRaises(
+                build.ReleaseBuildError
+            ) as raised:
+                build._release_inputs()
+
+            self.assertEqual(
+                str(raised.exception),
+                "Required release input is unsafe: docs/community-index-entry.json",
+            )
 
     @unittest.skipUnless(hasattr(os, "umask"), "POSIX umask support is required")
     def test_new_output_directory_is_private_under_permissive_caller_umask(self) -> None:
@@ -480,15 +511,15 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         upload = workflow.split("- name: Upload release artifacts", 1)[1]
         self.assertIn("python -B scripts/build_release.py --output-dir dist", workflow)
         self.assertIn(
-            "python -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256",
+            "python -B scripts/verify_release.py dist/hermes-t3-control-1.2.1.tar.gz.sha256",
             workflow,
         )
         paths = re.findall(r"(?m)^            (dist/\S+)$", upload)
         self.assertEqual(
             paths,
             [
-                "dist/hermes-t3-control-1.2.0.tar.gz",
-                "dist/hermes-t3-control-1.2.0.tar.gz.sha256",
+                "dist/hermes-t3-control-1.2.1.tar.gz",
+                "dist/hermes-t3-control-1.2.1.tar.gz.sha256",
             ],
         )
 

@@ -1,0 +1,18 @@
+{
+  "name": "hermes-t3-control",
+  "description": "Control T3 work from Hermes; core thread lifecycle verified end-to-end with Codex.",
+  "author": "Jakub Sladek",
+  "tags": [
+    "t3",
+    "codex",
+    "orchestration"
+  ],
+  "repo": "thetasigmaio/hermes-t3-control",
+  "ref": "8f42cb301fa065465e7d50e04e99577c328717f0",
+  "homepage": "https://github.com/thetasigmaio/hermes-t3-control",
+  "capabilities": [
+    "tools"
+  ],
+  "api_version": 1,
+  "added_at": "2026-08-22"
+}

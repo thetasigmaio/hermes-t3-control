@@ -367,7 +367,11 @@ class RegistrationTests(unittest.TestCase):
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual(manifest["api_version"], 1)
-        self.assertEqual(manifest["version"], "1.2.0")
+        self.assertEqual(manifest["version"], "1.2.1")
+        self.assertEqual(
+            manifest["description"],
+            "Control T3 work from Hermes with bounded tools and operation-scoped local authentication; core thread lifecycle verified end-to-end with Codex.",
+        )
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"], "https://github.com/thetasigmaio/hermes-t3-control"

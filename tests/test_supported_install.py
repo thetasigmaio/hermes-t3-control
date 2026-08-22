@@ -33,6 +33,13 @@ EXPECTED_TOOLS = (
 TEST_CREDENTIAL = "test-only-placeholder"
 DEVELOPMENT_UNTRACKED_ALLOWLIST = (
     pathlib.Path("auth.py"),
+    pathlib.Path("after-install.md"),
+    pathlib.Path("docs/community-index-entry.json"),
+    pathlib.Path("docs/community-index.md"),
+    pathlib.Path("docs/compatibility.md"),
+    pathlib.Path("docs/operations.md"),
+    pathlib.Path("docs/security.md"),
+    pathlib.Path("docs/tools.md"),
     pathlib.Path("tests/test_auth.py"),
     pathlib.Path("tests/test_schemas.py"),
 )
@@ -77,7 +84,7 @@ assert manifest.manifest_version == 1
 assert manifest.api_version == 1
 assert (manifest.name, manifest.version, manifest.kind) == (
     "hermes-t3-control",
-    "1.2.0",
+    "1.2.1",
     "standalone",
 )
 assert tuple(manifest.provides_tools) == expected_tools
@@ -502,7 +509,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
             disabled_plugins = json.loads(listed_disabled.stdout)
             self.assertEqual(len(disabled_plugins), 1)
             self.assertEqual(disabled_plugins[0]["name"], "hermes-t3-control")
-            self.assertEqual(disabled_plugins[0]["version"], "1.2.0")
+            self.assertEqual(disabled_plugins[0]["version"], "1.2.1")
             self.assertEqual(disabled_plugins[0]["source"], "git")
             self.assertEqual(disabled_plugins[0]["status"], "not enabled")
 
@@ -511,8 +518,17 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 (installed_root / "plugin.yaml").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["manifest_version"], 1)
-            self.assertEqual(manifest["version"], "1.2.0")
+            self.assertEqual(manifest["version"], "1.2.1")
             self.assertEqual(tuple(manifest["provides_tools"]), EXPECTED_TOOLS)
+            after_install = (installed_root / "after-install.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Hermes T3 Control: next steps", after_install)
+            self.assertIn(
+                "Call only `t3_threads` with `{}`; do not call mutation tools.",
+                after_install,
+            )
+            self.assertIn("Hermes T3 Control: next steps", installed.stdout)
             installed_revision = _run(
                 ["git", "rev-parse", "HEAD"],
                 cwd=installed_root,

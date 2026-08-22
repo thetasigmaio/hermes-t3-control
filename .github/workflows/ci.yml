@@ -87,13 +87,13 @@ jobs:
       - name: Build deterministic archive
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
-        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256
+        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.2.1.tar.gz.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.2.0
+          name: hermes-t3-control-1.2.1
           path: |
-            dist/hermes-t3-control-1.2.0.tar.gz
-            dist/hermes-t3-control-1.2.0.tar.gz.sha256
+            dist/hermes-t3-control-1.2.1.tar.gz
+            dist/hermes-t3-control-1.2.1.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
