@@ -309,7 +309,11 @@ class ReadAndSchemaTests(unittest.TestCase):
                 "hasPendingUserInput": True,
                 "hasActionableProposedPlan": False,
                 "backgroundLiveness": "working",
-                "planProgress": None,
+                "planProgress": {
+                    "step": "Inspect canonical progress",
+                    "completedSteps": 1,
+                    "totalSteps": 3,
+                },
             }
         )
         self.assertIs(client.validate_shell_snapshot(shell), shell)
@@ -334,6 +338,15 @@ class ReadAndSchemaTests(unittest.TestCase):
             ("hasPendingApprovals", 1),
             ("backgroundLiveness", []),
             ("planProgress", "working"),
+            ("planProgress", {}),
+            (
+                "planProgress",
+                {"step": "Inspect", "completedSteps": -1, "totalSteps": 3},
+            ),
+            (
+                "planProgress",
+                {"step": "Inspect", "completedSteps": 1, "totalSteps": True},
+            ),
         )
         for field, value in invalid_shell_fields:
             invalid = copy.deepcopy(shell)

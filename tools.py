@@ -832,13 +832,13 @@ def _thread_state(
     status = current_session.get("status") if isinstance(current_session, dict) else None
     latest = thread.get("latestTurn")
     turn_state = latest.get("state") if isinstance(latest, dict) else None
+    background_liveness = thread.get("backgroundLiveness")
+    if background_liveness in {"working", "monitoring"}:
+        return "running", background_liveness
     if status == "error" or turn_state == "error":
         return "error", "error"
     if status == "stopped":
         return "stopped", "stopped"
-    background_liveness = thread.get("backgroundLiveness")
-    if background_liveness in {"working", "monitoring"}:
-        return "running", background_liveness
     if status in {"starting", "running"}:
         return status, "working"
     if turn_state == "interrupted":
@@ -1995,6 +1995,8 @@ def _require_plan_ready(
 ) -> dict[str, Any]:
     thread = detail["thread"]
     _ensure_mutable_thread(thread)
+    if thread.get("backgroundLiveness") in {"working", "monitoring"}:
+        raise ConflictError("The target thread still has live background work.")
     current_session = thread["session"]
     if isinstance(current_session, dict) and current_session["status"] in {
         "starting",

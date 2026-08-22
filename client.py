@@ -408,7 +408,11 @@ def _validate_thread(value: Any, path: str, *, detail: bool) -> None:
     if "backgroundLiveness" in thread and thread["backgroundLiveness"] is not None:
         _enum(thread, "backgroundLiveness", BACKGROUND_LIVENESS_STATES, path)
     if "planProgress" in thread and thread["planProgress"] is not None:
-        _object(thread["planProgress"], f"{path}.planProgress")
+        progress_path = f"{path}.planProgress"
+        progress = _object(thread["planProgress"], progress_path)
+        _nonempty_string(progress, "step", progress_path)
+        _nonnegative_int(progress, "completedSteps", progress_path)
+        _nonnegative_int(progress, "totalSteps", progress_path)
     if "latestTurn" not in thread:
         raise ResponseSchemaError(f"{path}.latestTurn is required.")
     if thread["latestTurn"] is not None:

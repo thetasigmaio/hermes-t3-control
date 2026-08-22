@@ -184,6 +184,8 @@ Example for `t3_thread_implement_plan`:
 
 The tool verifies the native transition to interaction mode `default`, revalidates the unchanged plan, and starts the same-thread turn with `sourceProposedPlan`. If the mode transition is only accepted pending projection, it stops before dispatching the implementation turn and returns a safe reconciliation path. A full-access Plan implementation repeats the file-modification/deletion warning at the point of action.
 
+Live background work must clear before Plan implementation. Canonical `backgroundLiveness` remains authoritative even if the main provider session is stopped or errored, so re-read or wait rather than starting concurrent work in the same checkout.
+
 ## Ten-tool reference
 
 Every handler rejects unknown fields and returns sanitized JSON. Results contain `ok`; errors also contain a stable code, retryability, ambiguity, and safe recovery metadata.

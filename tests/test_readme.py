@@ -160,6 +160,7 @@ class ReadmeContractTests(unittest.TestCase):
             "Strict Plan to Build",
             "sourceProposedPlan",
             "never caller-authored plan prose",
+            "Live background work must clear before Plan implementation",
             "required_snapshot_sequence",
             "expected_message_id",
         ):

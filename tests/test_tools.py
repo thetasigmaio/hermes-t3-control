@@ -412,6 +412,30 @@ class AgentFacingReadToolTests(unittest.TestCase):
                 self.assertEqual(projected["lifecycle"], "running")
                 self.assertEqual(projected["liveness"], background_liveness)
 
+    def test_background_liveness_precedes_terminal_session_state(self) -> None:
+        for status in ("error", "stopped"):
+            with self.subTest(status=status):
+                shell = self._compact_shell()
+                thread = shell["threads"][0]
+                thread["title"] = f"Terminal background {status}"
+                current_session = session(status=status)
+                current_session["threadId"] = thread["id"]
+                thread["session"] = current_session
+                thread["latestTurn"] = latest_turn(state="error")
+                thread["backgroundLiveness"] = "working"
+                thread["hasPendingApprovals"] = False
+                thread["hasPendingUserInput"] = False
+                with LoopbackServer([Response(value=shell)]) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_threads,
+                        {"title_query": thread["title"], "require_one": True},
+                    )
+
+                projected = result["threads"][0]
+                self.assertEqual(projected["lifecycle"], "running")
+                self.assertEqual(projected["liveness"], "working")
+
     def test_threads_explicit_raw_is_legacy_exact_and_require_one_fails_closed(self) -> None:
         shell = self._compact_shell()
         with LoopbackServer([Response(value=shell)]) as server:
@@ -565,8 +589,9 @@ class AgentFacingReadToolTests(unittest.TestCase):
             ),
         ]
         detail["thread"]["planProgress"] = {
-            "plan": [{"step": "Implement", "status": "inProgress"}],
-            "explanation": "Working",
+            "step": "Implement",
+            "completedSteps": 1,
+            "totalSteps": 3,
         }
         detail["thread"]["projectId"] = "project-alpha"
         responder = projection_responder(shell, detail)
@@ -600,10 +625,7 @@ class AgentFacingReadToolTests(unittest.TestCase):
         self.assertEqual(projected["actionable_plan"]["id"], "plan-new")
         self.assertEqual(
             projected["plan_progress"],
-            {
-                "plan": [{"step": "Implement", "status": "inProgress"}],
-                "explanation": "Working",
-            },
+            {"step": "Implement", "completedSteps": 1, "totalSteps": 3},
         )
         self.assertEqual(
             [(request["kind"], request["request_id"]) for request in projected["pending_requests"]],
@@ -620,7 +642,11 @@ class AgentFacingReadToolTests(unittest.TestCase):
 
     def test_material_uses_canonical_plan_progress_and_respects_clear(self) -> None:
         shell = self._compact_shell()
-        canonical = {"step": "Canonical background work", "status": "inProgress"}
+        canonical = {
+            "step": "Canonical background work",
+            "completedSteps": 1,
+            "totalSteps": 3,
+        }
         historical = activity(
             activity_id="stale-plan-progress",
             kind="turn.plan.updated",
@@ -725,7 +751,9 @@ class AgentFacingReadToolTests(unittest.TestCase):
             for index in range(32)
         ]
         detail["thread"]["planProgress"] = {
-            "steps": ["p" * 20_000 for _ in range(32)]
+            "step": "p" * 20_000,
+            "completedSteps": 1,
+            "totalSteps": 32,
         }
         with LoopbackServer(
             [Response(value=shell_snapshot(sequence=88)), Response(value=detail)]
@@ -1675,7 +1703,8 @@ class AgentFacingWaitToolTests(unittest.TestCase):
                 detail["thread"]["backgroundLiveness"] = background_liveness
                 detail["thread"]["planProgress"] = {
                     "step": "Background work remains",
-                    "status": "inProgress",
+                    "completedSteps": 1,
+                    "totalSteps": 3,
                 }
                 result, _server = self._invoke_wait(
                     detail,
@@ -1694,9 +1723,35 @@ class AgentFacingWaitToolTests(unittest.TestCase):
                     result["material_delta"]["plan_progress"],
                     {
                         "step": "Background work remains",
-                        "status": "inProgress",
+                        "completedSteps": 1,
+                        "totalSteps": 3,
                     },
                 )
+
+    def test_wait_never_settles_terminal_state_with_live_background_work(self) -> None:
+        for status in ("error", "stopped"):
+            with self.subTest(status=status):
+                detail = with_projection_fields(
+                    detail_snapshot(
+                        sequence=17,
+                        turn=latest_turn(turn_id="turn-1", state="error"),
+                        current_session=session(status=status),
+                    ),
+                    thread_sequence=17,
+                )
+                detail["thread"]["backgroundLiveness"] = "monitoring"
+                result, _server = self._invoke_wait(
+                    detail,
+                    {
+                        "thread_id": "thread-1",
+                        "until": "terminal",
+                        "timeout_seconds": 0,
+                    },
+                )
+
+                self.assertEqual(result["wait_outcome"], "timeout")
+                self.assertEqual(result["lifecycle"], "running")
+                self.assertEqual(result["liveness"], "monitoring")
 
     def test_wait_receipt_has_one_cumulative_projection_budget(self) -> None:
         detail = with_projection_fields(
@@ -1716,8 +1771,26 @@ class AgentFacingWaitToolTests(unittest.TestCase):
             thread_sequence=16,
         )
         detail["thread"]["planProgress"] = {
-            "steps": ["p" * 20_000 for _ in range(32)]
+            "step": "p" * 120_000,
+            "completedSteps": 1,
+            "totalSteps": 32,
         }
+        detail["thread"]["activities"] = [
+            activity(
+                activity_id=f"wait-approval-{index}",
+                kind="approval.requested",
+                payload={
+                    "requestId": f"wait-request-{index}",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                    "detail": "d" * 20_000,
+                },
+                sequence=index + 1,
+                created_at=f"2026-08-21T12:00:{index:02d}Z",
+                turn_id="turn-1",
+            )
+            for index in range(32)
+        ]
         result, _server = self._invoke_wait(
             detail,
             {"thread_id": "thread-1", "until": "change", "timeout_seconds": 0},
@@ -3615,6 +3688,12 @@ class MutationToolTests(unittest.TestCase):
             detail_snapshot(sequence=1, proposed_plans=[already]),
             running,
         )
+        background = detail_snapshot(
+            sequence=1,
+            proposed_plans=[proposed_plan()],
+        )
+        background["thread"]["backgroundLiveness"] = "working"
+        cases += (background,)
         for detail in cases:
             with self.subTest(plan_count=len(detail["thread"]["proposedPlans"])):
                 with LoopbackServer([Response(value=detail)]) as server:
@@ -3625,6 +3704,38 @@ class MutationToolTests(unittest.TestCase):
                     )
                 self.assertEqual(result["error_code"], "conflict")
                 self.assertEqual([item["method"] for item in server.requests], ["GET"])
+
+    def test_plan_rechecks_background_liveness_after_mode_transition(self) -> None:
+        commands: list[dict] = []
+        plan = proposed_plan()
+        before = detail_snapshot(sequence=1, proposed_plans=[plan])
+        before["thread"]["interactionMode"] = "plan"
+        after_mode = detail_snapshot(sequence=2, proposed_plans=[plan])
+        after_mode["thread"]["interactionMode"] = "default"
+        after_mode["thread"]["backgroundLiveness"] = "monitoring"
+
+        with LoopbackServer(
+            [
+                Response(value=before),
+                captured_dispatch(commands),
+                Response(value=after_mode),
+            ]
+        ) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_implement_plan,
+                {"thread_id": "thread-1", "plan_id": "plan-1"},
+            )
+
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertEqual(
+            [command["type"] for command in commands],
+            ["thread.interaction-mode.set"],
+        )
+        self.assertEqual(
+            [request["method"] for request in server.requests],
+            ["GET", "POST", "GET"],
+        )
 
     def test_plan_second_phase_accepted_pending_reports_completed_mode_without_rollback(self) -> None:
         commands: list[dict] = []
