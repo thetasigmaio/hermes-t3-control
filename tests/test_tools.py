@@ -4,10 +4,12 @@ import copy
 import json
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import schemas
 import tools
+import auth
 from tests.support import (
     LoopbackServer,
     Response,
@@ -23,16 +25,23 @@ from tests.support import (
 
 class FakeContext:
     def __init__(
-        self, base_url: str, *, default_runtime_mode: object = None
+        self,
+        base_url: str,
+        *,
+        default_runtime_mode: object = None,
+        auth_mode: object = "external-token",
     ) -> None:
         self.base_url = base_url
         self.default_runtime_mode = default_runtime_mode
+        self.auth_mode = auth_mode
 
     def get_config(self, key: str, default: object = None) -> object:
         if key == "base_url":
             return self.base_url
         if key == "default_runtime_mode":
             return self.default_runtime_mode
+        if key == "auth_mode":
+            return self.auth_mode
         return default
 
 
@@ -46,11 +55,12 @@ def invoke(
     **kwargs: object,
 ) -> dict:
     handler = tools.bind_handler(context or FakeContext(server.base_url), operation)
+    resolved_credential = server.token if credential is None else credential
     with mock.patch.object(
         tools,
         "_profile_secret",
-        return_value=server.token if credential is None else credential,
-    ):
+        return_value=resolved_credential,
+    ), mock.patch.object(auth, "_profile_secret", return_value=resolved_credential):
         return json.loads(handler(args, **kwargs))
 
 
@@ -63,16 +73,92 @@ def captured_dispatch(store: list[dict]):
     return responder
 
 
+def projected_message(
+    *,
+    message_id: str,
+    role: str,
+    text: str,
+    turn_id: str | None,
+    streaming: bool = False,
+    created_at: str = "2026-08-21T12:00:00Z",
+    updated_at: str | None = None,
+) -> dict:
+    return {
+        "id": message_id,
+        "role": role,
+        "text": text,
+        "turnId": turn_id,
+        "streaming": streaming,
+        "createdAt": created_at,
+        "updatedAt": updated_at or created_at,
+    }
+
+
+def activity(
+    *,
+    activity_id: str,
+    kind: str,
+    payload: dict,
+    sequence: int,
+    created_at: str,
+    turn_id: str | None = "turn-1",
+) -> dict:
+    return {
+        "id": activity_id,
+        "tone": "approval" if kind.startswith("approval.") else "info",
+        "kind": kind,
+        "summary": kind,
+        "payload": payload,
+        "turnId": turn_id,
+        "sequence": sequence,
+        "createdAt": created_at,
+    }
+
+
+def with_projection_fields(detail: dict, *, thread_sequence: int | None = None) -> dict:
+    projected = copy.deepcopy(detail)
+    projected["thread"].setdefault("activities", [])
+    projected["thread"].setdefault("checkpoints", [])
+    if "page" in projected:
+        projected["page"]["threadSequence"] = (
+            projected["snapshotSequence"]
+            if thread_sequence is None
+            else thread_sequence
+        )
+    return projected
+
+
+def projection_responder(shell: dict, detail: dict):
+    def responder(request: dict) -> Response:
+        if request["path"] == "/api/orchestration/shell":
+            return Response(value=shell)
+        if request["path"].startswith("/api/orchestration/threads/"):
+            return Response(value=detail)
+        return Response(status=404, value={"code": "not_found"})
+
+    return responder
+
+
 class ReadToolTests(unittest.TestCase):
     def test_threads_and_detail_reads(self) -> None:
         shell = shell_snapshot(sequence=3)
         detail = detail_snapshot(sequence=4)
         with LoopbackServer([Response(value=shell), Response(value=detail)]) as server:
-            listed = invoke(server, tools.t3_threads, {}, ignored_context=True)
+            listed = invoke(
+                server,
+                tools.t3_threads,
+                {"view": "raw"},
+                ignored_context=True,
+            )
             read = invoke(
                 server,
                 tools.t3_thread_read,
-                {"thread_id": "thread-1", "turn_limit": 7, "before_cursor": "older"},
+                {
+                    "thread_id": "thread-1",
+                    "view": "raw",
+                    "turn_limit": 7,
+                    "before_cursor": "older",
+                },
             )
             self.assertTrue(listed["ok"])
             self.assertEqual(listed["shell"]["snapshotSequence"], 3)
@@ -91,7 +177,11 @@ class ReadToolTests(unittest.TestCase):
                 {"project_id": "project-1", "title": "Thread", "instance_id": "codex"},
             )
             handler = tools.bind_handler(FakeContext(server.base_url), tools.t3_threads)
-            with mock.patch.object(tools, "_profile_secret", side_effect=RuntimeError("hidden")):
+            with mock.patch.object(
+                tools, "_profile_secret", side_effect=RuntimeError("hidden")
+            ), mock.patch.object(
+                auth, "_profile_secret", side_effect=RuntimeError("hidden")
+            ):
                 unavailable = json.loads(handler({}))
             self.assertEqual(invalid["error_code"], "invalid_input")
             self.assertEqual(incomplete["error_code"], "invalid_input")
@@ -112,8 +202,12 @@ class ReadToolTests(unittest.TestCase):
                 f"{server.token}\N{LATIN SMALL LETTER E WITH ACUTE}",
             ):
                 with self.subTest(secret_shape=(len(invalid_secret), invalid_secret.strip() == invalid_secret)):
-                    with mock.patch.object(tools, "_profile_secret", return_value=invalid_secret):
-                        self.assertFalse(tools.check_t3_available())
+                    with mock.patch.object(
+                        tools, "_profile_secret", return_value=invalid_secret
+                    ), mock.patch.object(
+                        auth, "_profile_secret", return_value=invalid_secret
+                    ):
+                        self.assertTrue(tools.check_t3_available())
                         result = json.loads(handler({}))
                     self.assertEqual(result["error_code"], "configuration_error")
                     self.assertNotIn(invalid_secret, json.dumps(result))
@@ -132,11 +226,511 @@ class ReadToolTests(unittest.TestCase):
             self.assertEqual(server.requests, [])
 
 
+class AgentFacingReadToolTests(unittest.TestCase):
+    def _compact_shell(self) -> dict:
+        now = datetime.now(timezone.utc)
+
+        def stamp(minutes_ago: int) -> str:
+            return (
+                (now - timedelta(minutes=minutes_ago))
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+
+        shell = shell_snapshot(sequence=41)
+        project = shell["projects"][0]
+        project.update(
+            {
+                "id": "project-alpha",
+                "title": "Mission Alpha",
+                "workspaceRoot": "/work/alpha",
+            }
+        )
+        other_project = copy.deepcopy(project)
+        other_project.update(
+            {
+                "id": "project-beta",
+                "title": "Mission Beta",
+                "workspaceRoot": "/work/beta",
+            }
+        )
+
+        def compact_thread(
+            thread_id: str,
+            *,
+            project_id: str = "project-alpha",
+            title: str,
+            updated_at: str,
+            status: str = "ready",
+            pending_approval: bool = False,
+        ) -> dict:
+            current = session(status=status)
+            current["threadId"] = thread_id
+            current["updatedAt"] = updated_at
+            thread = copy.deepcopy(shell["threads"][0])
+            thread.update(
+                {
+                    "id": thread_id,
+                    "projectId": project_id,
+                    "title": title,
+                    "updatedAt": updated_at,
+                    "session": current,
+                    "latestUserMessageAt": updated_at,
+                    "hasPendingApprovals": pending_approval,
+                    "hasPendingUserInput": False,
+                    "hasActionableProposedPlan": False,
+                }
+            )
+            return thread
+
+        tied = stamp(2)
+        shell["projects"] = [project, other_project]
+        shell["threads"] = [
+            compact_thread("thread-b", title="Needle beta", updated_at=tied),
+            compact_thread("thread-a", title="NEEDLE alpha", updated_at=tied),
+            compact_thread(
+                "thread-blocked",
+                title="Needle blocked",
+                updated_at=stamp(1),
+                status="running",
+                pending_approval=True,
+            ),
+            compact_thread(
+                "thread-running",
+                title="Other",
+                updated_at=stamp(3),
+                status="running",
+            ),
+            compact_thread(
+                "thread-old",
+                title="Needle old",
+                updated_at=stamp(2_000),
+            ),
+            compact_thread(
+                "thread-other-project",
+                project_id="project-beta",
+                title="Needle elsewhere",
+                updated_at=stamp(1),
+            ),
+        ]
+        shell["updatedAt"] = stamp(0)
+        return shell
+
+    def test_threads_default_compact_filters_then_sorts_and_limits(self) -> None:
+        shell = self._compact_shell()
+        with LoopbackServer([Response(value=shell)]) as server:
+            result = invoke(
+                server,
+                tools.t3_threads,
+                {
+                    "project": "ALPHA",
+                    "workspace": "/work/alpha",
+                    "title_query": "needle",
+                    "lifecycle": "ready",
+                    "updated_within_minutes": 60,
+                    "limit": 2,
+                },
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["view"], "compact")
+        self.assertEqual(
+            [thread["id"] for thread in result["threads"]],
+            ["thread-a", "thread-b"],
+        )
+        first = result["threads"][0]
+        self.assertEqual(
+            first["project"],
+            {
+                "id": "project-alpha",
+                "title": "Mission Alpha",
+                "workspace": "/work/alpha",
+            },
+        )
+        self.assertEqual(first["lifecycle"], "ready")
+        self.assertEqual(first["liveness"], "settled")
+        self.assertIn("runtime_mode", first)
+        self.assertIn("interaction_mode", first)
+        self.assertIn("latest_user_message_at", first)
+
+    def test_threads_explicit_raw_is_legacy_exact_and_require_one_fails_closed(self) -> None:
+        shell = self._compact_shell()
+        with LoopbackServer([Response(value=shell)]) as server:
+            raw = invoke(server, tools.t3_threads, {"view": "raw"})
+        self.assertEqual(raw, {"ok": True, "shell": shell})
+
+        for title_query in ("does not exist", "needle"):
+            with self.subTest(title_query=title_query):
+                with LoopbackServer([Response(value=shell)]) as server:
+                    failed = invoke(
+                        server,
+                        tools.t3_threads,
+                        {
+                            "view": "compact",
+                            "project": "project-alpha",
+                            "title_query": title_query,
+                            "require_one": True,
+                            "limit": 50,
+                        },
+                    )
+                self.assertEqual(failed["error_code"], "conflict")
+                self.assertEqual([item["method"] for item in server.requests], ["GET"])
+
+    def test_threads_project_workspace_and_blocked_lifecycle_aliases_are_explicit(self) -> None:
+        shell = self._compact_shell()
+        cases = (
+            ({"project": "mission alpha", "title_query": "blocked"}, "thread-blocked"),
+            ({"project": "alpha", "title_query": "blocked"}, "thread-blocked"),
+            ({"workspace": "alpha", "title_query": "blocked"}, "thread-blocked"),
+            ({"lifecycle": "blocked"}, "thread-blocked"),
+        )
+        for filters, expected_id in cases:
+            with self.subTest(filters=filters):
+                with LoopbackServer([Response(value=shell)]) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_threads,
+                        {"view": "compact", "require_one": True, **filters},
+                    )
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["threads"][0]["id"], expected_id)
+                self.assertEqual(len(result["threads"]), 1)
+
+    def test_thread_read_defaults_to_bounded_material_projection(self) -> None:
+        shell = self._compact_shell()
+        plan_old = proposed_plan(plan_id="plan-old", plan_markdown="Old")
+        plan_old["updatedAt"] = "2026-08-21T11:00:00Z"
+        plan_new = proposed_plan(plan_id="plan-new", plan_markdown="Ship it")
+        plan_new["updatedAt"] = "2026-08-21T12:05:00Z"
+        implemented = proposed_plan(
+            plan_id="plan-done",
+            implemented_at="2026-08-21T12:04:00Z",
+            implementation_thread_id="thread-1",
+        )
+        running_session = session(status="running", active_turn_id="turn-1")
+        running_session["lastError"] = "provider needs attention"
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=52,
+                messages=[
+                    projected_message(
+                        message_id="assistant-old",
+                        role="assistant",
+                        text="old answer",
+                        turn_id="turn-0",
+                        created_at="2026-08-21T11:00:00Z",
+                    ),
+                    projected_message(
+                        message_id="user-new",
+                        role="user",
+                        text="new request",
+                        turn_id="turn-1",
+                        created_at="2026-08-21T12:01:00Z",
+                    ),
+                    projected_message(
+                        message_id="assistant-new",
+                        role="assistant",
+                        text="working update",
+                        turn_id="turn-1",
+                        streaming=True,
+                        created_at="2026-08-21T12:02:00Z",
+                        updated_at="2026-08-21T12:03:00Z",
+                    ),
+                ],
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=running_session,
+                proposed_plans=[plan_old, implemented, plan_new],
+            ),
+            thread_sequence=17,
+        )
+        detail["thread"]["activities"] = [
+            activity(
+                activity_id="approval-resolved-first",
+                kind="approval.resolved",
+                payload={"requestId": "approval-closed"},
+                sequence=2,
+                created_at="2026-08-21T12:00:02Z",
+            ),
+            activity(
+                activity_id="approval-requested-first",
+                kind="approval.requested",
+                payload={
+                    "requestId": "approval-closed",
+                    "requestKind": "file-read",
+                    "requestType": "file_read_approval",
+                },
+                sequence=1,
+                created_at="2026-08-21T12:00:01Z",
+            ),
+            activity(
+                activity_id="approval-open",
+                kind="approval.requested",
+                payload={
+                    "requestId": "approval-open",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                    "detail": "Run the focused tests",
+                },
+                sequence=4,
+                created_at="2026-08-21T12:02:00Z",
+            ),
+            activity(
+                activity_id="input-open",
+                kind="user-input.requested",
+                payload={
+                    "requestId": "input-open",
+                    "questions": [
+                        {
+                            "id": "scope",
+                            "header": "Scope",
+                            "question": "Which scope?",
+                            "options": [
+                                {"label": "Focused", "description": "Only focused tests"}
+                            ],
+                            "multiSelect": False,
+                        }
+                    ],
+                },
+                sequence=5,
+                created_at="2026-08-21T12:02:01Z",
+            ),
+            activity(
+                activity_id="plan-progress",
+                kind="turn.plan.updated",
+                payload={
+                    "plan": [{"step": "Implement", "status": "inProgress"}],
+                    "explanation": "Working",
+                },
+                sequence=6,
+                created_at="2026-08-21T12:02:02Z",
+            ),
+        ]
+        detail["thread"]["projectId"] = "project-alpha"
+        responder = projection_responder(shell, detail)
+        with LoopbackServer([responder, responder]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("view", result)
+        self.assertEqual(result["view"], "material")
+        self.assertEqual(result["snapshot_sequence"], 52)
+        self.assertEqual(result["thread_sequence"], 17)
+        self.assertEqual(result["page"]["has_more"], False)
+        projected = result["thread"]
+        self.assertEqual(
+            projected["project"],
+            {"id": "project-alpha", "title": "Mission Alpha", "workspace": "/work/alpha"},
+        )
+        self.assertEqual(projected["lifecycle"], "blocked")
+        self.assertEqual(projected["liveness"], "action_required")
+        self.assertEqual(projected["runtime_mode"], "approval-required")
+        self.assertEqual(projected["interaction_mode"], "default")
+        self.assertEqual(projected["session"]["active_turn_id"], "turn-1")
+        self.assertEqual(projected["last_error"], "provider needs attention")
+        self.assertEqual(projected["latest_user_update"]["id"], "user-new")
+        self.assertEqual(projected["latest_assistant_update"]["id"], "assistant-new")
+        self.assertTrue(projected["latest_assistant_update"]["streaming"])
+        self.assertEqual(projected["actionable_plan"]["id"], "plan-new")
+        self.assertEqual(
+            projected["plan_progress"],
+            {
+                "plan": [{"step": "Implement", "status": "inProgress"}],
+                "explanation": "Working",
+            },
+        )
+        self.assertEqual(
+            [(request["kind"], request["request_id"]) for request in projected["pending_requests"]],
+            [("approval", "approval-open"), ("user_input", "input-open")],
+        )
+        self.assertEqual(projected["settled_at"], None)
+        self.assertEqual(projected["latest_user_message_at"], "2026-08-21T12:01:00Z")
+        self.assertEqual(projected["created_at"], "2026-08-21T12:00:00Z")
+        self.assertEqual(projected["updated_at"], "2026-08-21T12:00:00Z")
+        self.assertEqual(
+            sorted(request["method"] for request in server.requests),
+            ["GET", "GET"],
+        )
+
+    def test_material_read_drops_request_resolved_by_later_unsequenced_activity(self) -> None:
+        requested = activity(
+            activity_id="input-requested",
+            kind="user-input.requested",
+            payload={"requestId": "input-1", "questions": []},
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        resolved = activity(
+            activity_id="input-resolved",
+            kind="user-input.resolved",
+            payload={"requestId": "input-1", "answers": {"confirmed": True}},
+            sequence=5,
+            created_at="2026-08-21T12:00:01Z",
+        )
+        resolved.pop("sequence")
+        detail = with_projection_fields(
+            detail_snapshot(sequence=5, current_session=session(status="ready")),
+            thread_sequence=5,
+        )
+        detail["thread"]["activities"] = [requested, resolved]
+        shell = shell_snapshot(sequence=5)
+        responder = projection_responder(shell, detail)
+
+        with LoopbackServer([responder, responder]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["thread"]["pending_requests"], [])
+        self.assertEqual(result["thread"]["lifecycle"], "ready")
+        self.assertEqual(result["thread"]["liveness"], "settled")
+
+    def test_material_read_keeps_request_when_later_resolution_is_for_other_turn(
+        self,
+    ) -> None:
+        requested = activity(
+            activity_id="input-requested",
+            kind="user-input.requested",
+            payload={"requestId": "reused-id", "questions": []},
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+            turn_id="turn-new",
+        )
+        other_turn_resolution = activity(
+            activity_id="input-resolved-old-turn",
+            kind="user-input.resolved",
+            payload={"requestId": "reused-id", "answers": {"scope": "Old"}},
+            sequence=5,
+            created_at="2026-08-21T12:00:01Z",
+            turn_id="turn-old",
+        )
+        detail = with_projection_fields(
+            detail_snapshot(sequence=5, current_session=session(status="running")),
+            thread_sequence=5,
+        )
+        detail["thread"]["activities"] = [requested, other_turn_resolution]
+        shell = shell_snapshot(sequence=5)
+        responder = projection_responder(shell, detail)
+
+        with LoopbackServer([responder, responder]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [item["request_id"] for item in result["thread"]["pending_requests"]],
+            ["reused-id"],
+        )
+        self.assertEqual(result["thread"]["liveness"], "action_required")
+
+    def test_material_read_closes_one_request_on_unscoped_stale_provider_failure(
+        self,
+    ) -> None:
+        requested = activity(
+            activity_id="input-requested",
+            kind="user-input.requested",
+            payload={"requestId": "input-1", "questions": []},
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+            turn_id="turn-1",
+        )
+        failed = activity(
+            activity_id="input-response-failed",
+            kind="provider.user-input.respond.failed",
+            payload={"requestId": "input-1", "reason": "stale pending request"},
+            sequence=5,
+            created_at="2026-08-21T12:00:01Z",
+            turn_id=None,
+        )
+        detail = with_projection_fields(
+            detail_snapshot(sequence=5, current_session=session(status="ready")),
+            thread_sequence=5,
+        )
+        detail["thread"]["activities"] = [requested, failed]
+        shell = shell_snapshot(sequence=5)
+        responder = projection_responder(shell, detail)
+
+        with LoopbackServer([responder, responder]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["thread"]["pending_requests"], [])
+        self.assertEqual(result["thread"]["liveness"], "settled")
+
+    def test_material_read_keeps_reused_requests_on_unscoped_provider_failure(
+        self,
+    ) -> None:
+        requests = [
+            activity(
+                activity_id=f"input-requested-{turn_id}",
+                kind="user-input.requested",
+                payload={"requestId": "reused-id", "questions": []},
+                sequence=sequence,
+                created_at=f"2026-08-21T12:00:0{sequence}Z",
+                turn_id=turn_id,
+            )
+            for sequence, turn_id in ((1, "turn-1"), (2, "turn-2"))
+        ]
+        failed = activity(
+            activity_id="input-response-failed",
+            kind="provider.user-input.respond.failed",
+            payload={"requestId": "reused-id", "reason": "unknown pending request"},
+            sequence=3,
+            created_at="2026-08-21T12:00:03Z",
+            turn_id=None,
+        )
+        detail = with_projection_fields(
+            detail_snapshot(sequence=3, current_session=session(status="running")),
+            thread_sequence=3,
+        )
+        detail["thread"]["activities"] = [*requests, failed]
+        shell = shell_snapshot(sequence=3)
+        responder = projection_responder(shell, detail)
+
+        with LoopbackServer([responder, responder]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [item["request_id"] for item in result["thread"]["pending_requests"]],
+            ["reused-id", "reused-id"],
+        )
+        self.assertEqual(result["thread"]["liveness"], "action_required")
+
+    def test_thread_read_explicit_raw_preserves_detail_contract(self) -> None:
+        detail = with_projection_fields(detail_snapshot(sequence=12), thread_sequence=7)
+        with LoopbackServer([Response(value=detail)]) as server:
+            raw = invoke(
+                server,
+                tools.t3_thread_read,
+                {"thread_id": "thread-1", "view": "raw"},
+            )
+        self.assertEqual(raw, {"ok": True, "detail": detail})
+
+
 class PublicArgumentPreflightTests(unittest.TestCase):
     def test_active_credential_in_every_public_string_path_makes_no_http_request(self) -> None:
         base_args = {
+            "t3_threads": {"view": "compact"},
             "t3_thread_read": {
                 "thread_id": "thread-1",
+                "view": "material",
                 "turn_limit": 20,
                 "before_cursor": "older",
             },
@@ -152,7 +746,11 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 "branch": "feature/test",
                 "worktree_path": "/work/test",
             },
-            "t3_thread_send": {"thread_id": "thread-1", "message": "Continue"},
+            "t3_thread_send": {
+                "thread_id": "thread-1",
+                "message": "Continue",
+                "busy_policy": "reject",
+            },
             "t3_thread_set_mode": {
                 "thread_id": "thread-1",
                 "runtime_mode": "approval-required",
@@ -163,6 +761,16 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             },
             "t3_turn_interrupt": {"thread_id": "thread-1"},
             "t3_session_stop": {"thread_id": "thread-1"},
+            "t3_thread_wait": {
+                "thread_id": "thread-1",
+                "until": "terminal",
+                "timeout_seconds": 0,
+            },
+            "t3_thread_respond": {
+                "thread_id": "thread-1",
+                "request_id": "approval-1",
+                "decision": "accept",
+            },
         }
         public_string_paths = {
             (tool_name, (field_name,))
@@ -179,13 +787,23 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 ("t3_thread_create", ("model_options", "value")),
             }
         )
+        if "t3_thread_respond" in schemas.SCHEMAS:
+            public_string_paths.add(
+                ("t3_thread_respond", ("answers", "question-1"))
+            )
         mode_credentials = {
             ("t3_thread_create", ("runtime_mode",)): "auto",
             ("t3_thread_create", ("interaction_mode",)): "plan",
             ("t3_thread_set_mode", ("runtime_mode",)): "auto",
             ("t3_thread_set_mode", ("interaction_mode",)): "plan",
+            ("t3_threads", ("view",)): "compact",
+            ("t3_threads", ("lifecycle",)): "running",
+            ("t3_thread_read", ("view",)): "material",
+            ("t3_thread_send", ("busy_policy",)): "queue",
+            ("t3_thread_wait", ("until",)): "terminal",
+            ("t3_thread_respond", ("decision",)): "accept",
         }
-        self.assertEqual(len(public_string_paths), 22)
+        self.assertEqual(len(public_string_paths), 35)
 
         with LoopbackServer([]) as server:
             for tool_name, field_path in sorted(public_string_paths):
@@ -201,6 +819,9 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                         payload.pop("runtime_mode")
                     if field_path[0] == "model_options":
                         payload["model_options"][0][field_path[1]] = credential
+                    elif field_path[0] == "answers":
+                        payload.pop("decision")
+                        payload["answers"] = {field_path[1]: credential}
                     else:
                         payload[field_path[0]] = credential
                     request_count = len(server.requests)
@@ -227,6 +848,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
 
     def test_non_null_string_schema_and_handler_parity_makes_no_http_request(self) -> None:
         base_args = {
+            "t3_threads": {},
             "t3_thread_read": {"thread_id": "thread-1", "turn_limit": 20},
             "t3_thread_create": {"project_id": "project-1", "title": "Thread"},
             "t3_thread_send": {"thread_id": "thread-1", "message": "Continue"},
@@ -240,6 +862,12 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             },
             "t3_turn_interrupt": {"thread_id": "thread-1"},
             "t3_session_stop": {"thread_id": "thread-1"},
+            "t3_thread_wait": {"thread_id": "thread-1"},
+            "t3_thread_respond": {
+                "thread_id": "thread-1",
+                "request_id": "approval-1",
+                "decision": "accept",
+            },
         }
         schema_matrix = {
             (tool_name, field_name)
@@ -264,6 +892,8 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                     and field_name == "interaction_mode"
                 ):
                     payload.pop("runtime_mode")
+                if tool_name == "t3_thread_respond" and field_name == "decision":
+                    payload["decision"] = None
                 payload[field_name] = None
 
                 with self.subTest(tool=tool_name, field=field_name):
@@ -279,13 +909,1158 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             omitted = invoke(
                 server,
                 tools.t3_thread_read,
-                {"thread_id": "thread-1"},
+                {"thread_id": "thread-1", "view": "raw"},
             )
             self.assertTrue(omitted["ok"])
             self.assertEqual(
                 server.requests[0]["path"],
                 "/api/orchestration/threads/thread-1?turnLimit=20",
             )
+
+    def test_respond_rejects_non_javascript_safe_integers_without_http(self) -> None:
+        unsafe = 2**53
+        with LoopbackServer([]) as server:
+            for answer in (unsafe, -unsafe):
+                with self.subTest(answer_sign=1 if answer > 0 else -1):
+                    request_count = len(server.requests)
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_respond"],
+                        {
+                            "thread_id": "thread-1",
+                            "request_id": "input-1",
+                            "answers": {"count": answer},
+                        },
+                    )
+                    self.assertEqual(result["error_code"], "invalid_input")
+                    self.assertEqual(len(server.requests), request_count)
+
+    def test_respond_rejects_invalid_unicode_in_answer_arrays_without_http(self) -> None:
+        with LoopbackServer([]) as server:
+            result = invoke(
+                server,
+                tools.OPERATIONS["t3_thread_respond"],
+                {
+                    "thread_id": "thread-1",
+                    "request_id": "input-1",
+                    "answers": {"scope": ["\ud800"]},
+                },
+            )
+
+        self.assertEqual(result["error_code"], "invalid_input")
+        self.assertEqual(server.requests, [])
+
+
+class AgentFacingSendToolTests(unittest.TestCase):
+    def test_send_busy_policy_defaults_reject_and_never_posts(self) -> None:
+        running = detail_snapshot(
+            sequence=3,
+            turn=latest_turn(turn_id="turn-active", state="running"),
+            current_session=session(status="running", active_turn_id="turn-active"),
+        )
+        with LoopbackServer(
+            [
+                Response(value=running),
+                Response(status=400, value={"code": "invalid_request"}),
+            ]
+        ) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_send,
+                {"thread_id": "thread-1", "message": "Do not queue implicitly"},
+            )
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertEqual([request["method"] for request in server.requests], ["GET"])
+
+    def test_send_queue_accepts_only_exact_persisted_unlinked_message(self) -> None:
+        commands: list[dict] = []
+        running_session = session(status="running", active_turn_id="turn-active")
+        before = with_projection_fields(
+            detail_snapshot(
+                sequence=3,
+                turn=latest_turn(turn_id="turn-active", state="running"),
+                current_session=running_session,
+            ),
+            thread_sequence=8,
+        )
+
+        def dispatch(request: dict) -> Response:
+            commands.append(json.loads(request["body"]))
+            return Response(value={"sequence": 9})
+
+        def queued_readback(request: dict) -> Response:
+            command = commands[0]
+            persisted = projected_message(
+                message_id=command["message"]["messageId"],
+                role="user",
+                text=command["message"]["text"],
+                turn_id=None,
+                created_at=command["createdAt"],
+            )
+            after = with_projection_fields(
+                detail_snapshot(
+                    sequence=9,
+                    messages=[persisted],
+                    turn=latest_turn(turn_id="turn-active", state="running"),
+                    current_session=running_session,
+                ),
+                thread_sequence=9,
+            )
+            return Response(value=after)
+
+        with LoopbackServer(
+            [Response(value=before), dispatch, queued_readback]
+        ) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": " queue this exactly ",
+                    "busy_policy": "queue",
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["verification"], "verified")
+        self.assertEqual(result["command_state"], "queued")
+        self.assertEqual(result["persisted_message"]["id"], result["message_id"])
+        self.assertEqual(result["persisted_message"]["text"], "queue this exactly")
+        self.assertIsNone(result["persisted_message"]["turn_id"])
+        self.assertEqual(result["latest_turn"]["turnId"], "turn-active")
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["type"], "thread.turn.start")
+        self.assertNotIn("busyPolicy", commands[0])
+
+    def test_send_reports_started_completed_error_and_blocked_observed_states(self) -> None:
+        cases = (
+            ("started", "running", "running", []),
+            ("completed", "completed", "ready", []),
+            ("error", "error", "error", []),
+            (
+                "blocked",
+                "running",
+                "running",
+                [
+                    activity(
+                        activity_id="approval-open",
+                        kind="approval.requested",
+                        payload={
+                            "requestId": "approval-open",
+                            "requestKind": "command",
+                            "requestType": "exec_command_approval",
+                        },
+                        sequence=7,
+                        created_at="2026-08-21T12:00:01Z",
+                        turn_id="turn-new",
+                    )
+                ],
+            ),
+        )
+        for command_state, turn_state, session_status, activities in cases:
+            with self.subTest(command_state=command_state):
+                commands: list[dict] = []
+                before = with_projection_fields(
+                    detail_snapshot(
+                        sequence=5,
+                        current_session=session(status="ready"),
+                    ),
+                    thread_sequence=5,
+                )
+
+                def dispatch(request: dict) -> Response:
+                    commands.append(json.loads(request["body"]))
+                    return Response(value={"sequence": 6})
+
+                def readback(request: dict) -> Response:
+                    command = commands[0]
+                    current_session = session(
+                        status=session_status,
+                        active_turn_id=("turn-new" if session_status == "running" else None),
+                    )
+                    after = with_projection_fields(
+                        detail_snapshot(
+                            sequence=6,
+                            messages=[
+                                projected_message(
+                                    message_id=command["message"]["messageId"],
+                                    role="user",
+                                    text=command["message"]["text"],
+                                    turn_id="turn-new",
+                                    created_at=command["createdAt"],
+                                )
+                            ],
+                            turn=latest_turn(turn_id="turn-new", state=turn_state),
+                            current_session=current_session,
+                        ),
+                        thread_sequence=6,
+                    )
+                    after["thread"]["activities"] = copy.deepcopy(activities)
+                    return Response(value=after)
+
+                with LoopbackServer(
+                    [Response(value=before), dispatch, readback]
+                ) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_thread_send,
+                        {"thread_id": "thread-1", "message": "Run"},
+                    )
+                self.assertTrue(result["ok"])
+                self.assertIn("command_state", result)
+                self.assertEqual(result["command_state"], command_state)
+                self.assertEqual(result["persisted_message"]["turn_id"], "turn-new")
+
+
+class AgentFacingWaitToolTests(unittest.TestCase):
+    def _invoke_wait(self, detail: dict, args: dict) -> tuple[dict, LoopbackServer]:
+        self.assertIn("t3_thread_wait", tools.OPERATIONS)
+        shell = shell_snapshot(sequence=detail["snapshotSequence"])
+        responder = projection_responder(shell, detail)
+        server = LoopbackServer([responder] * 12)
+        server.__enter__()
+        try:
+            result = invoke(server, tools.OPERATIONS["t3_thread_wait"], args)
+        finally:
+            server.__exit__(None, None, None)
+        return result, server
+
+    def test_wait_rejects_unbounded_timeout_before_http(self) -> None:
+        self.assertIn("t3_thread_wait", tools.OPERATIONS)
+        with LoopbackServer([]) as server:
+            result = invoke(
+                server,
+                tools.OPERATIONS["t3_thread_wait"],
+                {"thread_id": "thread-1", "timeout_seconds": 31},
+            )
+        self.assertEqual(result["error_code"], "invalid_input")
+        self.assertEqual(server.requests, [])
+
+    def test_wait_reports_per_thread_progress_and_latest_assistant_delta(self) -> None:
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=20,
+                messages=[
+                    projected_message(
+                        message_id="assistant-progress",
+                        role="assistant",
+                        text="Implemented the first step",
+                        turn_id="turn-1",
+                        created_at="2026-08-21T12:02:00Z",
+                    )
+                ],
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=session(status="running", active_turn_id="turn-1"),
+            ),
+            thread_sequence=8,
+        )
+        result, _server = self._invoke_wait(
+            detail,
+            {
+                "thread_id": "thread-1",
+                "after_thread_sequence": 7,
+                "until": "change",
+                "timeout_seconds": 0,
+            },
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["wait_outcome"], "progressed")
+        self.assertEqual(result["thread_sequence"], 8)
+        self.assertEqual(result["liveness"], "working")
+        self.assertTrue(result["progress"])
+        self.assertEqual(result["latest_assistant_update"]["id"], "assistant-progress")
+        self.assertEqual(
+            result["material_delta"]["latest_assistant_update"]["text"],
+            "Implemented the first step",
+        )
+
+    def test_wait_distinguishes_action_required_settled_and_timeout(self) -> None:
+        blocked = with_projection_fields(
+            detail_snapshot(
+                sequence=10,
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=session(status="running", active_turn_id="turn-1"),
+            ),
+            thread_sequence=10,
+        )
+        blocked["thread"]["activities"] = [
+            activity(
+                activity_id="input-open",
+                kind="user-input.requested",
+                payload={"requestId": "input-open", "questions": []},
+                sequence=10,
+                created_at="2026-08-21T12:00:00Z",
+            )
+        ]
+        settled = with_projection_fields(
+            detail_snapshot(
+                sequence=11,
+                turn=latest_turn(turn_id="turn-1", state="completed"),
+                current_session=session(status="ready"),
+            ),
+            thread_sequence=11,
+        )
+        unchanged = with_projection_fields(
+            detail_snapshot(
+                sequence=12,
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=session(status="running", active_turn_id="turn-1"),
+            ),
+            thread_sequence=12,
+        )
+        cases = (
+            (
+                blocked,
+                {"thread_id": "thread-1", "until": "blocked", "timeout_seconds": 0},
+                "action_required",
+                "action_required",
+            ),
+            (
+                settled,
+                {"thread_id": "thread-1", "until": "terminal", "timeout_seconds": 0},
+                "settled",
+                "settled",
+            ),
+            (
+                settled,
+                {
+                    "thread_id": "thread-1",
+                    "after_thread_sequence": 11,
+                    "until": "terminal",
+                    "timeout_seconds": 0,
+                },
+                "timeout",
+                "settled",
+            ),
+            (
+                unchanged,
+                {
+                    "thread_id": "thread-1",
+                    "after_thread_sequence": 12,
+                    "until": "change",
+                    "timeout_seconds": 0,
+                },
+                "timeout",
+                "working",
+            ),
+        )
+        for detail, args, outcome, liveness in cases:
+            with self.subTest(outcome=outcome):
+                result, _server = self._invoke_wait(detail, args)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["wait_outcome"], outcome)
+                self.assertEqual(result["liveness"], liveness)
+
+
+class AgentFacingRespondToolTests(unittest.TestCase):
+    def _pending_detail(self, *activities: dict, sequence: int = 4) -> dict:
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=sequence,
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=session(status="running", active_turn_id="turn-1"),
+            ),
+            thread_sequence=sequence,
+        )
+        detail["thread"]["activities"] = list(activities)
+        return detail
+
+    def _invoke_with_short_projection_window(
+        self,
+        before: dict,
+        after: dict,
+        response_args: dict,
+    ) -> tuple[dict, list[dict]]:
+        commands: list[dict] = []
+
+        def dispatch(request: dict) -> Response:
+            commands.append(json.loads(request["body"]))
+            return Response(value={"sequence": 5})
+
+        with LoopbackServer(
+            [Response(value=before), dispatch] + [Response(value=after)] * 12
+        ) as server:
+            transport = tools.T3Client(
+                server.base_url,
+                server.token,
+                request_timeout=0.1,
+                mutation_timeout=0.08,
+                mutation_poll_timeout=0.04,
+                poll_interval=0.01,
+                retry_backoff=(),
+            )
+            with mock.patch.object(tools, "_make_client", return_value=transport):
+                result = invoke(
+                    server,
+                    tools.OPERATIONS["t3_thread_respond"],
+                    {"thread_id": "thread-1", **response_args},
+                )
+        return result, commands
+
+    def test_respond_dispatches_exact_typed_approval_or_user_input_command(self) -> None:
+        approval = activity(
+            activity_id="approval-open",
+            kind="approval.requested",
+            payload={
+                "requestId": "approval-open",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        user_input = activity(
+            activity_id="input-open",
+            kind="user-input.requested",
+            payload={
+                "requestId": "input-open",
+                "questions": [
+                    {
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Choose scope",
+                        "options": [],
+                        "multiSelect": False,
+                    }
+                ],
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        cases = (
+            (
+                approval,
+                {"request_id": "approval-open", "decision": "acceptForSession"},
+                "thread.approval.respond",
+                {"decision": "acceptForSession"},
+                "approval.resolved",
+            ),
+            (
+                user_input,
+                {"request_id": "input-open", "answers": {"scope": "Focused"}},
+                "thread.user-input.respond",
+                {"answers": {"scope": "Focused"}},
+                "user-input.resolved",
+            ),
+        )
+        self.assertIn("t3_thread_respond", tools.OPERATIONS)
+        for requested, response_args, command_type, command_payload, resolved_kind in cases:
+            with self.subTest(command_type=command_type):
+                commands: list[dict] = []
+                before = self._pending_detail(requested, sequence=4)
+
+                def dispatch(request: dict) -> Response:
+                    commands.append(json.loads(request["body"]))
+                    return Response(value={"sequence": 5})
+
+                def readback(_request: dict) -> Response:
+                    command_time = datetime.fromisoformat(
+                        commands[0]["createdAt"].replace("Z", "+00:00")
+                    ) + timedelta(milliseconds=1)
+                    resolved = activity(
+                        activity_id="resolved",
+                        kind=resolved_kind,
+                        payload={
+                            "requestId": response_args["request_id"],
+                            **command_payload,
+                        },
+                        sequence=5,
+                        created_at=command_time.isoformat(timespec="milliseconds").replace(
+                            "+00:00", "Z"
+                        ),
+                    )
+                    if resolved_kind == "user-input.resolved":
+                        resolved.pop("sequence")
+                    return Response(
+                        value=self._pending_detail(requested, resolved, sequence=5)
+                    )
+
+                with LoopbackServer(
+                    [Response(value=before), dispatch, readback]
+                ) as server:
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_respond"],
+                        {"thread_id": "thread-1", **response_args},
+                    )
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["accepted"])
+                self.assertTrue(result["completed"])
+                self.assertEqual(result["verification"], "verified")
+                self.assertEqual(result["action"], "pending_request_responded")
+                self.assertEqual(result["request_id"], response_args["request_id"])
+                self.assertEqual(commands[0]["type"], command_type)
+                self.assertEqual(commands[0]["threadId"], "thread-1")
+                self.assertEqual(commands[0]["requestId"], response_args["request_id"])
+                for key, value in command_payload.items():
+                    self.assertEqual(commands[0][key], value)
+
+    def test_respond_preserves_javascript_safe_integer_boundaries(self) -> None:
+        safe = 2**53 - 1
+        requested = activity(
+            activity_id="input-open",
+            kind="user-input.requested",
+            payload={"requestId": "input-open", "questions": []},
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        for answer in (-safe, safe):
+            with self.subTest(answer_sign=1 if answer > 0 else -1):
+                resolved = activity(
+                    activity_id=(
+                        "resolved-positive" if answer > 0 else "resolved-negative"
+                    ),
+                    kind="user-input.resolved",
+                    payload={
+                        "requestId": "input-open",
+                        "answers": {"count": answer},
+                    },
+                    sequence=5,
+                    created_at="2026-08-21T12:00:01Z",
+                )
+                with mock.patch.object(
+                    tools,
+                    "_now_rfc3339",
+                    return_value="2026-08-21T12:00:00.500Z",
+                ):
+                    result, commands = self._invoke_with_short_projection_window(
+                        self._pending_detail(requested, sequence=4),
+                        self._pending_detail(requested, resolved, sequence=5),
+                        {"request_id": "input-open", "answers": {"count": answer}},
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["completed"])
+                self.assertEqual(commands[0]["answers"], {"count": answer})
+
+    def test_respond_verifies_t3_canonical_single_and_multi_choice_answers(self) -> None:
+        requested = activity(
+            activity_id="input-open",
+            kind="user-input.requested",
+            payload={"requestId": "input-open", "questions": []},
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        cases = (
+            ({"scope": ["Focused"]}, {"scope": "Focused"}),
+            ({"scope": ["Focused", "Broad"]}, {"scope": ["Focused", "Broad"]}),
+        )
+        for requested_answers, projected_answers in cases:
+            with self.subTest(requested_answers=requested_answers):
+                resolved = activity(
+                    activity_id="resolved",
+                    kind="user-input.resolved",
+                    payload={
+                        "requestId": "input-open",
+                        "answers": projected_answers,
+                    },
+                    sequence=5,
+                    created_at="2026-08-21T12:00:01Z",
+                )
+                with mock.patch.object(
+                    tools,
+                    "_now_rfc3339",
+                    return_value="2026-08-21T12:00:00.500Z",
+                ):
+                    result, commands = self._invoke_with_short_projection_window(
+                        self._pending_detail(requested, sequence=4),
+                        self._pending_detail(requested, resolved, sequence=5),
+                        {
+                            "request_id": "input-open",
+                            "answers": requested_answers,
+                        },
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["completed"])
+                self.assertEqual(result["verification"], "verified")
+                self.assertEqual(commands[0]["answers"], requested_answers)
+
+    def test_respond_rejects_matching_provider_failure_activity(self) -> None:
+        cases = (
+            (
+                "approval.requested",
+                {
+                    "requestId": "request-1",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                },
+                {"request_id": "request-1", "decision": "accept"},
+                "provider.approval.respond.failed",
+            ),
+            (
+                "user-input.requested",
+                {"requestId": "request-1", "questions": []},
+                {"request_id": "request-1", "answers": {"scope": "Focused"}},
+                "provider.user-input.respond.failed",
+            ),
+        )
+        for requested_kind, requested_payload, response_args, failure_kind in cases:
+            with self.subTest(failure_kind=failure_kind):
+                requested = activity(
+                    activity_id="requested",
+                    kind=requested_kind,
+                    payload=requested_payload,
+                    sequence=4,
+                    created_at="2026-08-21T12:00:00Z",
+                )
+                failed = activity(
+                    activity_id="failed",
+                    kind=failure_kind,
+                    payload={"requestId": "request-1", "reason": "stale pending request"},
+                    sequence=5,
+                    created_at="2026-08-21T12:00:01Z",
+                )
+                with mock.patch.object(
+                    tools,
+                    "_now_rfc3339",
+                    return_value="2026-08-21T12:00:00.500Z",
+                ):
+                    result, commands = self._invoke_with_short_projection_window(
+                        self._pending_detail(requested, sequence=4),
+                        self._pending_detail(requested, failed, sequence=5),
+                        response_args,
+                    )
+
+                self.assertEqual(result["error_code"], "concurrent_state_change")
+                self.assertTrue(result["outcome_ambiguous"])
+                self.assertEqual(len(commands), 1)
+
+    def test_respond_rejects_real_null_turn_equal_time_provider_failure(self) -> None:
+        command_time = "2026-08-21T12:00:01Z"
+        cases = (
+            (
+                "approval.requested",
+                {
+                    "requestId": "request-1",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                },
+                {"request_id": "request-1", "decision": "accept"},
+                "provider.approval.respond.failed",
+            ),
+            (
+                "user-input.requested",
+                {"requestId": "request-1", "questions": []},
+                {"request_id": "request-1", "answers": {"scope": "Focused"}},
+                "provider.user-input.respond.failed",
+            ),
+        )
+        for requested_kind, requested_payload, response_args, failure_kind in cases:
+            with self.subTest(failure_kind=failure_kind):
+                requested = activity(
+                    activity_id="requested",
+                    kind=requested_kind,
+                    payload=requested_payload,
+                    sequence=4,
+                    created_at="2026-08-21T12:00:00Z",
+                    turn_id="turn-1",
+                )
+                failed = activity(
+                    activity_id="failed",
+                    kind=failure_kind,
+                    payload={"requestId": "request-1", "reason": "provider failure"},
+                    sequence=5,
+                    created_at=command_time,
+                    turn_id=None,
+                )
+                with mock.patch.object(
+                    tools,
+                    "_now_rfc3339",
+                    return_value=command_time,
+                ):
+                    result, commands = self._invoke_with_short_projection_window(
+                        self._pending_detail(requested, sequence=4),
+                        self._pending_detail(requested, failed, sequence=5),
+                        response_args,
+                    )
+
+                self.assertEqual(result["error_code"], "concurrent_state_change")
+                self.assertTrue(result["outcome_ambiguous"])
+                self.assertEqual(len(commands), 1)
+
+    def test_respond_rejects_concurrent_different_resolution(self) -> None:
+        cases = (
+            (
+                "approval.requested",
+                {
+                    "requestId": "request-1",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                },
+                {"request_id": "request-1", "decision": "accept"},
+                "approval.resolved",
+                {"requestId": "request-1", "decision": "decline"},
+            ),
+            (
+                "user-input.requested",
+                {"requestId": "request-1", "questions": []},
+                {"request_id": "request-1", "answers": {"scope": "Focused"}},
+                "user-input.resolved",
+                {"requestId": "request-1", "answers": {"scope": "All"}},
+            ),
+            (
+                "user-input.requested",
+                {"requestId": "request-1", "questions": []},
+                {
+                    "request_id": "request-1",
+                    "answers": {"confirmed": True},
+                },
+                "user-input.resolved",
+                {
+                    "requestId": "request-1",
+                    "answers": {"confirmed": 1},
+                },
+            ),
+        )
+        for (
+            requested_kind,
+            requested_payload,
+            response_args,
+            resolved_kind,
+            resolved_payload,
+        ) in cases:
+            with self.subTest(resolved_kind=resolved_kind):
+                requested = activity(
+                    activity_id="requested",
+                    kind=requested_kind,
+                    payload=requested_payload,
+                    sequence=4,
+                    created_at="2026-08-21T12:00:00Z",
+                )
+                resolved = activity(
+                    activity_id="resolved",
+                    kind=resolved_kind,
+                    payload=resolved_payload,
+                    sequence=5,
+                    created_at="2026-08-21T12:00:01Z",
+                )
+                with mock.patch.object(
+                    tools,
+                    "_now_rfc3339",
+                    return_value="2026-08-21T12:00:00.500Z",
+                ):
+                    result, commands = self._invoke_with_short_projection_window(
+                        self._pending_detail(requested, sequence=4),
+                        self._pending_detail(requested, resolved, sequence=5),
+                        response_args,
+                    )
+
+                self.assertEqual(result["error_code"], "concurrent_state_change")
+                self.assertTrue(result["outcome_ambiguous"])
+                self.assertEqual(len(commands), 1)
+
+    def test_respond_ignores_pre_dispatch_terminal_activity_and_remains_pending(self) -> None:
+        stale_resolution = activity(
+            activity_id="old-resolution",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "accept"},
+            sequence=2,
+            created_at="2026-08-21T11:59:58Z",
+        )
+        stale_resolution.pop("sequence")
+        requested = activity(
+            activity_id="requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        before = self._pending_detail(stale_resolution, requested, sequence=4)
+        after = self._pending_detail(stale_resolution, sequence=5)
+
+        result, commands = self._invoke_with_short_projection_window(
+            before,
+            after,
+            {"request_id": "request-1", "decision": "accept"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "pending_request_response_accepted")
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["dispatch_sequence"], 5)
+        self.assertEqual(result["reconciliation"]["required_snapshot_sequence"], 5)
+        self.assertEqual(len(commands), 1)
+
+    def test_respond_ignores_newly_projected_unsequenced_terminal_older_than_request(self) -> None:
+        requested = activity(
+            activity_id="approval-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        stale_resolution = activity(
+            activity_id="hidden-old-resolution",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "accept"},
+            sequence=2,
+            created_at="2026-08-21T11:59:00Z",
+        )
+        stale_resolution.pop("sequence")
+        result, commands = self._invoke_with_short_projection_window(
+            self._pending_detail(requested, sequence=4),
+            self._pending_detail(requested, stale_resolution, sequence=5),
+            {"request_id": "request-1", "decision": "accept"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "pending_request_response_accepted")
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["dispatch_sequence"], 5)
+        self.assertEqual(len(commands), 1)
+
+    def test_respond_ignores_unsequenced_terminal_at_exact_dispatch_timestamp(self) -> None:
+        command_time = "2026-08-21T12:00:01.000Z"
+        requested = activity(
+            activity_id="approval-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        ambiguous_resolution = activity(
+            activity_id="equal-time-resolution",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "accept"},
+            sequence=5,
+            created_at=command_time,
+        )
+        ambiguous_resolution.pop("sequence")
+        with mock.patch.object(tools, "_now_rfc3339", return_value=command_time):
+            result, commands = self._invoke_with_short_projection_window(
+                self._pending_detail(requested, sequence=4),
+                self._pending_detail(requested, ambiguous_resolution, sequence=5),
+                {"request_id": "request-1", "decision": "accept"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "pending_request_response_accepted")
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(len(commands), 1)
+
+    def test_respond_ignores_newly_projected_sequenced_terminal_before_dispatch(
+        self,
+    ) -> None:
+        command_time = "2026-08-21T12:00:02.000Z"
+        requested = activity(
+            activity_id="approval-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        hidden_resolution = activity(
+            activity_id="hidden-resolution",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "accept"},
+            sequence=5,
+            created_at="2026-08-21T12:00:01Z",
+        )
+        with mock.patch.object(tools, "_now_rfc3339", return_value=command_time):
+            result, commands = self._invoke_with_short_projection_window(
+                self._pending_detail(requested, sequence=4),
+                self._pending_detail(requested, hidden_resolution, sequence=5),
+                {"request_id": "request-1", "decision": "accept"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "pending_request_response_accepted")
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(len(commands), 1)
+
+    def test_respond_accepts_low_session_sequence_terminal_after_dispatch(self) -> None:
+        requested = activity(
+            activity_id="approval-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=1,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        resolved = activity(
+            activity_id="approval-resolved",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "accept"},
+            sequence=2,
+            created_at="2026-08-21T12:00:02Z",
+        )
+        with mock.patch.object(
+            tools,
+            "_now_rfc3339",
+            return_value="2026-08-21T12:00:01Z",
+        ):
+            result, commands = self._invoke_with_short_projection_window(
+                self._pending_detail(requested, sequence=100),
+                self._pending_detail(requested, resolved, sequence=101),
+                {"request_id": "request-1", "decision": "accept"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["verification"], "verified")
+        self.assertEqual(len(commands), 1)
+
+    def test_respond_ignores_late_terminal_for_reused_id_on_other_turn(self) -> None:
+        old_requested = activity(
+            activity_id="old-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "reused-id",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=1,
+            created_at="2026-08-21T12:00:00Z",
+            turn_id="turn-old",
+        )
+        old_resolved = activity(
+            activity_id="old-resolved",
+            kind="approval.resolved",
+            payload={"requestId": "reused-id", "decision": "decline"},
+            sequence=2,
+            created_at="2026-08-21T12:00:00.500Z",
+            turn_id="turn-old",
+        )
+        new_requested = activity(
+            activity_id="new-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "reused-id",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=3,
+            created_at="2026-08-21T12:00:01Z",
+            turn_id="turn-new",
+        )
+        late_old_resolution = activity(
+            activity_id="late-old-resolution",
+            kind="approval.resolved",
+            payload={"requestId": "reused-id", "decision": "accept"},
+            sequence=4,
+            created_at="2026-08-21T12:00:02Z",
+            turn_id="turn-old",
+        )
+        before = self._pending_detail(
+            old_requested,
+            old_resolved,
+            new_requested,
+            sequence=3,
+        )
+        after = self._pending_detail(
+            old_requested,
+            old_resolved,
+            new_requested,
+            late_old_resolution,
+            sequence=5,
+        )
+        with mock.patch.object(
+            tools,
+            "_now_rfc3339",
+            return_value="2026-08-21T12:00:01.500Z",
+        ):
+            result, commands = self._invoke_with_short_projection_window(
+                before,
+                after,
+                {"request_id": "reused-id", "decision": "accept"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "pending_request_response_accepted")
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(len(commands), 1)
+
+    def test_respond_rejects_equal_timestamp_unsequenced_terminal_before_post(self) -> None:
+        created_at = "2026-08-21T12:00:00Z"
+        requested = activity(
+            activity_id="z-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at=created_at,
+        )
+        ambiguous_resolution = activity(
+            activity_id="a-resolved",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "decline"},
+            sequence=5,
+            created_at=created_at,
+        )
+        ambiguous_resolution.pop("sequence")
+        detail = self._pending_detail(
+            requested,
+            ambiguous_resolution,
+            sequence=4,
+        )
+
+        result, commands = self._invoke_with_short_projection_window(
+            detail,
+            detail,
+            {"request_id": "request-1", "decision": "accept"},
+        )
+
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertFalse(result["outcome_ambiguous"])
+        self.assertEqual(commands, [])
+
+    def test_respond_rejects_equal_sequence_terminal_before_post(self) -> None:
+        requested = activity(
+            activity_id="approval-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "request-1",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:01Z",
+        )
+        ambiguous_resolution = activity(
+            activity_id="approval-resolved",
+            kind="approval.resolved",
+            payload={"requestId": "request-1", "decision": "decline"},
+            sequence=4,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        detail = self._pending_detail(
+            requested,
+            ambiguous_resolution,
+            sequence=4,
+        )
+
+        result, commands = self._invoke_with_short_projection_window(
+            detail,
+            detail,
+            {"request_id": "request-1", "decision": "accept"},
+        )
+
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertFalse(result["outcome_ambiguous"])
+        self.assertEqual(commands, [])
+
+    def test_respond_rejects_duplicate_same_kind_request_id_before_post(self) -> None:
+        first = activity(
+            activity_id="approval-requested-first",
+            kind="approval.requested",
+            payload={
+                "requestId": "same-id",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=3,
+            created_at="2026-08-21T12:00:00Z",
+            turn_id="turn-1",
+        )
+        second = activity(
+            activity_id="approval-requested-second",
+            kind="approval.requested",
+            payload={
+                "requestId": "same-id",
+                "requestKind": "file-read",
+                "requestType": "file_read_approval",
+            },
+            sequence=4,
+            created_at="2026-08-21T12:00:01Z",
+            turn_id="turn-2",
+        )
+        detail = self._pending_detail(first, second, sequence=4)
+
+        result, commands = self._invoke_with_short_projection_window(
+            detail,
+            detail,
+            {"request_id": "same-id", "decision": "accept"},
+        )
+
+        self.assertEqual(result["error_code"], "conflict")
+        self.assertFalse(result["outcome_ambiguous"])
+        self.assertEqual(commands, [])
+
+    def test_respond_stale_mismatched_or_ambiguous_request_never_posts(self) -> None:
+        requested_approval = activity(
+            activity_id="approval-requested",
+            kind="approval.requested",
+            payload={
+                "requestId": "same-id",
+                "requestKind": "command",
+                "requestType": "exec_command_approval",
+            },
+            sequence=1,
+            created_at="2026-08-21T12:00:00Z",
+        )
+        requested_input = activity(
+            activity_id="input-requested",
+            kind="user-input.requested",
+            payload={"requestId": "same-id", "questions": []},
+            sequence=2,
+            created_at="2026-08-21T12:00:01Z",
+        )
+        resolved_approval = activity(
+            activity_id="approval-resolved",
+            kind="approval.resolved",
+            payload={"requestId": "same-id"},
+            sequence=3,
+            created_at="2026-08-21T12:00:02Z",
+        )
+        cases = (
+            (
+                self._pending_detail(requested_approval, resolved_approval),
+                {"request_id": "same-id", "decision": "accept"},
+            ),
+            (
+                self._pending_detail(requested_input),
+                {"request_id": "same-id", "decision": "accept"},
+            ),
+            (
+                self._pending_detail(requested_approval),
+                {"request_id": "same-id", "answers": {"scope": "Focused"}},
+            ),
+            (
+                self._pending_detail(requested_approval, requested_input),
+                {"request_id": "same-id", "decision": "accept"},
+            ),
+        )
+        self.assertIn("t3_thread_respond", tools.OPERATIONS)
+        for detail, response_args in cases:
+            with self.subTest(response_args=response_args, activity_count=len(detail["thread"]["activities"])):
+                with LoopbackServer([Response(value=detail)]) as server:
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_respond"],
+                        {"thread_id": "thread-1", **response_args},
+                    )
+                self.assertEqual(result["error_code"], "conflict")
+                self.assertEqual([request["method"] for request in server.requests], ["GET"])
 
 
 class MutationToolTests(unittest.TestCase):
@@ -805,6 +2580,30 @@ class MutationToolTests(unittest.TestCase):
         self.assertNotIn("interactionMode", commands[0])
         self.assertEqual(changed["active_turn_unchanged"], "turn-1")
         self.assertIn("approval already pending", changed["warning"])
+        self.assertIn("full-access permits", changed["warning"])
+        self.assertEqual(
+            changed["warnings"],
+            [tools.FULL_ACCESS_WARNING, tools.PENDING_APPROVAL_WARNING],
+        )
+
+        idle_after = detail_snapshot(sequence=2)
+        idle_after["thread"]["runtimeMode"] = "full-access"
+        with LoopbackServer(
+            [
+                Response(value=detail_snapshot(sequence=1)),
+                Response(value={"sequence": 2}),
+                Response(value=idle_after),
+            ]
+        ) as server:
+            idle_full_access = invoke(
+                server,
+                tools.t3_thread_set_mode,
+                {"thread_id": "thread-1", "runtime_mode": "full-access"},
+            )
+        self.assertEqual(
+            idle_full_access["warnings"], [tools.FULL_ACCESS_WARNING]
+        )
+        self.assertEqual(idle_full_access["warning"], tools.FULL_ACCESS_WARNING)
 
         commands = []
         interaction_after = detail_snapshot(sequence=1)
@@ -868,6 +2667,11 @@ class MutationToolTests(unittest.TestCase):
         self.assertFalse(failed["ok"])
         self.assertEqual(failed["details"]["active_turn_unchanged"], "turn-1")
         self.assertIn("approval already pending", failed["details"]["warning"])
+        self.assertIn("full-access permits", failed["details"]["warning"])
+        self.assertEqual(
+            failed["details"]["warnings"],
+            [tools.FULL_ACCESS_WARNING, tools.PENDING_APPROVAL_WARNING],
+        )
 
     def test_plan_to_build_orders_native_mode_and_provenance_turn(self) -> None:
         commands: list[dict] = []
@@ -942,6 +2746,69 @@ class MutationToolTests(unittest.TestCase):
             commands[1]["sourceProposedPlan"],
         )
         self.assertIn("at-most-once", result["race_semantics"])
+
+    def test_plan_halts_when_mode_is_accepted_pending_projection(self) -> None:
+        commands: list[dict] = []
+        plan = proposed_plan()
+        before = with_projection_fields(
+            detail_snapshot(sequence=3, proposed_plans=[plan]),
+            thread_sequence=3,
+        )
+        before["thread"]["interactionMode"] = "plan"
+        stale_projection = with_projection_fields(
+            detail_snapshot(sequence=4, proposed_plans=[plan]),
+            thread_sequence=4,
+        )
+        stale_projection["thread"]["interactionMode"] = "default"
+
+        def dispatch(request: dict) -> Response:
+            commands.append(json.loads(request["body"]))
+            return Response(value={"sequence": 5})
+
+        with LoopbackServer(
+            [Response(value=before), dispatch] + [Response(value=stale_projection)] * 12
+        ) as server:
+            transport = tools.T3Client(
+                server.base_url,
+                server.token,
+                request_timeout=0.1,
+                mutation_timeout=0.08,
+                mutation_poll_timeout=0.04,
+                poll_interval=0.01,
+                retry_backoff=(),
+            )
+            with mock.patch.object(tools, "_make_client", return_value=transport):
+                result = invoke(
+                    server,
+                    tools.t3_thread_implement_plan,
+                    {"thread_id": "thread-1", "plan_id": "plan-1"},
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["action"],
+            "plan_mode_transition_accepted_pending_projection",
+        )
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(
+            result["reconciliation"],
+            {
+                "tool": "t3_thread_read",
+                "arguments": {
+                    "thread_id": "thread-1",
+                    "view": "raw",
+                    "turn_limit": 150,
+                },
+                "required_snapshot_sequence": 5,
+            },
+        )
+        self.assertEqual([command["type"] for command in commands], ["thread.interaction-mode.set"])
+        self.assertEqual(
+            [request["method"] for request in server.requests].count("POST"),
+            1,
+        )
 
     def test_plan_mode_boundary_requires_accepted_sequence_after_ambiguity(self) -> None:
         for initial_mode in ("default", "plan"):
@@ -1105,10 +2972,10 @@ class MutationToolTests(unittest.TestCase):
                         tools.t3_thread_implement_plan,
                         {"thread_id": "thread-1", "plan_id": "plan-1"},
                     )
-                    self.assertEqual(result["error_code"], "conflict")
-                    self.assertEqual([item["method"] for item in server.requests], ["GET"])
+                self.assertEqual(result["error_code"], "conflict")
+                self.assertEqual([item["method"] for item in server.requests], ["GET"])
 
-    def test_plan_second_phase_failure_reports_completed_mode_without_rollback(self) -> None:
+    def test_plan_second_phase_accepted_pending_reports_completed_mode_without_rollback(self) -> None:
         commands: list[dict] = []
         plan = proposed_plan()
         before = detail_snapshot(sequence=1, proposed_plans=[plan])
@@ -1128,13 +2995,13 @@ class MutationToolTests(unittest.TestCase):
                 tools.t3_thread_implement_plan,
                 {"thread_id": "thread-1", "plan_id": "plan-1"},
             )
-        self.assertFalse(result["ok"])
+        self.assertTrue(result["ok"])
         self.assertEqual(len(commands), 2)
-        self.assertEqual(result["details"]["workflow_phase"], "implementation_turn")
-        self.assertEqual(result["details"]["completed_phase"], "interaction_mode_set")
-        self.assertEqual(
-            result["details"]["verified_mode_command_id"], commands[0]["commandId"]
-        )
+        self.assertEqual(result["action"], "plan_implementation_accepted_pending_projection")
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["mode_command_id"], commands[0]["commandId"])
         self.assertEqual([item["method"] for item in server.requests].count("POST"), 2)
 
     def test_plan_turn_uuid_failure_reports_verified_mode_phase(self) -> None:

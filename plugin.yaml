@@ -2,21 +2,13 @@
   "manifest_version": 1,
   "api_version": 1,
   "name": "hermes-t3-control",
-  "version": "1.1.1",
-  "description": "Bounded control of T3-owned Codex threads through the supported loopback orchestration HTTP API.",
+  "version": "1.2.0",
+  "description": "Agent-friendly, bounded control of T3-owned Codex threads with operation-scoped local authentication.",
   "author": "Jakub Sladek",
   "license": "MIT",
   "homepage": "https://github.com/thetasigmaio/hermes-t3-control",
   "kind": "standalone",
-  "requires_env": [
-    {
-      "name": "T3_ORCHESTRATION_TOKEN",
-      "description": "Operator-provisioned short-lived T3 token with orchestration read and operate scopes.",
-      "prompt": "T3 orchestration token",
-      "password": true,
-      "secret": true
-    }
-  ],
+  "requires_env": [],
   "provides_tools": [
     "t3_threads",
     "t3_thread_read",
@@ -25,14 +17,26 @@
     "t3_thread_set_mode",
     "t3_thread_implement_plan",
     "t3_turn_interrupt",
-    "t3_session_stop"
+    "t3_session_stop",
+    "t3_thread_wait",
+    "t3_thread_respond"
   ],
   "python_dependencies": [],
   "config_schema": {
+    "auth_mode": {
+      "type": "string",
+      "required": false,
+      "description": "Optional explicit mode: local-cli or external-token. When omitted, a valid profile token selects external-token, no token selects local-cli, and invalid token configuration fails closed."
+    },
     "base_url": {
       "type": "string",
-      "required": true,
-      "description": "Numeric loopback-only T3 orchestration origin, for example http://127.0.0.1:9137."
+      "required": false,
+      "description": "Numeric loopback-only T3 orchestration origin required only for external-token mode."
+    },
+    "t3_base_dir": {
+      "type": "string",
+      "required": false,
+      "description": "Optional absolute local T3 base directory override; normal local discovery uses the current user's .t3 directory."
     },
     "default_runtime_mode": {
       "type": "string",

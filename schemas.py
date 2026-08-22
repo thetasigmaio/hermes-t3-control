@@ -12,6 +12,7 @@ _RUNTIME_MODE = {
 }
 _INTERACTION_MODE = {"type": "string", "enum": ["default", "plan"]}
 _MESSAGE = {"type": "string", "minLength": 1, "maxLength": 120000}
+_MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 _MODEL_OPTION = {
     "type": "object",
     "properties": {
@@ -43,8 +44,29 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 
 T3_THREADS_SCHEMA = _schema(
     "t3_threads",
-    "List the validated T3 orchestration shell snapshot and thread statuses.",
-    {},
+    "List compact, filtered T3 threads by default, or return the legacy raw shell snapshot explicitly.",
+    {
+        "view": {"type": "string", "enum": ["compact", "raw"], "default": "compact"},
+        "project": dict(_ID),
+        "workspace": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "title_query": {"type": "string", "minLength": 1, "maxLength": 512},
+        "lifecycle": {
+            "type": "string",
+            "enum": [
+                "idle",
+                "starting",
+                "running",
+                "ready",
+                "interrupted",
+                "stopped",
+                "error",
+                "blocked",
+            ],
+        },
+        "updated_within_minutes": {"type": "integer", "minimum": 1, "maximum": 10080},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+        "require_one": {"type": "boolean", "default": False},
+    },
     [],
 )
 
@@ -53,6 +75,7 @@ T3_THREAD_READ_SCHEMA = _schema(
     "Read one exact T3 thread with bounded turn pagination.",
     {
         "thread_id": dict(_ID),
+        "view": {"type": "string", "enum": ["material", "raw"], "default": "material"},
         "turn_limit": {"type": "integer", "minimum": 1, "maximum": 150, "default": 20},
         "before_cursor": {"type": "string", "minLength": 1, "maxLength": 4096},
     },
@@ -87,13 +110,75 @@ T3_THREAD_SEND_SCHEMA = _schema(
     {
         "thread_id": dict(_ID),
         "message": dict(_MESSAGE),
+        "busy_policy": {"type": "string", "enum": ["reject", "queue"], "default": "reject"},
     },
     ["thread_id", "message"],
 )
 
+T3_THREAD_WAIT_SCHEMA = _schema(
+    "t3_thread_wait",
+    "Wait at most 30 seconds for one thread to progress, require action, or settle.",
+    {
+        "thread_id": dict(_ID),
+        "after_thread_sequence": {"type": "integer", "minimum": 0},
+        "until": {
+            "type": "string",
+            "enum": ["change", "running", "blocked", "terminal", "error"],
+            "default": "terminal",
+        },
+        "timeout_seconds": {"type": "integer", "minimum": 0, "maximum": 30, "default": 0},
+    },
+    ["thread_id"],
+)
+
+T3_THREAD_RESPOND_SCHEMA = _schema(
+    "t3_thread_respond",
+    "Respond to one exact pending approval or user-input request after fail-closed readback.",
+    {
+        "thread_id": dict(_ID),
+        "request_id": dict(_ID),
+        "decision": {
+            "type": "string",
+            "enum": ["accept", "acceptForSession", "decline", "cancel"],
+        },
+        "answers": {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 64,
+            "propertyNames": dict(_ID),
+            "additionalProperties": {
+                "oneOf": [
+                    {"type": "string", "minLength": 0, "maxLength": 120_000},
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 0,
+                            "maxLength": 120_000,
+                        },
+                        "maxItems": 64,
+                    },
+                    {
+                        "type": "number",
+                        "minimum": -_MAX_SAFE_JSON_INTEGER,
+                        "maximum": _MAX_SAFE_JSON_INTEGER,
+                    },
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ]
+            },
+        },
+    },
+    ["thread_id", "request_id"],
+)
+T3_THREAD_RESPOND_SCHEMA["parameters"]["oneOf"] = [
+    {"required": ["decision"]},
+    {"required": ["answers"]},
+]
+
 T3_THREAD_SET_MODE_SCHEMA = _schema(
     "t3_thread_set_mode",
-    "Set exactly one persisted thread mode with exact readback; a runtime change cannot cancel or retroactively authorize an approval already pending for a started turn.",
+    "Set exactly one persisted thread mode with exact readback; full-access permits trusted provider work to execute commands and modify or delete files without approval, while a runtime change cannot cancel or retroactively authorize an approval already pending for a started turn.",
     {
         "thread_id": dict(_ID),
         "runtime_mode": dict(_RUNTIME_MODE),
@@ -138,6 +223,8 @@ SCHEMAS = {
         T3_THREAD_IMPLEMENT_PLAN_SCHEMA,
         T3_TURN_INTERRUPT_SCHEMA,
         T3_SESSION_STOP_SCHEMA,
+        T3_THREAD_WAIT_SCHEMA,
+        T3_THREAD_RESPOND_SCHEMA,
     )
 }
 

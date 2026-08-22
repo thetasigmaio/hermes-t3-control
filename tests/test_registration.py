@@ -22,9 +22,11 @@ EXPECTED_TOOLS = (
     "t3_thread_implement_plan",
     "t3_turn_interrupt",
     "t3_session_stop",
+    "t3_thread_wait",
+    "t3_thread_respond",
 )
 
-RUNTIME_FILES = ("__init__.py", "schemas.py", "tools.py", "client.py")
+RUNTIME_FILES = ("__init__.py", "auth.py", "schemas.py", "tools.py", "client.py")
 FORBIDDEN_IMPORT_ROOTS = frozenset(
     {
         "pathlib",
@@ -194,7 +196,10 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
         for alias in node.names:
             binding = alias.asname or alias.name.split(".", 1)[0]
             self.aliases[binding] = alias.name if alias.asname else binding
-            if _module_matches(alias.name, FORBIDDEN_IMPORT_ROOTS):
+            if _module_matches(alias.name, FORBIDDEN_IMPORT_ROOTS) and not (
+                self.filename == "auth.py"
+                and alias.name in {"pathlib", "subprocess"}
+            ):
                 self._record(node, f"forbidden import {alias.name}")
             if alias.name == "http.client" and self.filename != "client.py":
                 self._record(node, "HTTP transport outside client.py")
@@ -202,12 +207,18 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
-        if _module_matches(module, FORBIDDEN_IMPORT_ROOTS) or module in {"os", "socket"}:
+        if (
+            _module_matches(module, FORBIDDEN_IMPORT_ROOTS)
+            or module in {"os", "socket"}
+        ) and not (
+            self.filename == "auth.py"
+            and module in {"pathlib", "subprocess"}
+        ):
             self._record(node, f"forbidden direct import from {module}")
         if module == "http.client" and self.filename != "client.py":
             self._record(node, "HTTP transport outside client.py")
         if module == "agent.secret_scope" and (
-            self.filename != "tools.py"
+            self.filename != "auth.py"
             or {alias.name for alias in node.names} != {"get_secret"}
         ):
             self._record(node, "profile secret resolver outside tools.py")
@@ -264,7 +275,9 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         name = self._resolve(_dotted_name(node.func))
         final_name = name.rsplit(".", 1)[-1] if name else ""
-        if name == "open" or final_name in FILE_CALLS:
+        if (name == "open" or final_name in FILE_CALLS) and not (
+            self.filename == "auth.py" and name == "os.open"
+        ):
             self._record(node, "direct file access")
         if name and name.startswith("socket."):
             self._record(node, "direct socket construction")
@@ -340,7 +353,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual({item["is_async"] for item in ctx.registrations}, {False})
         self.assertEqual(
             {tuple(item["requires_env"]) for item in ctx.registrations},
-            {("T3_ORCHESTRATION_TOKEN",)},
+            {()},
         )
         check_ids = {id(item["check_fn"]) for item in ctx.registrations}
         self.assertEqual(len(check_ids), 1)
@@ -354,7 +367,7 @@ class RegistrationTests(unittest.TestCase):
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual(manifest["api_version"], 1)
-        self.assertEqual(manifest["version"], "1.1.1")
+        self.assertEqual(manifest["version"], "1.2.0")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"], "https://github.com/thetasigmaio/hermes-t3-control"
@@ -362,14 +375,17 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(tuple(manifest["provides_tools"]), EXPECTED_TOOLS)
         self.assertEqual(manifest["python_dependencies"], [])
         self.assertEqual(
-            set(manifest["config_schema"]), {"base_url", "default_runtime_mode"}
+            set(manifest["config_schema"]),
+            {"auth_mode", "base_url", "t3_base_dir", "default_runtime_mode"},
         )
         self.assertEqual(
             manifest["config_schema"]["default_runtime_mode"]["default"],
             "approval-required",
         )
-        self.assertTrue(manifest["requires_env"][0]["password"])
-        self.assertTrue(manifest["requires_env"][0]["secret"])
+        auth_description = manifest["config_schema"]["auth_mode"]["description"]
+        self.assertIn("valid profile token selects external-token", auth_description)
+        self.assertIn("invalid token configuration fails closed", auth_description)
+        self.assertEqual(manifest.get("requires_env", []), [])
         plugin = load_plugin()
         self.assertEqual(tuple(plugin.TOOL_NAMES), EXPECTED_TOOLS)
         for schema in plugin.SCHEMAS.values():
@@ -382,19 +398,10 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("oneOf", plugin.SCHEMAS["t3_thread_set_mode"]["parameters"])
         self.assertFalse(any("dispatch" in name for name in plugin.TOOL_NAMES))
 
-    def test_passive_check_uses_profile_safe_resolver_and_fails_closed(self) -> None:
+    def test_passive_check_keeps_tokenless_local_mode_discoverable_without_io(self) -> None:
         plugin = load_plugin()
-        tools_module = sys.modules[f"{plugin.__name__}.tools"]
-        runtime_value = "runtime-" + __import__("secrets").token_urlsafe(16)
-        with mock.patch.object(tools_module, "_profile_secret", return_value=runtime_value) as resolver:
+        with mock.patch.object(socket, "socket", side_effect=AssertionError("network attempted")):
             self.assertTrue(plugin.check_t3_available())
-            resolver.assert_called_once_with("T3_ORCHESTRATION_TOKEN")
-        with mock.patch.object(tools_module, "_profile_secret", side_effect=RuntimeError("private")):
-            self.assertFalse(plugin.check_t3_available())
-        for invalid in ("", "   ", f" {runtime_value}", f"{runtime_value}\n"):
-            with self.subTest(secret_shape=(len(invalid), invalid == invalid.strip())):
-                with mock.patch.object(tools_module, "_profile_secret", return_value=invalid):
-                    self.assertFalse(plugin.check_t3_available())
 
     def test_plugin_runtime_source_obeys_capability_policy(self) -> None:
         sources = {
@@ -404,7 +411,9 @@ class RegistrationTests(unittest.TestCase):
             with self.subTest(runtime_file=name):
                 self.assertEqual(runtime_source_violations(source, name), [])
         combined = "\n".join(sources.values())
-        self.assertNotRegex(combined, r"\.jsonl\b|/proc/|bootstrap\.createThread")
+        self.assertNotRegex(combined, r"\.jsonl\b|bootstrap\.createThread")
+        self.assertNotIn("shell=True", combined)
+        self.assertEqual(sources["auth.py"].count('"/proc/"'), 1)
 
     def test_runtime_source_policy_rejects_capability_sentinels(self) -> None:
         blocked = {
@@ -438,7 +447,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(
             runtime_source_violations(intentional_client, "client.py"), []
         )
-        self.assertEqual(runtime_source_violations(intentional_resolver, "tools.py"), [])
+        self.assertEqual(runtime_source_violations(intentional_resolver, "auth.py"), [])
         self.assertEqual(runtime_source_violations(inert_text, "tools.py"), [])
 
     def test_runtime_source_policy_rejects_disposable_secret_literal_sentinels(self) -> None:

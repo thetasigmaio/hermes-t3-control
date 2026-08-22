@@ -24,12 +24,13 @@ MAX_TITLE_CHARS = 512
 MAX_CURSOR_CHARS = 4_096
 MAX_MESSAGE_UTF16_UNITS = 120_000
 MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024
+MAX_ENVIRONMENT_RESPONSE_BYTES = 1 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_TURN_LIMIT = 150
 DEFAULT_TURN_LIMIT = 20
 REQUEST_TIMEOUT_SECONDS = 10.0
 MUTATION_TIMEOUT_SECONDS = 30.0
-MUTATION_POLL_SECONDS = 5.0
+MUTATION_POLL_SECONDS = 15.0
 MAX_DISPATCH_ATTEMPTS = 3
 READ_CHUNK_BYTES = 64 * 1024
 ERROR_VALUE_CHARS = 512
@@ -43,6 +44,7 @@ SESSION_STATUSES = frozenset(
     {"idle", "starting", "running", "ready", "interrupted", "stopped", "error"}
 )
 LATEST_TURN_STATES = frozenset({"running", "interrupted", "completed", "error"})
+BACKGROUND_LIVENESS_STATES = frozenset({"working", "monitoring"})
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _BEARER_CREDENTIAL_RE = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}", re.ASCII)
@@ -51,6 +53,8 @@ _RFC3339_RE = re.compile(
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
 )
 _DETAIL_PREFIX = "/api/orchestration/threads/"
+_ENVIRONMENT_DESCRIPTOR_PATH = "/.well-known/t3/environment"
+_PROBE_MARKER = "configured-environment-probe-marker"
 _KNOWN_SERVER_FIELDS = ("code", "reason", "requiredScope", "traceId")
 
 
@@ -315,6 +319,22 @@ def validate_dispatch_response(value: Any) -> dict[str, Any]:
     return root
 
 
+def validate_environment_descriptor(value: Any) -> dict[str, Any]:
+    root = _object(value, "environment")
+    _bounded_response_string(root, "environmentId", "environment")
+    _bounded_response_string(root, "serverVersion", "environment")
+    return root
+
+
+def probe_environment_descriptor(base_url: str) -> dict[str, Any]:
+    """Read the supported environment descriptor without sending a credential."""
+    probe = T3Client(base_url, _PROBE_MARKER)
+    value = probe._request_json(
+        "GET", _ENVIRONMENT_DESCRIPTOR_PATH, _send_authorization=False
+    )
+    return validate_environment_descriptor(value)
+
+
 def _validate_project(value: Any, path: str) -> None:
     project = _object(value, path)
     _nonempty_string(project, "id", path)
@@ -360,6 +380,20 @@ def _validate_thread(value: Any, path: str, *, detail: bool) -> None:
     _nullable_timestamp(thread, "archivedAt", path)
     _timestamp(thread, "createdAt", path)
     _timestamp(thread, "updatedAt", path)
+    for field in ("settledAt", "latestUserMessageAt"):
+        if field in thread:
+            _nullable_timestamp(thread, field, path)
+    for field in (
+        "hasPendingApprovals",
+        "hasPendingUserInput",
+        "hasActionableProposedPlan",
+    ):
+        if field in thread:
+            _boolean(thread, field, path)
+    if "backgroundLiveness" in thread and thread["backgroundLiveness"] is not None:
+        _enum(thread, "backgroundLiveness", BACKGROUND_LIVENESS_STATES, path)
+    if "planProgress" in thread and thread["planProgress"] is not None:
+        _object(thread["planProgress"], f"{path}.planProgress")
     if "latestTurn" not in thread:
         raise ResponseSchemaError(f"{path}.latestTurn is required.")
     if thread["latestTurn"] is not None:
@@ -378,6 +412,10 @@ def _validate_thread(value: Any, path: str, *, detail: bool) -> None:
             _validate_proposed_plan(
                 proposed_plan, f"{path}.proposedPlans[{index}]"
             )
+        if "activities" in thread:
+            activities = _list(thread, "activities", path)
+            for index, activity in enumerate(activities):
+                _validate_activity(activity, f"{path}.activities[{index}]")
 
 
 def _validate_latest_turn(value: Any, path: str) -> None:
@@ -441,6 +479,17 @@ def _validate_message(value: Any, path: str) -> None:
     _timestamp(message, "updatedAt", path)
 
 
+def _validate_activity(value: Any, path: str) -> None:
+    activity = _object(value, path)
+    for field in ("id", "kind", "summary"):
+        _nonempty_string(activity, field, path)
+    _object(_required(activity, "payload", path), f"{path}.payload")
+    _nullable_string(activity, "turnId", path)
+    if "sequence" in activity:
+        _nonnegative_int(activity, "sequence", path)
+    _timestamp(activity, "createdAt", path)
+
+
 def _object(value: Any, path: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ResponseSchemaError(f"{path} must be an object.")
@@ -464,6 +513,29 @@ def _nonempty_string(obj: Mapping[str, Any], field: str, path: str) -> str:
     value = _required(obj, field, path)
     if not isinstance(value, str) or not value.strip():
         raise ResponseSchemaError(f"{path}.{field} must be a non-empty string.")
+    return value
+
+
+def _bounded_response_string(
+    obj: Mapping[str, Any], field: str, path: str
+) -> str:
+    value = _required(obj, field, path)
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > MAX_IDENTIFIER_CHARS
+        or _CONTROL_RE.search(value) is not None
+    ):
+        raise ResponseSchemaError(
+            f"{path}.{field} must be a bounded non-empty string."
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ResponseSchemaError(
+            f"{path}.{field} must be a bounded non-empty string."
+        ) from exc
     return value
 
 
@@ -536,6 +608,7 @@ class T3Client:
         sleeper: Callable[[float], None] = time.sleep,
         uuid_factory: Callable[[], uuid.UUID] = uuid.uuid4,
         connection_factory: Callable[[str, str, int, float], Any] | None = None,
+        connected_socket_validator: Callable[[Any, float], None] | None = None,
     ) -> None:
         self.scheme, self.host, self.port, self.origin = self._validate_origin(base_url)
         if not is_valid_bearer_credential(token):
@@ -572,6 +645,11 @@ class T3Client:
         self.sleeper = sleeper
         self.uuid_factory = uuid_factory
         self.connection_factory = connection_factory
+        if connected_socket_validator is not None and not callable(
+            connected_socket_validator
+        ):
+            raise ConfigurationError("connected_socket_validator must be callable.")
+        self.connected_socket_validator = connected_socket_validator
 
     @staticmethod
     def _validate_origin(base_url: Any) -> tuple[str, str, int, str]:
@@ -630,6 +708,10 @@ class T3Client:
         value = self._request_json("GET", "/api/orchestration/shell", deadline=deadline)
         return validate_shell_snapshot(value)
 
+    def get_environment_descriptor(self) -> dict[str, Any]:
+        value = self._request_json("GET", _ENVIRONMENT_DESCRIPTOR_PATH)
+        return validate_environment_descriptor(value)
+
     def get_thread(
         self,
         thread_id: Any,
@@ -677,6 +759,13 @@ class T3Client:
         if len(body) > self.request_body_limit:
             raise InvalidInputError("command exceeds the configured request body limit.")
         command_id = _validate_uuid4(command.get("commandId"), "command.commandId")
+        raw_message = command.get("message")
+        message_id = (
+            raw_message.get("messageId")
+            if isinstance(raw_message, Mapping)
+            and isinstance(raw_message.get("messageId"), str)
+            else None
+        )
         if command.get("threadId") != normalized_thread_id:
             raise InvalidInputError("command.threadId must match the exact readback target.")
         if not callable(predicate):
@@ -730,6 +819,7 @@ class T3Client:
                         sequence=None,
                         attempts=attempt,
                         recovered=True,
+                        message_id=message_id,
                     )
                 if attempt >= self.dispatch_attempts:
                     raise MutationAmbiguousError(
@@ -741,24 +831,27 @@ class T3Client:
                 continue
 
             sequence = dispatch["sequence"]
-            try:
-                detail = self._poll_accepted(
-                    normalized_thread_id,
-                    predicate,
-                    race_detector,
+            detail, projection_cause_code = self._poll_accepted(
+                normalized_thread_id,
+                predicate,
+                race_detector,
+                command_id,
+                sequence,
+                operation_deadline,
+            )
+            if projection_cause_code is not None:
+                return self._accepted_pending_result(
                     command_id,
-                    sequence,
-                    operation_deadline,
+                    normalized_thread_id,
+                    detail,
+                    sequence=sequence,
+                    attempts=attempt,
+                    recovered=ambiguous_cause_code is not None,
+                    message_id=message_id,
+                    projection_cause_code=projection_cause_code,
                 )
-            except VerificationFailedError as exc:
-                if ambiguous_cause_code is None:
-                    raise
-                raise MutationAmbiguousError(
-                    command_id=command_id,
-                    thread_id=normalized_thread_id,
-                    cause_code=exc.error_code,
-                    details=exc.details,
-                ) from exc
+            if detail is None:
+                raise T3ClientError()
             return self._mutation_result(
                 command_id,
                 normalized_thread_id,
@@ -766,6 +859,7 @@ class T3Client:
                 sequence=sequence,
                 attempts=attempt,
                 recovered=ambiguous_cause_code is not None,
+                message_id=message_id,
             )
 
         raise MutationAmbiguousError(
@@ -806,12 +900,12 @@ class T3Client:
         command_id: str,
         sequence: int,
         operation_deadline: float,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any] | None, str | None]:
         poll_deadline = min(operation_deadline, self.clock() + self.mutation_poll_timeout)
         latest: dict[str, Any] | None = None
         while True:
             if self.clock() >= poll_deadline:
-                self._raise_verification_failed(command_id, thread_id, sequence, latest)
+                return latest, "poll_deadline"
             try:
                 latest = self.get_thread(
                     thread_id, turn_limit=MAX_TURN_LIMIT, deadline=poll_deadline
@@ -819,38 +913,24 @@ class T3Client:
                 if race_detector is not None and race_detector(latest):
                     raise ConcurrentStateChangeError(command_id=command_id, thread_id=thread_id)
                 if latest["snapshotSequence"] >= sequence and predicate(latest):
-                    return latest
+                    return latest, None
             except ConcurrentStateChangeError:
                 raise
             except Exception as exc:
-                cause_code = exc.error_code if isinstance(exc, T3ClientError) else "internal_error"
-                raise MutationAmbiguousError(
-                    command_id=command_id,
-                    thread_id=thread_id,
-                    cause_code=cause_code,
-                ) from exc
+                if self.clock() >= poll_deadline:
+                    return latest, "poll_deadline"
+                cause_code = (
+                    exc.error_code
+                    if isinstance(exc, T3ClientError)
+                    else "internal_error"
+                )
+                return latest, _sanitize_text(cause_code)
             if self.clock() >= poll_deadline:
-                self._raise_verification_failed(command_id, thread_id, sequence, latest)
+                return latest, "poll_deadline"
             remaining = poll_deadline - self.clock()
             if remaining <= 0:
-                self._raise_verification_failed(command_id, thread_id, sequence, latest)
+                return latest, "poll_deadline"
             self.sleeper(min(self.poll_interval, remaining))
-
-    @staticmethod
-    def _raise_verification_failed(
-        command_id: str,
-        thread_id: str,
-        sequence: int,
-        latest: dict[str, Any] | None,
-    ) -> None:
-        details: dict[str, Any] = {"dispatch_sequence": sequence}
-        if latest is not None:
-            details["observed_snapshot_sequence"] = latest["snapshotSequence"]
-        raise VerificationFailedError(
-            command_id=command_id,
-            thread_id=thread_id,
-            details=details,
-        )
 
     @staticmethod
     def _mutation_result(
@@ -861,15 +941,62 @@ class T3Client:
         sequence: int | None,
         attempts: int,
         recovered: bool,
+        message_id: str | None,
     ) -> dict[str, Any]:
-        return {
+        result = {
             "command_id": command_id,
             "thread_id": thread_id,
             "dispatch_sequence": sequence,
             "dispatch_attempts": attempts,
             "recovered_after_ambiguous_dispatch": recovered,
+            "accepted": True,
+            "verification": "verified",
+            "completed": True,
             "detail": detail,
         }
+        if message_id is not None:
+            result["message_id"] = message_id
+        return result
+
+    @staticmethod
+    def _accepted_pending_result(
+        command_id: str,
+        thread_id: str,
+        detail: dict[str, Any] | None,
+        *,
+        sequence: int,
+        attempts: int,
+        recovered: bool,
+        message_id: str | None,
+        projection_cause_code: str,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "command_id": command_id,
+            "thread_id": thread_id,
+            "dispatch_sequence": sequence,
+            "dispatch_attempts": attempts,
+            "recovered_after_ambiguous_dispatch": recovered,
+            "accepted": True,
+            "verification": "accepted_pending_projection",
+            "completed": False,
+            "projection_cause_code": projection_cause_code,
+            "detail": detail,
+            "reconciliation": {
+                "tool": "t3_thread_read",
+                "arguments": {
+                    "thread_id": thread_id,
+                    "view": "raw",
+                    "turn_limit": MAX_TURN_LIMIT,
+                },
+                "required_snapshot_sequence": sequence,
+            },
+        }
+        if message_id is not None:
+            result["message_id"] = message_id
+            result["reconciliation"]["expected_message_id"] = message_id
+        if detail is not None:
+            result["observed_snapshot_sequence"] = detail["snapshotSequence"]
+        return result
 
     def _sleep_before_retry(
         self, index: int, deadline: float, command_id: str, thread_id: str
@@ -896,8 +1023,15 @@ class T3Client:
         *,
         body: bytes | None = None,
         deadline: float | None = None,
+        _send_authorization: bool = True,
     ) -> Any:
         self._validate_endpoint(method, path)
+        if not _send_authorization and (
+            method != "GET" or path != _ENVIRONMENT_DESCRIPTOR_PATH or body is not None
+        ):
+            raise InvalidInputError(
+                "Unauthenticated HTTP is limited to the environment descriptor."
+            )
         if body is not None and (not isinstance(body, bytes) or len(body) > self.request_body_limit):
             raise InvalidInputError("request body exceeds its byte limit.")
         operation_deadline = deadline if deadline is not None else self.clock() + self.request_timeout
@@ -910,18 +1044,32 @@ class T3Client:
             connection = self._connection(timeout)
             connection.connect()
             self._set_socket_timeout(connection, request_deadline)
+            if self.connected_socket_validator is not None:
+                sock = getattr(connection, "sock", None)
+                if sock is None:
+                    raise T3ClientError()
+                self.connected_socket_validator(sock, request_deadline)
             headers = {
                 "Accept": "application/json",
-                "Authorization": f"Bearer {self.token}",
                 "Connection": "close",
             }
+            if _send_authorization:
+                headers["Authorization"] = f"Bearer {self.token}"
             if body is not None:
                 headers["Content-Type"] = "application/json"
             connection.request(method, path, body=body, headers=headers)
             self._set_socket_timeout(connection, request_deadline)
             response = connection.getresponse()
             status = response.status
-            raw = self._read_bounded(response, connection, request_deadline)
+            response_limit = self.response_limit
+            if path == _ENVIRONMENT_DESCRIPTOR_PATH:
+                response_limit = min(response_limit, MAX_ENVIRONMENT_RESPONSE_BYTES)
+            raw = self._read_bounded(
+                response,
+                connection,
+                request_deadline,
+                response_limit=response_limit,
+            )
         except T3ClientError:
             raise
         except (socket.timeout, TimeoutError, OSError, http.client.HTTPException) as exc:
@@ -967,18 +1115,25 @@ class T3Client:
             )
         return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
 
-    def _read_bounded(self, response: Any, connection: Any, deadline: float) -> bytes:
+    def _read_bounded(
+        self,
+        response: Any,
+        connection: Any,
+        deadline: float,
+        *,
+        response_limit: int,
+    ) -> bytes:
         chunks: list[bytes] = []
         total = 0
         while True:
             self._set_socket_timeout(connection, deadline)
-            remaining_capacity = self.response_limit - total
+            remaining_capacity = response_limit - total
             chunk = response.read1(min(READ_CHUNK_BYTES, remaining_capacity + 1))
             self._remaining(deadline)
             if not chunk:
                 break
             total += len(chunk)
-            if total > self.response_limit:
+            if total > response_limit:
                 raise ResponseTooLargeError()
             chunks.append(chunk)
         return b"".join(chunks)
@@ -1049,6 +1204,8 @@ class T3Client:
 
     @staticmethod
     def _validate_endpoint(method: str, path: str) -> None:
+        if method == "GET" and path == _ENVIRONMENT_DESCRIPTOR_PATH:
+            return
         if method == "GET" and path == "/api/orchestration/shell":
             return
         if method == "POST" and path == "/api/orchestration/dispatch":

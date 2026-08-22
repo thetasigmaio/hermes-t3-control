@@ -1,14 +1,14 @@
-# Hermes T3 Control 1.1.1
+# Hermes T3 Control 1.2.0
 
-Hermes T3 Control is a synchronous native directory plugin that lets Hermes operate T3-owned Codex threads through T3's authenticated numeric-loopback orchestration API.
+Hermes T3 Control is a synchronous native directory plugin that lets a Hermes agent discover, inspect, continue, and monitor T3-owned Codex threads through T3's authenticated orchestration API.
 
-The mental model is small: use `t3_threads` to discover projects and threads, use `t3_thread_read` to inspect one exact thread, and use the six mutation tools only against an ID returned by T3. Mutations return a verified exact-thread readback; the plugin is not a raw dispatcher or a general T3 client.
+The mental model is ten tools in four steps: find a thread with `t3_threads`, inspect it with `t3_thread_read`, continue or control that exact thread, then monitor it with `t3_thread_wait`. Ordinary local use needs no copied token, port, or UUID. Every mutation remains exact-thread scoped and never silently chooses a fuzzy match.
 
-Compatibility: Hermes 0.20.4 and 0.20.5, Python 3.11-3.13, and T3 server contract `0.0.34-nightly.20260820.1141`. Manifest version 1 is deliberate because it is the newest version accepted by both supported Hermes installers. Released under the [MIT License](LICENSE).
+Compatibility: Hermes 0.20.4 and 0.20.5, Python 3.11-3.13, and T3 server contract `0.0.34-nightly.20260820.1141`. Manifest version 1 is deliberate because it is the newest manifest accepted by both supported Hermes installers. Released under the [MIT License](LICENSE).
 
-## Secure quick start
+## Quick setup
 
-Work in the intended Hermes profile. These commands show which profile files will receive configuration and make the install-time scanner prerequisite explicit:
+Work in the intended Hermes profile and keep the default scanner enabled:
 
 ```bash
 hermes config path
@@ -17,28 +17,24 @@ hermes config set plugins.scan_on_install true
 hermes config get plugins.scan_on_install --json
 ```
 
-The final command must print `true` before installation.
-
-Set the audited v1.1.1 release commit, then install that immutable revision disabled. Replace the placeholder with the published 40-character commit SHA; do not use a branch name or a moving tag.
+The last command must print `true`. Install one audited, immutable v1.2.0 commit while the plugin is disabled:
 
 ```bash
-read -r -p 'v1.1.1 release commit SHA: ' HERMES_T3_CONTROL_REF
+read -r -p 'Audited 40-character commit SHA: ' HERMES_T3_CONTROL_REF
 hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable
 ```
 
-The supported path does not need `--force` for a fresh install. At the masked `requires_env` prompt, enter the operator-provisioned `T3_ORCHESTRATION_TOKEN`. Prefer a short-lived token limited to `orchestration:read` and `orchestration:operate`.
-
-Configure the non-secret loopback origin and the conservative create default:
+This supported path does not need `--force`. Configure local CLI authentication and the conservative creation default:
 
 ```bash
-hermes config set plugins.entries.hermes-t3-control.settings.base_url http://127.0.0.1:9137
+hermes config set plugins.entries.hermes-t3-control.settings.auth_mode local-cli
 hermes config set plugins.entries.hermes-t3-control.settings.default_runtime_mode approval-required
 hermes config get plugins.entries.hermes-t3-control.settings --json
 ```
 
-`base_url` must be an `http` or `https` root origin with a numeric loopback address. Hostnames such as `localhost`, credentials in the URL, paths, queries, fragments, redirects, proxies, and cross-origin requests are rejected.
+T3 must already be running for tool calls. The plugin discovers that same-user live T3 environment and matching upstream CLI, creates a five-minute in-memory session for one bounded operation, and revokes it in `finally`.
 
-Validate the installed copy, then enable it without tool-override permission:
+Validate before activation, then enable without permission to replace built-in tools:
 
 ```bash
 hermes plugins doctor hermes-t3-control --ci
@@ -46,55 +42,129 @@ hermes plugins enable hermes-t3-control --no-allow-tool-override
 hermes plugins show hermes-t3-control
 ```
 
-Doctor must report `registrations: 8 tool(s), 0 hook(s)`. This is the first read-only verification; it checks the installed manifest and registration without contacting T3.
+Doctor runs while the plugin is still disabled and must report `registrations: 10 tool(s), 0 hook(s)`.
 
-Start a new Hermes CLI session so it reloads plugins. For a messaging gateway, run `hermes gateway restart`. A Desktop/T3 backend based on `hermes serve` must be fully stopped and restarted through its normal owner; reconnecting to the same process is insufficient. For a manually owned backend, inspect its status first:
+Restart the process that constructs the Hermes tool catalog. For an installed messaging gateway:
+
+```bash
+hermes gateway restart
+hermes gateway status
+```
+
+For a Desktop/T3 backend, first identify the supported owner and lifecycle:
 
 ```bash
 hermes serve --status
 ```
 
-Confirm the process and profile owner, stop that backend through the same terminal or process manager that launched it, and relaunch it with the same configuration (`hermes serve` only when that was its original launch command). Do not use `hermes serve --stop` while another backend may be running: it stops every Hermes web-server process, including unrelated `serve` and `dashboard` instances.
+Fully stop and relaunch that backend through the same owner or process manager. A fresh Hermes process or session is required; reconnecting to the same process is insufficient.
 
-For the first live T3 check, use an operator-supervised Hermes session and invoke exactly `t3_threads` with `{}` before any mutation. Do not use one-shot `-z` as a read-only safety boundary: it exposes all eight tools and automatically bypasses Hermes approvals.
+Use this literal non-thread-mutating first check operator prompt. Local authentication still issues and revokes its bounded administrative session:
 
-## Create and continue one thread
+> Call only `t3_threads` with `{}`; do not call mutation tools.
 
-Call `t3_thread_create` with a project ID returned by `t3_threads`. Omitting `instance_id` and `model` uses the project's default model selection; if either is supplied, both are required.
+## Find and read the right thread
+
+`t3_threads` returns compact summaries by default. Filters are optional and combined. A human selector such as project `solarsim` plus a title query can require exactly one result; zero or multiple matches fail closed, and the plugin never silently chooses by fuzzy title.
+
+Example for `t3_threads`:
+
+```json
+{
+  "project": "solarsim",
+  "title_query": "release smoke",
+  "require_one": true,
+  "limit": 10
+}
+```
+
+Use the returned ID for an exact material read. Histories stay bounded and paginated.
+
+Example for `t3_thread_read`:
+
+```json
+{
+  "thread_id": "thread-id-from-t3_threads",
+  "view": "material",
+  "turn_limit": 20
+}
+```
+
+The material summary includes project/workspace, title, model and modes, lifecycle and provider liveness, latest turn/session, pending approval or user-input requests, last error, latest user and assistant updates, actionable plan, plan progress, timestamps, and sequence cursors. An explicit `raw` view preserves the bounded legacy projection when diagnostics require it.
+
+## Continue and monitor one exact thread
+
+Sending continues the same stored thread. It preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree, and it never creates a replacement thread. `busy_policy` defaults to `reject`; select `queue` only when an additional accepted turn is intentional.
+
+Example for `t3_thread_send`:
+
+```json
+{
+  "thread_id": "exact-thread-id",
+  "message": "Continue the assigned goal and report only material progress.",
+  "busy_policy": "reject"
+}
+```
+
+Observed command states distinguish `started`, `queued`, `completed`, `blocked`, `error`, and `accepted_pending_projection`. A busy rejection is unambiguous and performs no dispatch.
+
+Wait without dumping snapshots. `timeout_seconds` 0-30 is bounded; `after_thread_sequence` makes progress checks incremental. Provider liveness and work progress are separate fields.
+
+Example for `t3_thread_wait`:
+
+```json
+{
+  "thread_id": "exact-thread-id",
+  "after_thread_sequence": 42,
+  "until": "terminal",
+  "timeout_seconds": 30
+}
+```
+
+The result reports progress, action required, settlement, or timeout with only a material delta and latest assistant update. A timeout says nothing was observed in the bounded window; it does not declare provider failure.
+
+Pending actions are typed and exact-request scoped. Use `decision` for an approval request or `answers` for a user-input request; a stale, mismatched, missing, or ambiguous request is rejected before dispatch. For an approval, replace `answers` below with `"decision": "accept"` or `"decision": "decline"`.
+
+Example for `t3_thread_respond`:
+
+```json
+{
+  "thread_id": "exact-thread-id",
+  "request_id": "pending-user-input-request-id",
+  "answers": {
+    "scope": "Focused"
+  }
+}
+```
+
+## Create and plan
+
+Create is explicit and never happens as a fallback from send. Omit `instance_id` and `model` together to use the project's model default. If either is present, both are required.
+
+Example for `t3_thread_create`:
 
 ```json
 {
   "project_id": "project-id-from-t3_threads",
-  "title": "Audit the release candidate",
+  "title": "Disposable release acceptance",
   "runtime_mode": "approval-required",
   "interaction_mode": "default",
-  "initial_message": "Inspect the release candidate and report findings."
+  "initial_message": "Inspect the disposable fixture and report one harmless finding."
 }
 ```
 
-The result action is `thread_created_with_initial_turn` and includes the new `thread_id`, separate create/turn command IDs, the message ID, provider session, latest turn, exact `detail`, and `race_semantics`. Without `initial_message`, the action is `thread_created` and no turn starts.
+Optional branch and worktree values are T3 metadata; the plugin does not create or inspect a checkout.
 
-Continue the same thread with its returned ID:
+### Strict Plan to Build
 
-```json
-{
-  "thread_id": "thread-id-returned-by-t3_thread_create",
-  "message": "Now summarize the two highest-risk findings."
-}
-```
+Plan execution uses the stored server plan, never caller-authored plan prose:
 
-`t3_thread_send` pre-reads the stored model, runtime, and interaction modes and starts a fresh turn on that same thread, including after `t3_session_stop`. It never creates a replacement thread or re-resolves the project's creation default.
+1. Create or set the exact thread to interaction mode `plan`, then send the planning goal.
+2. Wait until its provider is no longer running.
+3. Read the exact thread and select one unimplemented proposed-plan ID.
+4. Call the implementation tool with only the exact thread and stored plan IDs.
 
-Optional `branch` and `worktree_path` values on create are T3 metadata only. The plugin does not inspect Git, resolve branches, or create worktrees. Explicit `model_options` replaces options for an explicit `instance_id`/`model` pair; an omitted option list preserves canonical options only when that pair matches the project default.
-
-## Strict Plan to Build on the same thread
-
-Use the stored server plan, never caller-authored plan prose:
-
-1. Call `t3_thread_create` with `interaction_mode: "plan"` and an `initial_message` asking for a plan.
-2. Wait until the turn and provider session are no longer running.
-3. Call `t3_thread_read` for the same thread. Select one `detail.thread.proposedPlans[].id` whose `implementedAt` and `implementationThreadId` are both null.
-4. Call `t3_thread_implement_plan` with only those server identities:
+Example for `t3_thread_implement_plan`:
 
 ```json
 {
@@ -103,55 +173,47 @@ Use the stored server plan, never caller-authored plan prose:
 }
 ```
 
-The implementation tool performs and verifies the native interaction-mode transition to `default`, revalidates the unchanged stored plan, and then starts the implementation turn with `sourceProposedPlan: {threadId, planId}`. Success is `same_thread_plan_implementation_started` with mode/turn command IDs, accepted dispatch metadata, same-thread provenance, provider session, latest turn, exact readback, and `race_semantics`.
+The tool verifies the native transition to interaction mode `default`, revalidates the unchanged plan, and starts the same-thread turn with `sourceProposedPlan`. If the mode transition is only accepted pending projection, it stops before dispatching the implementation turn and returns a safe reconciliation path.
 
-Do not run concurrent implement calls. T3 has no atomic expected-mode, idle-state, unimplemented-plan, or at-most-once guard, so success proves observed ordering and provenance but cannot exclude a transient mode change or duplicate concurrent work. If the mode phase succeeds and the turn phase fails, the error identifies the completed phase; the plugin does not roll the mode back.
+## Ten-tool reference
 
-## Eight-tool reference
+Every handler rejects unknown fields and returns sanitized JSON. Results contain `ok`; errors also contain a stable code, retryability, ambiguity, and safe recovery metadata.
 
-Every tool rejects unknown fields and returns sanitized JSON. All results contain `ok`. Errors also contain `error_code`, `retryable`, `outcome_ambiguous`, and a safe `error`; target and recovery metadata appear when available.
+| Tool | Purpose and important defaults |
+|---|---|
+| `t3_threads` | Filtered compact summaries by default; bounded explicit `raw` view. |
+| `t3_thread_read` | Exact bounded material summary by default; optional raw page and cursor. |
+| `t3_thread_create` | Create one native thread, optionally with one verified initial turn. |
+| `t3_thread_send` | Continue the same thread; `busy_policy` defaults to `reject`. |
+| `t3_thread_set_mode` | Set exactly one stored runtime or interaction mode. |
+| `t3_thread_implement_plan` | Strict same-thread stored-plan transition and implementation. |
+| `t3_turn_interrupt` | Best-effort interrupt of the provider session current for the exact thread. |
+| `t3_session_stop` | Best-effort stop without deleting or replacing the thread. |
+| `t3_thread_wait` | Wait for change/running/blocked/terminal/error with `timeout_seconds` 0-30. |
+| `t3_thread_respond` | Answer one pending request by exact request ID and type. |
 
-| Tool | Inputs and defaults | Successful result |
-|---|---|---|
-| `t3_threads` | `{}` | `shell`: validated projects, threads, and statuses. |
-| `t3_thread_read` | `thread_id`; `turn_limit` 1-150, default 20; `before_cursor` requires an explicit limit | `detail`: exact bounded thread page. |
-| `t3_thread_create` | `project_id`, `title`; optional paired model selection, modes, initial message, and checkout metadata | `thread_created` or `thread_created_with_initial_turn`, command IDs, and exact readback. |
-| `t3_thread_send` | `thread_id`, `message` | `new_turn_same_thread`, command/message IDs, session, latest turn, and exact readback. |
-| `t3_thread_set_mode` | `thread_id` and exactly one of `runtime_mode` or `interaction_mode` | `thread_mode_set` or verified `mode_already_set`. |
-| `t3_thread_implement_plan` | `thread_id`, server `plan_id` | `same_thread_plan_implementation_started` with provenance and both phases' metadata. |
-| `t3_turn_interrupt` | `thread_id` | `best_effort_turn_interrupt`, captured turn ID, and exact readback. |
-| `t3_session_stop` | `thread_id` | `best_effort_session_stop` or verified `already_stopped`. |
-
-Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`; the create fallback is `approval-required`. Interaction modes are `default` and `plan`. Messages are trimmed and limited to 120000 JavaScript UTF-16 code units. Identifiers and titles are limited to 512 characters, cursors and worktree paths to 4096, and `model_options` to 64 unique string-or-Boolean entries.
+Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`. Messages are trimmed and limited to 120000 JavaScript UTF-16 code units. Identifiers and titles are limited to 512 characters, cursors and worktree paths to 4096, compact lists to 50, and model options to 64 unique entries.
 
 ## Safety and recovery
 
-**`full-access` permits trusted provider work to execute commands and modify or delete files without approval.** Select it only for a trusted provider and checkout. Changing a persisted runtime mode after a turn starts cannot cancel, remove, or retroactively authorize an approval already pending for that turn, and it does not prove that the running provider session changed mode.
+`full-access` permits trusted provider work to execute commands and modify or delete files without approval. Use it only for a trusted provider and checkout. A persisted runtime-mode change cannot cancel or retroactively authorize an approval already pending for a started turn.
 
-Each logical mutation uses one fresh UUIDv4 command ID and an immutable canonical body. After an ambiguous transmission, the plugin exact-reads before retrying and reuses the byte-identical command. For `mutation_ambiguous` or `verification_failed`, reconcile with `t3_thread_read` before issuing any new mutation.
+Each mutation uses a fresh UUIDv4 command ID and immutable canonical body. A genuinely ambiguous transport retry reuses the same command ID and byte-identical command. Never resend after a successful dispatch response merely because read projection is late.
 
-`t3_turn_interrupt` and `t3_session_stop` are best effort because T3 has no atomic expected-session guard. Interrupt detects an observed newer turn as `concurrent_state_change`; stop never deletes or replaces the thread.
+After acceptance, the plugin reconciles the exact command or message identity for a 15-second projection window. `accepted_pending_projection` is not a failure: it includes the command ID, message ID where applicable, target, and an exact bounded `t3_thread_read` raw reconciliation recipe with `required_snapshot_sequence` and, for a turn, `expected_message_id`. Retrying it as a new send can create duplicate work.
 
-One HTTP request has a 10-second absolute monotonic deadline. A logical mutation is bounded to 30 seconds, at most three dispatch attempts, and a five-second accepted-state poll. Requests are limited to 1 MiB and responses to 16 MiB. Transport is restricted to these endpoints and never follows redirects:
+Use these distinctions:
 
-- `GET /api/orchestration/shell`
-- `GET /api/orchestration/threads/:threadId`
-- `POST /api/orchestration/dispatch`
+- `mutation_ambiguous`: the transport failed before acceptance could be established; exact-read before any retry.
+- `network_error`: a read did not complete; check the live T3 process and loopback origin.
+- `conflict`: the target is busy, stale, archived, ambiguous, or not in the required state; re-read it.
+- `auth_cleanup: failed`: the accepted operation remains authoritative, but revocation confirmation failed; wait for lease expiry and reconcile rather than repeat it.
 
-## Troubleshooting
-
-- `requires manifest_version 2`: the selected SHA is not v1.1.1. Recheck the 40-character release commit.
-- Install-time security block mentioning historical development specs: the selected SHA is not the clean v1.1.1 repository tree. Do not bypass it with `--force` or disable scanning.
-- Doctor does not report eight tools: keep the plugin disabled, confirm the active profile and installed SHA, then reinstall the audited ref.
-- `configuration_error`: check `hermes config get plugins.entries.hermes-t3-control.settings --json`, the active profile's masked credential, and the numeric-loopback T3 origin.
-- `authentication_error` or `authorization_error`: refresh the operator-managed token and its two orchestration scopes; never retry with the credential in a prompt or tool input.
-- `network_error`: restore or verify the configured loopback T3 service; retry only when `outcome_ambiguous` is false. Otherwise reconcile the exact thread before any mutation.
-- `conflict`: re-read `t3_threads` or `t3_thread_read`, resolve stale IDs or running/already-implemented state, then decide whether a new mutation is valid.
-- A pinned `hermes plugins update` is refused by design. Use the pinned reinstall flow below.
+For a network outage, restore the exact local T3 instance and read again. For zero or multiple selector matches, narrow project/workspace/title filters. For a verification lag, repeat the returned raw read until `snapshotSequence` reaches `required_snapshot_sequence`, then verify `expected_message_id` or the intended state before any new mutation. None of these recovery paths creates a replacement thread.
 
 ## Update, rollback, and uninstall
 
-`--no-enable` does not clear an existing enabled entry. Disable and remove the old copy before installing the new audited revision; plugin removal preserves its profile settings and secret:
+Inspect and test the new commit before replacing an installed copy:
 
 ```bash
 read -r -p 'New audited 40-character commit SHA: ' HERMES_T3_CONTROL_REF
@@ -162,11 +224,7 @@ hermes plugins doctor hermes-t3-control --ci
 hermes plugins enable hermes-t3-control --no-allow-tool-override
 ```
 
-Use this flow only with a separately reviewed exact commit. Do not substitute `--force`: `--force` also accepts a `caution` security-scan verdict, not only replacement, so it weakens the install gate.
-
-Restart the long-lived Hermes host as described in quick start. Rollback uses the same commands only with an audited previous revision whose manifest version is 1. v1.1.0 is not an installable rollback target on Hermes 0.20.4 or 0.20.5 because its manifest version is 2. If no compatible known-good revision exists, keep v1.1.1 disabled or remove it; there is no moving-channel or automatic rollback command.
-
-To remove the plugin:
+Then restart the owning Hermes process and repeat the non-thread-mutating first check. Rollback uses the same disable/remove/install sequence with a previously audited compatible commit. v1.1.0 is not an installable rollback target on Hermes 0.20.4 or 0.20.5; its manifest is newer than those installers support. To uninstall and remove its non-secret entry:
 
 ```bash
 hermes plugins disable hermes-t3-control
@@ -174,43 +232,41 @@ hermes plugins remove hermes-t3-control
 hermes config unset plugins.entries.hermes-t3-control
 ```
 
-Then revoke the T3 token and remove `T3_ORCHESTRATION_TOKEN` from the active profile path shown by `hermes config env-path`, without printing it. Plugin removal does not erase profile settings or secrets automatically. Restart any long-lived Hermes host.
+`remove` is the primary command shown by Hermes 0.20.4/0.20.5 help; `uninstall` is only an alias.
 
-`hermes plugins disable` also leaves `hermes-t3-control` in `plugins.disabled`. To remove that harmless residual entry, run `hermes config edit` and delete only that list item; preserve every other disabled plugin.
+## Security and credential handling
 
-## Credential and data boundary
+Local mode resolves same-user bounded runtime metadata, a numeric loopback origin, the running Node executable, the exact T3 server entrypoint and package version, and the live environment descriptor. Before sending a bearer value, it pins the process identity, proves ownership of the listener, and proves the connected socket belongs to that pinned process. Its temporary bearer value stays in process memory, never enters argv, never persists, is not logged, and is revoked in `finally`. HTTP permits only `GET /.well-known/t3/environment`, `GET /api/orchestration/shell`, `GET /api/orchestration/threads/:threadId`, and `POST /api/orchestration/dispatch`. All proxies and redirects are disabled; origins must be numeric loopback. Responses are bounded to 1 MiB for environment metadata and 16 MiB for orchestration projections.
 
-Enter the token only through Hermes' masked `requires_env` prompt for the selected profile. Never put it in argv, shell history, `config.yaml`, source, logs, examples, or tool inputs. The plugin resolves it through Hermes' profile-scoped secret API and does not issue or persist credentials.
+`local-cli` currently requires Linux with `/proc` and `pidfd` support, including WSL2. It assumes a single-user WSL trust boundary and trusts the upstream T3 bundle owned by the current Windows account. Neither auth mode makes a plain shared loopback listener safe from mutually untrusted local users; `external-token` is not a multi-user isolation mechanism. Isolate the operating-system user and T3 service instead.
 
-The plugin does not read SQLite, T3/Codex event-log JSONL, process credentials, or internal state; modify Hermes, T3, or Codex core; expose raw dispatch or WebSocket control; create worktrees; upload attachments; answer approvals; change an existing thread's model; or archive, delete, or replace projects or threads.
+The current upstream CLI issues eight administrative scopes, including `orchestration:read` and `orchestration:operate`; it cannot yet mint a narrower orchestration-only session. The plugin limits that credential to one bounded operation and its four HTTP routes. This upstream scope breadth is the main local-auth residual risk.
 
-## Development and release verification
+For an operator-isolated headless or local deployment where `local-cli` is unavailable, select `external-token`, configure an explicit numeric-loopback `base_url`, and provision a profile-scoped `T3_ORCHESTRATION_TOKEN` through the deployment's Hermes secret facility. Prefer a short-lived token limited to `orchestration:read` and `orchestration:operate`. Do not place credentials in plugin settings, shell history, command arguments, logs, or repository files.
+
+## Published asset verification
+
+From a trusted v1.2.0 source checkout containing `scripts/verify_release.py`, download into a new private directory and verify before using an artifact:
 
 ```bash
-python3 -B -m unittest discover -s tests -v
-env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v tests.test_supported_install
+umask 077
+RELEASE_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$RELEASE_DIR"' EXIT
+curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/hermes-t3-control-1.2.0.tar.gz" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.2.0/hermes-t3-control-1.2.0.tar.gz
+curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/hermes-t3-control-1.2.0.tar.gz.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.2.0/hermes-t3-control-1.2.0.tar.gz.sha256
+python3 -B scripts/verify_release.py "$RELEASE_DIR/hermes-t3-control-1.2.0.tar.gz.sha256"
+```
+
+## Development verification
+
+Run the dependency-free suite and release gates from a clean checkout:
+
+```bash
+PYTHONWARNINGS=error python3.11 -B -m unittest discover -s tests -v
+env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3.11 -B -m unittest -v tests.test_supported_install
 env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci
 python3 -B scripts/build_release.py --output-dir dist
-python3 -B scripts/verify_release.py dist/hermes-t3-control-1.1.1.tar.gz.sha256
+python3 -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256
 ```
 
-CI runs the supported-install regression separately against pinned Hermes 0.20.4 and 0.20.5 revisions. It uses a fresh `HERMES_HOME`, explicit `plugins.scan_on_install: true`, the real `hermes plugins install` pinned-ref path without `--force`, and the exact tracked repository tree. It then enables without tool-override permission and uses a fresh network-blocked Python process plus Plugin Doctor to verify exactly eight loaded tools and their manifest, configuration, and secret metadata.
-
-After publication, download and verify both release assets:
-
-```bash
-mkdir -p dist
-curl --fail --location --output dist/hermes-t3-control-1.1.1.tar.gz https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.1.1/hermes-t3-control-1.1.1.tar.gz
-curl --fail --location --output dist/hermes-t3-control-1.1.1.tar.gz.sha256 https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.1.1/hermes-t3-control-1.1.1.tar.gz.sha256
-python3 -B scripts/verify_release.py dist/hermes-t3-control-1.1.1.tar.gz.sha256
-```
-
-Resolve the annotated v1.1.1 tag to the immutable commit used by `--ref`, then compare it with the release announcement before installation:
-
-```bash
-HERMES_T3_CONTROL_REF="$(git ls-remote https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.1.1^{}' | awk 'NR == 1 {print $1}')"
-test "${#HERMES_T3_CONTROL_REF}" -eq 40
-printf '%s\n' "$HERMES_T3_CONTROL_REF"
-```
-
-The optional live smoke is read-only but requires an operator-designated isolated non-SolarSim thread. Run `python3 -B scripts/live_smoke.py` only with `T3_SMOKE_ISOLATED=1`, `T3_SMOKE_THREAD_ID`, `T3_ORCHESTRATION_BASE_URL`, and `T3_ORCHESTRATION_TOKEN` supplied through that environment's secret facility. It performs one exact-thread GET and prints no messages, plan text, URL, settings, or credentials.
+CI checks out each exact Hermes revision and runs `uv sync --frozen` before the supported installer regression. That regression uses an allowlisted environment with private temporary HOME/XDG paths and neutral Git configuration. Its fresh-process socket guard permits only the expected loopback TCP connection to a fixture server; it is not a general no-egress sandbox.

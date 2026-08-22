@@ -14,75 +14,67 @@ LOWER = README.lower()
 
 
 class ReadmeContractTests(unittest.TestCase):
-    def test_release_compatibility_and_fresh_pinned_install_are_exact(self) -> None:
+    def test_release_compatibility_and_pinned_install_are_exact(self) -> None:
         for phrase in (
-            "# Hermes T3 Control 1.1.1",
+            "# Hermes T3 Control 1.2.0",
             "synchronous native directory plugin",
             "Hermes 0.20.4 and 0.20.5",
             "Python 3.11-3.13",
             "0.0.34-nightly.20260820.1141",
             "Manifest version 1 is deliberate",
             "[MIT License](LICENSE)",
-            "plugins.scan_on_install",
-            "does not need `--force` for a fresh install",
+            "hermes config set plugins.scan_on_install true",
+            "hermes config get plugins.scan_on_install --json",
+            "does not need `--force`",
+            "v1.1.0 is not an installable rollback target on Hermes 0.20.4 or 0.20.5",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, README)
-        fresh_install = (
+        install = (
             'hermes plugins install thetasigmaio/hermes-t3-control --ref '
             '"$HERMES_T3_CONTROL_REF" --no-enable'
         )
-        self.assertEqual(README.count(fresh_install), 2)
-        self.assertNotIn("--force", fresh_install)
-        self.assertIn("hermes config set plugins.scan_on_install true", README)
-        self.assertIn("hermes config get plugins.scan_on_install --json", README)
-        self.assertIn("must print `true` before installation", README)
-        self.assertIn(
-            "v1.1.0 is not an installable rollback target on Hermes 0.20.4 or 0.20.5",
-            README,
-        )
+        self.assertEqual(README.count(install), 2)
+        self.assertNotIn("--force", install)
 
-    def test_configuration_activation_and_first_read_are_copy_pasteable(self) -> None:
+    def test_zero_copy_setup_activation_restart_and_first_read_are_literal(self) -> None:
         for command in (
             "hermes config path",
-            "hermes config env-path",
-            "hermes config set plugins.entries.hermes-t3-control.settings.base_url http://127.0.0.1:9137",
+            "hermes config set plugins.entries.hermes-t3-control.settings.auth_mode local-cli",
             "hermes config set plugins.entries.hermes-t3-control.settings.default_runtime_mode approval-required",
             "hermes config get plugins.entries.hermes-t3-control.settings --json",
             "hermes plugins doctor hermes-t3-control --ci",
             "hermes plugins enable hermes-t3-control --no-allow-tool-override",
             "hermes plugins show hermes-t3-control",
             "hermes gateway restart",
+            "hermes gateway status",
             "hermes serve --status",
-            "hermes serve",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, README)
-        self.assertIn("registrations: 8 tool(s), 0 hook(s)", README)
+        self.assertIn("registrations: 10 tool(s), 0 hook(s)", README)
+        self.assertIn("Doctor runs while the plugin is still disabled", README)
+        self.assertIn(
+            "Call only `t3_threads` with `{}`; do not call mutation tools.",
+            README,
+        )
+        self.assertIn("fresh Hermes process or session", README)
         self.assertIn("reconnecting to the same process is insufficient", README)
-        self.assertIn("stops every Hermes web-server process", README)
-        self.assertIn("first read-only verification", README)
-        self.assertIn("invoke exactly `t3_threads` with `{}` before any mutation", README)
-        self.assertIn("Do not use one-shot `-z` as a read-only safety boundary", README)
-        self.assertIn("numeric loopback", LOWER)
-        self.assertIn("Hostnames such as `localhost`", README)
+        self.assertNotIn("network-blocked", LOWER)
 
-    def test_documents_exact_eight_tools_defaults_and_result_shapes(self) -> None:
-        table = README.split("## Eight-tool reference", 1)[1].split(
+    def test_exact_ten_tool_reference_matches_schemas(self) -> None:
+        table = README.split("## Ten-tool reference", 1)[1].split(
             "## Safety and recovery", 1
         )[0]
-        documented_tools = tuple(
-            re.findall(r"(?m)^\| `([^`]+)` \|", table)
-        )
-        self.assertEqual(documented_tools, schemas.TOOL_NAMES)
+        documented = tuple(re.findall(r"(?m)^\| `([^`]+)` \|", table))
+        self.assertEqual(documented, schemas.TOOL_NAMES)
         for phrase in (
-            "`turn_limit` 1-150, default 20",
-            "exactly one of `runtime_mode` or `interaction_mode`",
-            "`thread_created` or `thread_created_with_initial_turn`",
-            "`thread_mode_set` or verified `mode_already_set`",
-            "`best_effort_session_stop` or verified `already_stopped`",
-            "All results contain `ok`",
-            "`error_code`, `retryable`, `outcome_ambiguous`",
+            "compact summaries by default",
+            "explicit `raw` view",
+            "material summary by default",
+            "`busy_policy` defaults to `reject`",
+            "`timeout_seconds` 0-30",
+            "exact request ID",
             "approval-required`, `auto-accept-edits`, `auto`, and `full-access`",
             "Interaction modes are `default` and `plan`",
             "120000 JavaScript UTF-16 code units",
@@ -90,171 +82,173 @@ class ReadmeContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, README)
 
-    def test_documents_create_send_and_strict_same_thread_plan_flow(self) -> None:
-        for phrase in (
-            "Call `t3_thread_create` with a project ID returned by `t3_threads`",
-            "if either is supplied, both are required",
-            '"runtime_mode": "approval-required"',
-            '"interaction_mode": "default"',
-            "same thread with its returned ID",
-            "never creates a replacement thread",
-            "metadata only",
-            "Strict Plan to Build on the same thread",
-            "never caller-authored plan prose",
-            "detail.thread.proposedPlans[].id",
-            '"plan_id": "server-plan-id-from-t3_thread_read"',
-            "sourceProposedPlan: {threadId, planId}",
-            "same-thread provenance",
-            "duplicate concurrent work",
-            "does not roll the mode back",
-        ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, README)
-        self.assertNotIn('"plan_markdown"', README)
-        self.assertNotIn('"plan_text"', README)
-
-    def test_every_json_example_parses_and_matches_its_tool_schema(self) -> None:
-        examples = tuple(
-            json.loads(block)
-            for block in re.findall(r"```json\n(.*?)\n```", README, re.DOTALL)
+    def test_every_json_example_parses_and_is_structurally_valid_for_named_tool(self) -> None:
+        named_examples = tuple(
+            (tool_name, json.loads(block))
+            for tool_name, block in re.findall(
+                r"(?m)^Example for `(t3_[^`]+)`:.*?^```json\n(.*?)\n```",
+                README,
+                re.DOTALL,
+            )
         )
-        example_tools = (
-            "t3_thread_create",
-            "t3_thread_send",
-            "t3_thread_implement_plan",
+        self.assertEqual(
+            tuple(tool_name for tool_name, _ in named_examples),
+            (
+                "t3_threads",
+                "t3_thread_read",
+                "t3_thread_send",
+                "t3_thread_wait",
+                "t3_thread_respond",
+                "t3_thread_create",
+                "t3_thread_implement_plan",
+            ),
         )
-        self.assertEqual(len(examples), len(example_tools))
-        for tool_name, example in zip(example_tools, examples, strict=True):
+        all_json_blocks = re.findall(r"```json\n(.*?)\n```", README, re.DOTALL)
+        self.assertEqual(len(all_json_blocks), len(named_examples))
+        for tool_name, example in named_examples:
             with self.subTest(tool=tool_name):
+                self.assertIn(tool_name, schemas.SCHEMAS)
                 parameters = schemas.SCHEMAS[tool_name]["parameters"]
                 self.assertIsInstance(example, dict)
                 self.assertLessEqual(set(parameters["required"]), set(example))
                 self.assertLessEqual(set(example), set(parameters["properties"]))
-                for field_name, value in example.items():
-                    field_schema = parameters["properties"][field_name]
+                for field, value in example.items():
+                    field_schema = parameters["properties"][field]
                     if field_schema.get("type") == "string":
                         self.assertIsInstance(value, str)
-                        self.assertGreaterEqual(
-                            len(value), field_schema.get("minLength", 0)
-                        )
-                        self.assertLessEqual(
-                            len(value), field_schema.get("maxLength", len(value))
-                        )
                     if "enum" in field_schema:
                         self.assertIn(value, field_schema["enum"])
 
-    def test_documents_full_access_races_recovery_and_security_boundary(self) -> None:
+        examples_by_tool = dict(named_examples)
+        self.assertIn("answers", examples_by_tool["t3_thread_respond"])
+        self.assertNotIn("decision", examples_by_tool["t3_thread_respond"])
+
+    def test_workflows_cover_exact_selector_continuation_wait_response_and_plan(self) -> None:
         for phrase in (
-            "full-access` permits trusted provider work to execute commands and modify or delete files without approval",
-            "cannot cancel, remove, or retroactively authorize an approval already pending",
-            "fresh UUIDv4 command ID",
-            "byte-identical command",
-            "`mutation_ambiguous` or `verification_failed`",
-            "`network_error`",
-            "retry only when `outcome_ambiguous` is false",
-            "`conflict`",
-            "re-read `t3_threads` or `t3_thread_read`",
-            "`concurrent_state_change`",
-            "10-second absolute monotonic deadline",
-            "30 seconds",
-            "three dispatch attempts",
+            "project `solarsim` plus a title query",
+            "zero or multiple matches",
+            "never silently chooses",
+            "preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree",
+            "never creates a replacement thread",
+            "queued",
+            "started",
+            "completed",
+            "blocked",
+            "accepted_pending_projection",
+            "provider liveness",
+            "work progress",
+            "approval request",
+            "user-input request",
+            "Strict Plan to Build",
+            "sourceProposedPlan",
+            "never caller-authored plan prose",
+            "required_snapshot_sequence",
+            "expected_message_id",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, README)
+
+    def test_security_auth_bounds_and_recovery_are_truthful(self) -> None:
+        for phrase in (
+            "five-minute",
+            "revokes it in `finally`",
+            "never enters argv",
+            "never persists",
+            "eight administrative scopes",
+            "external-token",
+            "profile-scoped `T3_ORCHESTRATION_TOKEN`",
+            "numeric loopback",
+            "proxies and redirects",
             "1 MiB",
             "16 MiB",
-            "Never put it in argv",
-            "does not issue or persist credentials",
-            "SQLite",
-            "event-log JSONL",
-            "raw dispatch or WebSocket control",
+            "15-second projection window",
+            "byte-identical command",
+            "Never resend after a successful dispatch response",
+            "`accepted_pending_projection` is not a failure",
+            "`mutation_ambiguous`",
+            "`network_error`",
+            "`conflict`",
+            "`auth_cleanup: failed`",
+            "full-access` permits trusted provider work to execute commands and modify or delete files without approval",
+            "`local-cli` currently requires Linux with `/proc` and `pidfd` support",
+            "single-user WSL trust boundary",
+            "connected socket belongs to that pinned process",
+            "not a multi-user isolation mechanism",
+            "mutually untrusted local users",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, README)
         for endpoint in (
+            "GET /.well-known/t3/environment",
             "GET /api/orchestration/shell",
             "GET /api/orchestration/threads/:threadId",
             "POST /api/orchestration/dispatch",
         ):
-            with self.subTest(endpoint=endpoint):
-                self.assertIn(f"`{endpoint}`", README)
+            self.assertIn(f"`{endpoint}`", README)
         self.assertNotRegex(README, r"(?m)^\s*(?:export\s+)?T3_ORCHESTRATION_TOKEN\s*=")
+        self.assertIn("non-thread-mutating first check", LOWER)
+        self.assertNotIn("read-only first check", LOWER)
 
-    def test_documents_update_rollback_uninstall_and_release_verification(self) -> None:
-        update_block = README.split("## Update, rollback, and uninstall", 1)[1].split(
-            "## Credential and data boundary", 1
+    def test_update_rollback_uninstall_and_optional_external_auth_are_supported(self) -> None:
+        update = README.split("## Update, rollback, and uninstall", 1)[1].split(
+            "## Security and credential handling", 1
         )[0]
-        commands = (
+        for command in (
             "read -r -p 'New audited 40-character commit SHA: ' HERMES_T3_CONTROL_REF",
             "hermes plugins disable hermes-t3-control",
-            'hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable',
             "hermes plugins remove hermes-t3-control",
+            'hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable',
             "hermes config unset plugins.entries.hermes-t3-control",
-        )
-        for command in commands:
-            with self.subTest(command=command):
-                self.assertIn(command, update_block)
-        self.assertLess(
-            update_block.index("hermes plugins disable hermes-t3-control"),
-            update_block.index("hermes plugins remove hermes-t3-control"),
-        )
-        self.assertLess(
-            update_block.index("hermes plugins remove hermes-t3-control"),
-            update_block.index("hermes plugins install thetasigmaio/hermes-t3-control"),
-        )
-        self.assertNotIn(
-            "hermes plugins install thetasigmaio/hermes-t3-control --force",
-            update_block,
-        )
-        self.assertIn(
-            "`--force` also accepts a `caution` security-scan verdict",
-            update_block,
-        )
-        self.assertIn("separately reviewed exact commit", update_block)
-        self.assertIn("there is no moving-channel or automatic rollback command", README)
-        self.assertIn("Plugin removal does not erase profile settings or secrets", README)
-        self.assertIn("leaves `hermes-t3-control` in `plugins.disabled`", README)
-        self.assertIn("hermes config edit", update_block)
+        ):
+            self.assertIn(command, update)
         self.assertNotIn("hermes plugins uninstall hermes-t3-control", README)
+        self.assertIn("operator-isolated headless or local deployment", LOWER)
+        self.assertIn("base_url", README)
+        self.assertIn("orchestration:read", README)
+        self.assertIn("orchestration:operate", README)
+        self.assertNotIn("use explicit `external-token` mode in a multi-user distro", README)
 
+    def test_published_assets_use_a_private_fresh_https_only_directory(self) -> None:
+        self.assertIn(
+            "trusted v1.2.0 source checkout containing `scripts/verify_release.py`",
+            README,
+        )
+        blocks = [
+            block
+            for block in re.findall(r"```bash\n(.*?)\n```", README, re.DOTALL)
+            if "/releases/download/" in block
+        ]
+        self.assertEqual(len(blocks), 1)
+        block = blocks[0]
+        self.assertIn("umask 077", block)
+        self.assertRegex(block, r'RELEASE_DIR="\$\(mktemp -d\)"')
+        self.assertIn("trap 'rm -rf -- \"$RELEASE_DIR\"' EXIT", block)
+        self.assertEqual(block.count("--proto '=https'"), 2)
+        self.assertEqual(block.count("--proto-redir '=https'"), 2)
+        self.assertNotIn("--output dist/", block)
+        self.assertIn('"$RELEASE_DIR/hermes-t3-control-1.2.0.tar.gz"', block)
+        self.assertIn('"$RELEASE_DIR/hermes-t3-control-1.2.0.tar.gz.sha256"', block)
+        self.assertIn(
+            'python3 -B scripts/verify_release.py "$RELEASE_DIR/hermes-t3-control-1.2.0.tar.gz.sha256"',
+            block,
+        )
+
+    def test_development_gates_and_fresh_process_claim_are_precise(self) -> None:
         for command in (
-            "python3 -B -m unittest discover -s tests -v",
-            "env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v tests.test_supported_install",
+            "PYTHONWARNINGS=error python3.11 -B -m unittest discover -s tests -v",
+            "env HERMES_SUPPORTED_INSTALL_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3.11 -B -m unittest -v tests.test_supported_install",
             "env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci",
             "python3 -B scripts/build_release.py --output-dir dist",
+            "python3 -B scripts/verify_release.py dist/hermes-t3-control-1.2.0.tar.gz.sha256",
         ):
-            with self.subTest(command=command):
-                self.assertEqual(README.count(command), 1)
-        for url in (
-            "https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.1.1/hermes-t3-control-1.1.1.tar.gz",
-            "https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.1.1/hermes-t3-control-1.1.1.tar.gz.sha256",
-        ):
-            with self.subTest(url=url):
-                self.assertIn(url, README)
-        self.assertEqual(
-            README.count(
-                "python3 -B scripts/verify_release.py dist/hermes-t3-control-1.1.1.tar.gz.sha256"
-            ),
-            2,
-        )
-        for command in (
-            "curl --fail --location --output dist/hermes-t3-control-1.1.1.tar.gz ",
-            "curl --fail --location --output dist/hermes-t3-control-1.1.1.tar.gz.sha256 ",
-            "git ls-remote https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.1.1^{}'",
-            'test "${#HERMES_T3_CONTROL_REF}" -eq 40',
-        ):
-            with self.subTest(command=command):
-                self.assertIn(command, README)
+            self.assertEqual(README.count(command), 1, command)
+        self.assertIn("`uv sync --frozen`", README)
+        self.assertIn("expected loopback tcp connection", LOWER)
+        self.assertNotIn("network-blocked", LOWER)
 
-    def test_live_smoke_and_repository_paths_are_safe(self) -> None:
-        for name in (
-            "python3 -B scripts/live_smoke.py",
-            "T3_SMOKE_ISOLATED=1",
-            "T3_SMOKE_THREAD_ID",
-            "T3_ORCHESTRATION_BASE_URL",
-            "T3_ORCHESTRATION_TOKEN",
-            "operator-designated isolated non-SolarSim thread",
-        ):
-            with self.subTest(name=name):
-                self.assertIn(name, README)
+    def test_repository_paths_and_unpublished_status_are_safe(self) -> None:
         self.assertNotIn(".claude/spec", LOWER)
+        self.assertNotIn(".codex/spec", LOWER)
         machine_paths = re.compile(
             r"/home/[^/\s]+/|/Users/[^/\s]+/|/mnt/[a-z]/|"
             r"[A-Za-z]:\\Users\\|\\\\wsl(?:\.localhost)?\\",

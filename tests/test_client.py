@@ -6,6 +6,7 @@ import time
 import unittest
 import uuid
 from types import MappingProxyType
+from unittest import mock
 
 import client
 from tests.support import (
@@ -43,6 +44,11 @@ class OriginAndInputTests(unittest.TestCase):
 
     def test_constructor_overrides_cannot_exceed_production_maxima(self) -> None:
         token = uuid.uuid4().hex
+        self.assertEqual(client.MUTATION_POLL_SECONDS, 15.0)
+        self.assertEqual(
+            client.T3Client("http://127.0.0.1", token).mutation_poll_timeout,
+            15.0,
+        )
         with self.assertRaises(client.ConfigurationError):
             client.T3Client("http://127.0.0.1", token, request_timeout=10.01)
         with self.assertRaises(client.ConfigurationError):
@@ -140,6 +146,70 @@ class OriginAndInputTests(unittest.TestCase):
 
 
 class ReadAndSchemaTests(unittest.TestCase):
+    def test_environment_descriptor_is_allowlisted_bounded_and_additive(self) -> None:
+        descriptor = {
+            "environmentId": "environment-test",
+            "serverVersion": "0.0.34-nightly.20260820.1141",
+            "futureField": {"preserved": True},
+        }
+        with LoopbackServer([Response(value=descriptor)]) as server:
+            observed = client.T3Client(
+                server.base_url, server.token
+            ).get_environment_descriptor()
+
+        self.assertEqual(observed, descriptor)
+        self.assertEqual(
+            server.requests[0]["path"], "/.well-known/t3/environment"
+        )
+        self.assertEqual(
+            server.requests[0]["authorization"], f"Bearer {server.token}"
+        )
+
+        for field, value in (
+            ("environmentId", ""),
+            ("environmentId", " environment-test"),
+            ("environmentId", "x" * (client.MAX_IDENTIFIER_CHARS + 1)),
+            ("serverVersion", "bad\nversion"),
+            ("serverVersion", 1),
+        ):
+            invalid = dict(descriptor, **{field: value})
+            with self.subTest(field=field, value_type=type(value).__name__), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_environment_descriptor(invalid)
+
+    def test_environment_descriptor_probe_is_strictly_unauthenticated(self) -> None:
+        descriptor = {
+            "environmentId": "environment-test",
+            "serverVersion": "0.0.34-nightly.20260820.1141",
+        }
+        with LoopbackServer([Response(value=descriptor)]) as server:
+            observed = client.probe_environment_descriptor(server.base_url)
+
+        self.assertEqual(observed, descriptor)
+        self.assertEqual(
+            server.requests,
+            [
+                {
+                    "method": "GET",
+                    "path": "/.well-known/t3/environment",
+                    "authorization": None,
+                    "body": b"",
+                }
+            ],
+        )
+
+    def test_environment_descriptor_uses_its_one_mib_byte_limit(self) -> None:
+        oversized = {
+            "environmentId": "environment-test",
+            "serverVersion": "0.0.34-nightly.20260820.1141",
+            "padding": "x" * client.MAX_ENVIRONMENT_RESPONSE_BYTES,
+        }
+        with LoopbackServer([Response(value=oversized)]) as server:
+            transport = client.T3Client(server.base_url, server.token)
+            with self.assertRaises(client.ResponseTooLargeError):
+                transport.get_environment_descriptor()
+
     def test_shell_and_detail_preserve_additive_fields_and_authenticate(self) -> None:
         shell = shell_snapshot(extra=True)
         detail = detail_snapshot(sequence=2)
@@ -221,6 +291,100 @@ class ReadAndSchemaTests(unittest.TestCase):
             [1, 2, 3],
         )
         self.assertEqual(validated["thread"]["latestTurn"]["futureTurnField"], "kept")
+
+    def test_optional_agent_projection_fields_are_validated_when_present(self) -> None:
+        shell = shell_snapshot()
+        compact = shell["threads"][0]
+        compact.update(
+            {
+                "settledAt": None,
+                "latestUserMessageAt": NOW,
+                "hasPendingApprovals": False,
+                "hasPendingUserInput": True,
+                "hasActionableProposedPlan": False,
+                "backgroundLiveness": "working",
+                "planProgress": None,
+            }
+        )
+        self.assertIs(client.validate_shell_snapshot(shell), shell)
+
+        detail = detail_snapshot()
+        detail["thread"]["activities"] = [
+            {
+                "id": "activity-1",
+                "kind": "approval.requested",
+                "summary": "Approval requested",
+                "payload": {"requestId": "request-1", "future": True},
+                "turnId": None,
+                "sequence": 1,
+                "createdAt": NOW,
+                "futureActivityField": [1, 2, 3],
+            }
+        ]
+        self.assertIs(client.validate_thread_detail(detail), detail)
+
+        invalid_shell_fields = (
+            ("settledAt", "not-a-timestamp"),
+            ("hasPendingApprovals", 1),
+            ("backgroundLiveness", []),
+            ("planProgress", "working"),
+        )
+        for field, value in invalid_shell_fields:
+            invalid = copy.deepcopy(shell)
+            invalid["threads"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_shell_snapshot(invalid)
+
+        for field, value in (
+            ("id", ""),
+            ("kind", None),
+            ("summary", "  "),
+            ("payload", []),
+            ("turnId", 1),
+            ("sequence", True),
+            ("createdAt", "not-a-timestamp"),
+        ):
+            invalid = copy.deepcopy(detail)
+            invalid["thread"]["activities"][0][field] = value
+            with self.subTest(activity_field=field), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_thread_detail(invalid)
+
+    def test_background_liveness_matches_live_nullable_enum_projection(self) -> None:
+        for value in (None, "working", "monitoring"):
+            with self.subTest(value=value):
+                shell = shell_snapshot()
+                shell["threads"][0]["backgroundLiveness"] = value
+                self.assertIs(client.validate_shell_snapshot(shell), shell)
+
+        for value in ({"state": "working"}, "idle", False):
+            with self.subTest(invalid=value):
+                shell = shell_snapshot()
+                shell["threads"][0]["backgroundLiveness"] = value
+                with self.assertRaises(client.ResponseSchemaError):
+                    client.validate_shell_snapshot(shell)
+
+    def test_activity_sequence_matches_live_optional_projection(self) -> None:
+        detail = detail_snapshot()
+        detail["thread"]["activities"] = [
+            {
+                "id": "activity-live",
+                "tone": "info",
+                "kind": "checkpoint.captured",
+                "summary": "Checkpoint captured",
+                "payload": {},
+                "turnId": "turn-1",
+                "createdAt": NOW,
+            }
+        ]
+        self.assertIs(client.validate_thread_detail(detail), detail)
+
+        detail["thread"]["activities"][0]["sequence"] = True
+        with self.assertRaises(client.ResponseSchemaError):
+            client.validate_thread_detail(detail)
 
     def test_detail_requires_proposed_plans_and_exact_plan_fields(self) -> None:
         missing_plans = detail_snapshot()
@@ -526,6 +690,9 @@ class MutationTests(unittest.TestCase):
         ) as server:
             transport = client.T3Client(server.base_url, server.token, poll_interval=0.001)
             result = transport.mutate("thread-1", self.command, self.predicate)
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["verification"], "verified")
+            self.assertTrue(result["completed"])
             self.assertEqual(result["dispatch_sequence"], 9)
             self.assertEqual(result["detail"]["snapshotSequence"], 9)
             self.assertEqual(
@@ -743,7 +910,34 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(caught.exception.error_code, "invalid_request")
             self.assertEqual(len(server.requests), 1)
 
-    def test_accepted_poll_expiry_is_verification_failed(self) -> None:
+    def test_accepted_turn_with_delayed_projection_is_pending_without_redispatch(self) -> None:
+        message_id = str(uuid.uuid4())
+        command = {
+            "type": "thread.turn.start",
+            "commandId": self.command_id,
+            "threadId": "thread-1",
+            "message": {
+                "messageId": message_id,
+                "role": "user",
+                "text": "Continue with the accepted work.",
+                "attachments": [],
+            },
+            "modelSelection": shell_snapshot()["threads"][0]["modelSelection"],
+            "titleSeed": "A thread",
+            "runtimeMode": "approval-required",
+            "interactionMode": "default",
+            "createdAt": NOW,
+        }
+        dispatch_body = client.canonical_command_bytes(command)
+
+        def exact_message_observed(detail: dict[str, object]) -> bool:
+            return any(
+                item["id"] == message_id
+                and item["role"] == "user"
+                and item["text"] == command["message"]["text"]
+                for item in detail["thread"]["messages"]  # type: ignore[index,union-attr]
+            )
+
         responses = [Response(value={"sequence": 5})] + [
             Response(value=detail_snapshot(sequence=5)) for _ in range(20)
         ]
@@ -756,12 +950,153 @@ class MutationTests(unittest.TestCase):
                 mutation_poll_timeout=0.02,
                 poll_interval=0.005,
             )
-            with self.assertRaises(client.VerificationFailedError) as caught:
-                transport.mutate("thread-1", self.command, self.predicate)
-            self.assertEqual(caught.exception.command_id, self.command_id)
-            self.assertEqual(caught.exception.details["dispatch_sequence"], 5)
+            result = transport.mutate(
+                "thread-1", command, exact_message_observed
+            )
 
-    def test_accepted_retry_poll_expiry_remains_mutation_ambiguous(self) -> None:
+            self.assertEqual(result["command_id"], self.command_id)
+            self.assertEqual(result["message_id"], message_id)
+            self.assertEqual(result["thread_id"], "thread-1")
+            self.assertEqual(result["dispatch_sequence"], 5)
+            self.assertEqual(result["dispatch_attempts"], 1)
+            self.assertFalse(result["recovered_after_ambiguous_dispatch"])
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["verification"], "accepted_pending_projection")
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["detail"]["snapshotSequence"], 5)
+            self.assertEqual(result["observed_snapshot_sequence"], 5)
+            self.assertEqual(
+                result["reconciliation"],
+                {
+                    "tool": "t3_thread_read",
+                    "arguments": {
+                        "thread_id": "thread-1",
+                        "view": "raw",
+                        "turn_limit": 150,
+                    },
+                    "required_snapshot_sequence": 5,
+                    "expected_message_id": message_id,
+                },
+            )
+            posts = [
+                request for request in server.requests if request["method"] == "POST"
+            ]
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(posts[0]["body"], dispatch_body)
+            self.assertTrue(
+                all(request["method"] == "GET" for request in server.requests[1:])
+            )
+
+    def test_accepted_get_timeout_at_exact_poll_boundary_is_pending(self) -> None:
+        now = [0.0]
+        transport = client.T3Client(
+            "http://127.0.0.1:9",
+            uuid.uuid4().hex,
+            mutation_timeout=2.0,
+            mutation_poll_timeout=1.0,
+            clock=lambda: now[0],
+        )
+        requests: list[tuple[str, str]] = []
+
+        def request(method: str, path: str, **_kwargs: object) -> object:
+            requests.append((method, path))
+            if method == "POST":
+                return {"sequence": 5}
+            now[0] = 1.0
+            raise client.NetworkError()
+
+        with mock.patch.object(transport, "_request_json", side_effect=request):
+            result = transport.mutate("thread-1", self.command, self.predicate)
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["projection_cause_code"], "poll_deadline")
+        self.assertIsNone(result["detail"])
+        self.assertNotIn("observed_snapshot_sequence", result)
+        self.assertEqual(
+            result["reconciliation"],
+            {
+                "tool": "t3_thread_read",
+                "arguments": {
+                    "thread_id": "thread-1",
+                    "view": "raw",
+                    "turn_limit": 150,
+                },
+                "required_snapshot_sequence": 5,
+            },
+        )
+        self.assertEqual(
+            requests,
+            [
+                ("POST", "/api/orchestration/dispatch"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+            ],
+        )
+
+    def test_accepted_poll_schema_failure_is_pending_with_bounded_cause(self) -> None:
+        with LoopbackServer(
+            [Response(value={"sequence": 5}), Response(value={"malformed": True})]
+        ) as server:
+            transport = client.T3Client(server.base_url, server.token)
+            result = transport.mutate("thread-1", self.command, self.predicate)
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["projection_cause_code"], "response_schema_error")
+        self.assertIsNone(result["detail"])
+        self.assertEqual(
+            [request["method"] for request in server.requests], ["POST", "GET"]
+        )
+
+    def test_exact_projected_user_message_with_null_turn_is_verified_as_accepted(self) -> None:
+        message_id = str(uuid.uuid4())
+        text = "Queue this exact request."
+        command = {
+            "type": "thread.turn.start",
+            "commandId": self.command_id,
+            "threadId": "thread-1",
+            "message": {
+                "messageId": message_id,
+                "role": "user",
+                "text": text,
+                "attachments": [],
+            },
+        }
+        projected = detail_snapshot(
+            sequence=6,
+            messages=[message(message_id=message_id, text=text, turn_id=None)],
+        )
+
+        def exact_message_observed(detail: dict[str, object]) -> bool:
+            return any(
+                item["id"] == message_id
+                and item["role"] == "user"
+                and item["text"] == text
+                for item in detail["thread"]["messages"]  # type: ignore[index,union-attr]
+            )
+
+        with LoopbackServer(
+            [Response(value={"sequence": 6}), Response(value=projected)]
+        ) as server:
+            transport = client.T3Client(server.base_url, server.token)
+            result = transport.mutate(
+                "thread-1", command, exact_message_observed
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["verification"], "verified")
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["message_id"], message_id)
+        self.assertEqual(result["detail"]["thread"]["messages"], [
+            message(message_id=message_id, text=text, turn_id=None)
+        ])
+        self.assertEqual(
+            [request["method"] for request in server.requests], ["POST", "GET"]
+        )
+
+    def test_accepted_retry_poll_expiry_is_pending_after_byte_identical_ambiguous_retry(self) -> None:
+        dispatch_body = client.canonical_command_bytes(self.command)
         responses = [
             Response(value={}, delay_before_body=0.08),
             Response(value=detail_snapshot(sequence=3)),
@@ -777,17 +1112,34 @@ class MutationTests(unittest.TestCase):
                 poll_interval=0.005,
                 retry_backoff=(),
             )
-            with self.assertRaises(client.MutationAmbiguousError) as caught:
-                transport.mutate("thread-1", self.command, self.predicate)
-            result = caught.exception.to_dict()
+            result = transport.mutate("thread-1", self.command, self.predicate)
             self.assertEqual(result["command_id"], self.command_id)
             self.assertEqual(result["thread_id"], "thread-1")
-            self.assertEqual(result["cause_code"], "verification_failed")
-            self.assertEqual(result["details"]["dispatch_sequence"], 4)
+            self.assertEqual(result["dispatch_sequence"], 4)
+            self.assertEqual(result["dispatch_attempts"], 2)
+            self.assertTrue(result["recovered_after_ambiguous_dispatch"])
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["verification"], "accepted_pending_projection")
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["observed_snapshot_sequence"], 4)
             self.assertEqual(
-                [request["method"] for request in server.requests[:3]],
-                ["POST", "GET", "POST"],
+                result["reconciliation"],
+                {
+                    "tool": "t3_thread_read",
+                    "arguments": {
+                        "thread_id": "thread-1",
+                        "view": "raw",
+                        "turn_limit": 150,
+                    },
+                    "required_snapshot_sequence": 4,
+                },
             )
+            posts = [
+                request["body"]
+                for request in server.requests
+                if request["method"] == "POST"
+            ]
+            self.assertEqual(posts, [dispatch_body, dispatch_body])
 
     def test_newer_turn_race_is_more_specific_than_ambiguity(self) -> None:
         detail = detail_snapshot(sequence=6)

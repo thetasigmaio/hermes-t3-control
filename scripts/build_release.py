@@ -24,6 +24,7 @@ RELEASE_FILES = (
     "LICENSE",
     "README.md",
     "__init__.py",
+    "auth.py",
     "client.py",
     "plugin.yaml",
     "schemas.py",
@@ -136,7 +137,7 @@ def _checked_output_directory_metadata(directory_fd: int) -> os.stat_result:
 def _open_output_directory(output_dir: Path) -> tuple[Path, int, os.stat_result]:
     _require_secure_publish_primitives()
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         resolved_output_dir = output_dir.resolve(strict=True)
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         flags |= getattr(os, "O_CLOEXEC", 0)
