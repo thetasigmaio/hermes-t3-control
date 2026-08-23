@@ -1,4 +1,4 @@
-# Hermes T3 Control 1.2.1
+# Hermes T3 Control 1.2.2
 
 Control T3 work from Hermes without copying tokens or hunting for thread UUIDs. The plugin lets an agent find the right thread, see its latest result, running status, pending questions, and stored plan, continue it safely, and wait for the outcome. The core thread lifecycle is verified end-to-end with Codex.
 
@@ -9,7 +9,7 @@ The simple mental model is:
 3. Continue or control that exact thread.
 4. Monitor with `t3_thread_wait`.
 
-Ten focused tools cover discovery, creation, continuation, modes, Plan to Build, interrupt, stop, wait, and typed responses. Outputs stay bounded, mutations fail closed on ambiguous selectors, and no mutation creates a replacement thread implicitly.
+Eleven focused tools cover discovery, creation, continuation, modes, Plan to Build, interrupt, stop, wait, typed responses, and explicit thread settlement. Outputs stay bounded, mutations fail closed on ambiguous selectors, and no mutation creates a replacement thread implicitly.
 
 ## Compatibility
 
@@ -32,38 +32,17 @@ See [Compatibility evidence](docs/compatibility.md) for the exact provider bound
 
 ## Quick start
 
-Prerequisites: T3 is running, Hermes 0.20.4 or 0.20.5 is available, and Git supports SSH signature verification. The block prints the active Hermes profile for confirmation, verifies the v1.2.1 tag against the pinned release-signing key, installs that exact commit disabled with the scanner on, runs Doctor, and enables without tool override.
+Prerequisites: T3 is running, Hermes 0.20.4 or 0.20.5 is available, and Git supports SSH signature verification. The block prints the active Hermes profile for confirmation, verifies the v1.2.2 tag against the pinned release-signing key, installs that exact commit disabled with the scanner on, runs Doctor, and enables without tool override.
 
 ```bash
-(
-  set -eu
-  umask 077
-  hermes config path
-  read -r -p 'Install into this Hermes profile? [y/N] ' CONFIRM
-  case "$CONFIRM" in y|Y) ;; *) exit 1 ;; esac
-  VERIFY_DIR="$(mktemp -d)"
-  trap 'rm -rf -- "$VERIFY_DIR"' EXIT
-  mkdir -m 700 "$VERIFY_DIR/home" "$VERIFY_DIR/xdg" "$VERIFY_DIR/repo"
-  safe_git() {
-    env -i PATH="$PATH" LC_ALL=C HOME="$VERIFY_DIR/home" XDG_CONFIG_HOME="$VERIFY_DIR/xdg" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"
-  }
-  safe_git -C "$VERIFY_DIR/repo" init -q
-  safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.2.1:refs/tags/v1.2.1'
-  TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.2.1 2>&1 || true)"
-  if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
-    printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
-    exit 1
-  fi
-  HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.2.1^{}')"
-  printf '%s\n' "$HERMES_T3_CONTROL_REF" | grep -Eq '^[0-9a-f]{40}$'
-  hermes config set plugins.scan_on_install true
-  hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable
-  hermes plugins doctor hermes-t3-control --ci
-  hermes plugins enable hermes-t3-control --no-allow-tool-override
-)
+( git clone --depth 1 https://github.com/thetasigmaio/hermes-t3-control &&
+cd ./hermes-t3-control &&
+SCRIPT=scripts/install-signed.sh && exec 3<"$SCRIPT" && test -f /dev/fd/3 &&
+HASH=18a98d7c4e247318af8728ecf79f64efd43491fd83faf884636e3119ede944d2 &&
+printf '%s  /dev/fd/3\n' "$HASH" | sha256sum -c - && bash /dev/fd/3 )
 ```
 
-Doctor runs while disabled and must report `registrations: 10 tool(s), 0 hook(s)`. This path does not use `--force`.
+Doctor runs while disabled and must report `registrations: 11 tool(s), 0 hook(s)`. This path does not use `--force`.
 
 Restart only the process that owns your Hermes session. For a managed messaging gateway:
 
@@ -106,15 +85,21 @@ Then wait without dumping a full snapshot:
 
 `t3_thread_wait {"thread_id":"exact-thread-id","until":"terminal","timeout_seconds":30}`
 
+After work is complete, explicitly apply the same settlement as the T3 UI when the server advertises that capability:
+
+`t3_thread_settle {"thread_id":"exact-thread-id"}`
+
+Settlement conflicts with starting/running work, pending approval or user input, and a recent queued turn. An already-settled thread succeeds. T3 clears pin and snooze itself; the thread remains available and is not stopped, deleted, or archived. This is distinct from turn-liveness `settled`, and there is no public unsettle tool.
+
 Zero or multiple matches require a narrower selector. A send never creates a replacement thread. If a mutation returns `accepted_pending_projection`, do not send it again; read back the exact command/message identity as described in [Operations and recovery](docs/operations.md#accepted-but-not-yet-projected).
 
 `full-access` lets the selected provider execute commands and modify or delete files without approval. Use it only for a trusted provider and checkout.
 
-For creation, Plan to Build, approvals/user input, mode changes, and all ten tools, see the [Tool reference](docs/tools.md).
+For creation, Plan to Build, approvals/user input, mode changes, settlement, and all eleven tools, see the [Tool reference](docs/tools.md).
 
 ## More detail
 
-- [Tool reference](docs/tools.md) — all ten tools, limits, and workflows.
+- [Tool reference](docs/tools.md) — all eleven tools, limits, and workflows.
 - [Compatibility evidence](docs/compatibility.md) — provider and OS claims plus acceptance gates.
 - [Security model](docs/security.md) — credential lifecycle, transport bounds, and race boundaries.
 - [Operations and recovery](docs/operations.md) — restart, update, rollback, troubleshooting, and release verification.

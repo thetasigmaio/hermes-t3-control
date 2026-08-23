@@ -48,6 +48,7 @@ SESSION_STATUSES = frozenset(
 )
 LATEST_TURN_STATES = frozenset({"running", "interrupted", "completed", "error"})
 BACKGROUND_LIVENESS_STATES = frozenset({"working", "monitoring"})
+SETTLED_OVERRIDES = frozenset({"settled", "active"})
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _BEARER_CREDENTIAL_RE = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}", re.ASCII)
@@ -174,6 +175,28 @@ class ConcurrentStateChangeError(T3ClientError):
     outcome_ambiguous = True
     default_message = (
         "A newer turn was observed; newer provider work may have received the side effect."
+    )
+
+
+class ModelSwitchBusyError(T3ClientError):
+    error_code = "model_switch_busy"
+    retryable = True
+    default_message = (
+        "The model selection can change only while the thread is idle and ready."
+    )
+
+
+class UnsupportedModelSwitchError(T3ClientError):
+    error_code = "unsupported_model_switch"
+    default_message = (
+        "The current provider session cannot be restored with the requested model selection."
+    )
+
+
+class ProviderLimitExhaustedError(T3ClientError):
+    error_code = "provider_limit_exhausted"
+    default_message = (
+        "The selected provider cannot start this turn because its usage limit is exhausted."
     )
 
 
@@ -338,6 +361,14 @@ def validate_environment_descriptor(value: Any) -> dict[str, Any]:
     root = _object(value, "environment")
     _bounded_response_string(root, "environmentId", "environment")
     _bounded_response_string(root, "serverVersion", "environment")
+    if "capabilities" in root:
+        capabilities = _object(root["capabilities"], "environment.capabilities")
+        if "threadSettlement" in capabilities:
+            _boolean(
+                capabilities,
+                "threadSettlement",
+                "environment.capabilities",
+            )
     return root
 
 
@@ -395,9 +426,19 @@ def _validate_thread(value: Any, path: str, *, detail: bool) -> None:
     _nullable_timestamp(thread, "archivedAt", path)
     _timestamp(thread, "createdAt", path)
     _timestamp(thread, "updatedAt", path)
-    for field in ("settledAt", "latestUserMessageAt"):
+    if "settledOverride" in thread and thread["settledOverride"] is not None:
+        _enum(thread, "settledOverride", SETTLED_OVERRIDES, path)
+    for field in (
+        "settledAt",
+        "latestUserMessageAt",
+        "snoozedUntil",
+        "snoozedAt",
+        "pinnedAt",
+    ):
         if field in thread:
             _nullable_timestamp(thread, field, path)
+    if "pinOrderKey" in thread:
+        _nullable_string(thread, "pinOrderKey", path)
     for field in (
         "hasPendingApprovals",
         "hasPendingUserInput",
@@ -480,6 +521,8 @@ def _validate_session(value: Any, path: str, parent_thread_id: str) -> None:
         raise ResponseSchemaError("Thread session identity is inconsistent.")
     _enum(session, "status", SESSION_STATUSES, path)
     _nullable_string(session, "providerName", path)
+    if "providerInstanceId" in session:
+        _nonempty_string(session, "providerInstanceId", path)
     _enum(session, "runtimeMode", RUNTIME_MODES, path)
     _nullable_string(session, "activeTurnId", path)
     _nullable_string(session, "lastError", path)
@@ -772,6 +815,10 @@ class T3Client:
         predicate: Callable[[dict[str, Any]], bool],
         *,
         race_detector: Callable[[dict[str, Any]], bool] | None = None,
+        terminal_error_detector: Callable[
+            [dict[str, Any]], T3ClientError | None
+        ]
+        | None = None,
         require_accepted_sequence: bool = False,
     ) -> dict[str, Any]:
         normalized_thread_id = normalize_string(
@@ -798,6 +845,10 @@ class T3Client:
             raise InvalidInputError("mutation predicate must be callable.")
         if race_detector is not None and not callable(race_detector):
             raise InvalidInputError("race detector must be callable.")
+        if terminal_error_detector is not None and not callable(
+            terminal_error_detector
+        ):
+            raise InvalidInputError("terminal error detector must be callable.")
 
         operation_deadline = self.clock() + self.mutation_timeout
         last_detail: dict[str, Any] | None = None
@@ -834,6 +885,7 @@ class T3Client:
                     normalized_thread_id,
                     predicate,
                     race_detector,
+                    terminal_error_detector,
                     command_id,
                     operation_deadline,
                     exc.error_code,
@@ -862,6 +914,7 @@ class T3Client:
                 normalized_thread_id,
                 predicate,
                 race_detector,
+                terminal_error_detector,
                 command_id,
                 sequence,
                 operation_deadline,
@@ -900,6 +953,10 @@ class T3Client:
         thread_id: str,
         predicate: Callable[[dict[str, Any]], bool],
         race_detector: Callable[[dict[str, Any]], bool] | None,
+        terminal_error_detector: Callable[
+            [dict[str, Any]], T3ClientError | None
+        ]
+        | None,
         command_id: str,
         deadline: float,
         cause_code: str,
@@ -908,8 +965,16 @@ class T3Client:
             detail = self.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT, deadline=deadline)
             if race_detector is not None and race_detector(detail):
                 raise ConcurrentStateChangeError(command_id=command_id, thread_id=thread_id)
+            self._raise_terminal_error(
+                terminal_error_detector, detail, command_id, thread_id
+            )
             return detail if predicate(detail) else None
-        except ConcurrentStateChangeError:
+        except (
+            ConcurrentStateChangeError,
+            ModelSwitchBusyError,
+            UnsupportedModelSwitchError,
+            ProviderLimitExhaustedError,
+        ):
             raise
         except Exception as exc:
             secondary_code = exc.error_code if isinstance(exc, T3ClientError) else "internal_error"
@@ -924,6 +989,10 @@ class T3Client:
         thread_id: str,
         predicate: Callable[[dict[str, Any]], bool],
         race_detector: Callable[[dict[str, Any]], bool] | None,
+        terminal_error_detector: Callable[
+            [dict[str, Any]], T3ClientError | None
+        ]
+        | None,
         command_id: str,
         sequence: int,
         operation_deadline: float,
@@ -939,9 +1008,20 @@ class T3Client:
                 )
                 if race_detector is not None and race_detector(latest):
                     raise ConcurrentStateChangeError(command_id=command_id, thread_id=thread_id)
+                self._raise_terminal_error(
+                    terminal_error_detector,
+                    latest,
+                    command_id,
+                    thread_id,
+                )
                 if latest["snapshotSequence"] >= sequence and predicate(latest):
                     return latest, None
-            except ConcurrentStateChangeError:
+            except (
+                ConcurrentStateChangeError,
+                ModelSwitchBusyError,
+                UnsupportedModelSwitchError,
+                ProviderLimitExhaustedError,
+            ):
                 raise
             except Exception as exc:
                 if self.clock() >= poll_deadline:
@@ -958,6 +1038,26 @@ class T3Client:
             if remaining <= 0:
                 return latest, "poll_deadline"
             self.sleeper(min(self.poll_interval, remaining))
+
+    @staticmethod
+    def _raise_terminal_error(
+        detector: Callable[[dict[str, Any]], T3ClientError | None] | None,
+        detail: dict[str, Any],
+        command_id: str,
+        thread_id: str,
+    ) -> None:
+        if detector is None:
+            return
+        detected = detector(detail)
+        if detected is None:
+            return
+        if not isinstance(detected, T3ClientError):
+            raise T3ClientError()
+        if detected.command_id is None:
+            detected.command_id = command_id
+        if detected.thread_id is None:
+            detected.thread_id = thread_id
+        raise detected
 
     @staticmethod
     def _mutation_result(

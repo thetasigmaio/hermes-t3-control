@@ -11,7 +11,7 @@ except ImportError:  # Direct repository import used by unit tests.
 
 
 def register(ctx) -> None:
-    """Register ten synchronous tools without constructing a client or doing I/O."""
+    """Register eleven synchronous tools without constructing a client or doing I/O."""
     for name in TOOL_NAMES:
         schema = SCHEMAS[name]
         ctx.register_tool(

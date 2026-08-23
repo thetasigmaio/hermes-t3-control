@@ -24,6 +24,7 @@ EXPECTED_TOOLS = (
     "t3_session_stop",
     "t3_thread_wait",
     "t3_thread_respond",
+    "t3_thread_settle",
 )
 
 RUNTIME_FILES = ("__init__.py", "auth.py", "schemas.py", "tools.py", "client.py")
@@ -367,7 +368,7 @@ class RegistrationTests(unittest.TestCase):
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual(manifest["api_version"], 1)
-        self.assertEqual(manifest["version"], "1.2.1")
+        self.assertEqual(manifest["version"], "1.2.2")
         self.assertEqual(
             manifest["description"],
             "Control T3 work from Hermes with bounded tools and operation-scoped local authentication; core thread lifecycle verified end-to-end with Codex.",

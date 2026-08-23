@@ -17,6 +17,7 @@ from tests.support import (
     latest_turn,
     message,
     proposed_plan,
+    session,
     shell_snapshot,
     source_proposed_plan,
 )
@@ -152,10 +153,25 @@ class OriginAndInputTests(unittest.TestCase):
 
 
 class ReadAndSchemaTests(unittest.TestCase):
+    def test_session_provider_instance_id_is_optional_but_nonempty_when_present(self) -> None:
+        missing = detail_snapshot(current_session=session(provider_instance_id=None))
+        self.assertIs(client.validate_thread_detail(missing), missing)
+
+        for invalid in (None, "", "   ", 7):
+            with self.subTest(invalid=invalid):
+                detail = detail_snapshot(current_session=session())
+                detail["thread"]["session"]["providerInstanceId"] = invalid
+                with self.assertRaises(client.ResponseSchemaError):
+                    client.validate_thread_detail(detail)
+
     def test_environment_descriptor_is_allowlisted_bounded_and_additive(self) -> None:
         descriptor = {
             "environmentId": "environment-test",
             "serverVersion": "0.0.34-nightly.20260820.1141",
+            "capabilities": {
+                "threadSettlement": True,
+                "futureCapability": {"preserved": True},
+            },
             "futureField": {"preserved": True},
         }
         with LoopbackServer([Response(value=descriptor)]) as server:
@@ -180,6 +196,35 @@ class ReadAndSchemaTests(unittest.TestCase):
         ):
             invalid = dict(descriptor, **{field: value})
             with self.subTest(field=field, value_type=type(value).__name__), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_environment_descriptor(invalid)
+
+        without_capabilities = {
+            "environmentId": descriptor["environmentId"],
+            "serverVersion": descriptor["serverVersion"],
+        }
+        self.assertIs(
+            client.validate_environment_descriptor(without_capabilities),
+            without_capabilities,
+        )
+        disabled_capability = dict(
+            without_capabilities,
+            capabilities={"threadSettlement": False},
+        )
+        self.assertIs(
+            client.validate_environment_descriptor(disabled_capability),
+            disabled_capability,
+        )
+        for capabilities in (
+            None,
+            [],
+            {"threadSettlement": None},
+            {"threadSettlement": 1},
+            {"threadSettlement": "true"},
+        ):
+            invalid = dict(descriptor, capabilities=capabilities)
+            with self.subTest(capabilities=capabilities), self.assertRaises(
                 client.ResponseSchemaError
             ):
                 client.validate_environment_descriptor(invalid)
@@ -368,6 +413,42 @@ class ReadAndSchemaTests(unittest.TestCase):
             invalid = copy.deepcopy(detail)
             invalid["thread"]["activities"][0][field] = value
             with self.subTest(activity_field=field), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_thread_detail(invalid)
+
+    def test_native_settlement_and_companion_fields_are_validated_when_present(self) -> None:
+        detail = detail_snapshot()
+        detail["thread"].update(
+            {
+                "settledOverride": "settled",
+                "settledAt": "2026-08-23T12:00:00Z",
+                "pinnedAt": None,
+                "pinOrderKey": None,
+                "snoozedUntil": None,
+                "snoozedAt": None,
+            }
+        )
+        self.assertIs(client.validate_thread_detail(detail), detail)
+        for settled_override in (None, "active", "settled"):
+            valid = copy.deepcopy(detail)
+            valid["thread"]["settledOverride"] = settled_override
+            with self.subTest(settled_override=settled_override):
+                self.assertIs(client.validate_thread_detail(valid), valid)
+
+        invalid_fields = (
+            ("settledOverride", False),
+            ("settledOverride", "unsupported"),
+            ("settledAt", "not-a-timestamp"),
+            ("pinnedAt", 1),
+            ("pinOrderKey", []),
+            ("snoozedUntil", "2026-08-23T12:00:00"),
+            ("snoozedAt", {}),
+        )
+        for field, value in invalid_fields:
+            invalid = copy.deepcopy(detail)
+            invalid["thread"][field] = value
+            with self.subTest(field=field), self.assertRaises(
                 client.ResponseSchemaError
             ):
                 client.validate_thread_detail(invalid)
@@ -781,6 +862,35 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(
                 [request["method"] for request in server.requests], ["POST", "GET", "GET"]
             )
+
+    def test_terminal_error_detector_surfaces_typed_command_correlated_failure(self) -> None:
+        with LoopbackServer(
+            [Response(value={"sequence": 9}), Response(value=detail_snapshot(sequence=9))]
+        ) as server:
+            transport = client.T3Client(server.base_url, server.token)
+            with self.assertRaises(client.UnsupportedModelSwitchError) as caught:
+                transport.mutate(
+                    "thread-1",
+                    self.command,
+                    self.predicate,
+                    terminal_error_detector=lambda _detail: client.UnsupportedModelSwitchError(),
+                )
+
+        self.assertEqual(caught.exception.command_id, self.command_id)
+        self.assertEqual(caught.exception.thread_id, "thread-1")
+        self.assertEqual(caught.exception.error_code, "unsupported_model_switch")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_model_switch_error_types_have_stable_retry_contracts(self) -> None:
+        busy = client.ModelSwitchBusyError().to_dict()
+        unsupported = client.UnsupportedModelSwitchError().to_dict()
+        exhausted = client.ProviderLimitExhaustedError().to_dict()
+        self.assertEqual(busy["error_code"], "model_switch_busy")
+        self.assertTrue(busy["retryable"])
+        self.assertEqual(unsupported["error_code"], "unsupported_model_switch")
+        self.assertFalse(unsupported["retryable"])
+        self.assertEqual(exhausted["error_code"], "provider_limit_exhausted")
+        self.assertFalse(exhausted["retryable"])
 
     def test_accepted_mutation_budget_exhaustion_is_pending_without_redispatch(self) -> None:
         dispatch = {"sequence": 5}

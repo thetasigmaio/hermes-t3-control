@@ -118,10 +118,28 @@ T3_THREAD_CREATE_SCHEMA = _schema(
 
 T3_THREAD_SEND_SCHEMA = _schema(
     "t3_thread_send",
-    "Continue one existing thread only with explicit start-or-queue acknowledgement; stored full-access can modify or delete files without approval.",
+    "Continue one existing thread only with explicit start-or-queue acknowledgement, optionally switching its persisted model selection while idle; stored full-access can modify or delete files without approval.",
     {
         "thread_id": dict(_ID),
         "message": dict(_MESSAGE),
+        "instance_id": {
+            **_ID,
+            "description": "instance_id and model must be supplied together.",
+        },
+        "model": {
+            **_ID,
+            "description": "instance_id and model must be supplied together.",
+        },
+        "model_options": {
+            "type": "array",
+            "items": _MODEL_OPTION,
+            "maxItems": 64,
+            "description": (
+                "model_options requires instance_id and model; explicit values replace "
+                "the target options exactly, while omission preserves options only for "
+                "the same stored instance/model pair."
+            ),
+        },
         "busy_policy": {
             "type": "string",
             "enum": ["reject", "queue"],
@@ -250,6 +268,13 @@ T3_SESSION_STOP_SCHEMA = _schema(
     ["thread_id"],
 )
 
+T3_THREAD_SETTLE_SCHEMA = _schema(
+    "t3_thread_settle",
+    "Settle one inactive T3 thread after fail-closed native capability and pending-work checks.",
+    {"thread_id": dict(_ID)},
+    ["thread_id"],
+)
+
 SCHEMAS = {
     schema["name"]: schema
     for schema in (
@@ -263,6 +288,7 @@ SCHEMAS = {
         T3_SESSION_STOP_SCHEMA,
         T3_THREAD_WAIT_SCHEMA,
         T3_THREAD_RESPOND_SCHEMA,
+        T3_THREAD_SETTLE_SCHEMA,
     )
 }
 

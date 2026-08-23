@@ -139,6 +139,16 @@ def projection_responder(shell: dict, detail: dict):
     return responder
 
 
+def settlement_descriptor(*, enabled: bool | None = True) -> dict:
+    descriptor = {
+        "environmentId": "environment-test",
+        "serverVersion": "0.0.34-nightly.20260820.1141",
+    }
+    if enabled is not None:
+        descriptor["capabilities"] = {"threadSettlement": enabled}
+    return descriptor
+
+
 class ReadToolTests(unittest.TestCase):
     def test_threads_and_detail_reads(self) -> None:
         shell = shell_snapshot(sequence=3)
@@ -956,6 +966,32 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 },
             ),
             (
+                "t3_thread_send",
+                {
+                    "thread_id": "thread-1",
+                    "message": "Missing model",
+                    "instance_id": "codex-main",
+                },
+            ),
+            (
+                "t3_thread_send",
+                {
+                    "thread_id": "thread-1",
+                    "message": "Missing instance",
+                    "model": "gpt-current",
+                },
+            ),
+            (
+                "t3_thread_send",
+                {
+                    "thread_id": "thread-1",
+                    "message": "Detached options",
+                    "model_options": [
+                        {"id": "reasoning_effort", "value": "ultra"}
+                    ],
+                },
+            ),
+            (
                 "t3_thread_create",
                 {
                     "project_id": "project-1",
@@ -1005,6 +1041,11 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             "t3_thread_send": {
                 "thread_id": "thread-1",
                 "message": "Continue",
+                "instance_id": "codex-main",
+                "model": "gpt-current",
+                "model_options": [
+                    {"id": "reasoning_effort", "value": "high"}
+                ],
                 "busy_policy": "reject",
             },
             "t3_thread_set_mode": {
@@ -1028,6 +1069,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 "turn_id": "turn-1",
                 "decision": "accept",
             },
+            "t3_thread_settle": {"thread_id": "thread-1"},
         }
         public_string_paths = {
             (tool_name, (field_name,))
@@ -1042,6 +1084,8 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             {
                 ("t3_thread_create", ("model_options", "id")),
                 ("t3_thread_create", ("model_options", "value")),
+                ("t3_thread_send", ("model_options", "id")),
+                ("t3_thread_send", ("model_options", "value")),
             }
         )
         if "t3_thread_respond" in schemas.SCHEMAS:
@@ -1060,7 +1104,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             ("t3_thread_wait", ("until",)): "terminal",
             ("t3_thread_respond", ("decision",)): "accept",
         }
-        self.assertEqual(len(public_string_paths), 36)
+        self.assertEqual(len(public_string_paths), 41)
 
         with LoopbackServer([]) as server:
             for tool_name, field_path in sorted(public_string_paths):
@@ -1126,6 +1170,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 "turn_id": "turn-1",
                 "decision": "accept",
             },
+            "t3_thread_settle": {"thread_id": "thread-1"},
         }
         schema_matrix = {
             (tool_name, field_name)
@@ -1139,6 +1184,13 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             for tool_name, field_name in sorted(schema_matrix):
                 payload = dict(base_args[tool_name])
                 if tool_name == "t3_thread_create" and field_name in {
+                    "instance_id",
+                    "model",
+                }:
+                    payload.update(
+                        {"instance_id": "codex-main", "model": "gpt-current"}
+                    )
+                if tool_name == "t3_thread_send" and field_name in {
                     "instance_id",
                     "model",
                 }:
@@ -1460,6 +1512,831 @@ class AgentFacingSendToolTests(unittest.TestCase):
                 self.assertIn("command_state", result)
                 self.assertEqual(result["command_state"], command_state)
                 self.assertEqual(result["persisted_message"]["turn_id"], "turn-new")
+
+
+class ModelSwitchSendToolTests(unittest.TestCase):
+    SOURCE_SELECTION = {
+        "instanceId": "codex_20x",
+        "model": "gpt-current",
+        "options": [
+            {"id": "reasoning_effort", "value": "high"},
+            {"id": "web_search", "value": True},
+        ],
+    }
+    TARGET_PAIR = {"instanceId": "codex", "model": "gpt-5.6"}
+
+    @staticmethod
+    def _captured_dispatch_at(store: list[dict], sequence: int):
+        def responder(request: dict) -> Response:
+            store.append(json.loads(request["body"]))
+            return Response(value={"sequence": sequence})
+
+        return responder
+
+    @staticmethod
+    def _before(
+        *,
+        sequence: int = 10,
+        current_session: dict | None = None,
+    ) -> dict:
+        resolved_session = copy.deepcopy(
+            current_session
+            or session(status="ready", provider_instance_id="codex_20x")
+        )
+        if "providerInstanceId" in resolved_session:
+            resolved_session["providerInstanceId"] = "codex_20x"
+        detail = detail_snapshot(
+            sequence=sequence,
+            turn=latest_turn(turn_id="turn-old", state="completed"),
+            current_session=resolved_session,
+        )
+        detail["thread"]["modelSelection"] = copy.deepcopy(
+            ModelSwitchSendToolTests.SOURCE_SELECTION
+        )
+        return detail
+
+    def _successful_switch(
+        self,
+        *,
+        args: dict | None = None,
+        before: dict | None = None,
+        metadata_sequence: int = 11,
+        turn_sequence: int = 12,
+        final_hook=None,
+    ) -> tuple[dict, list[dict], list[dict]]:
+        commands: list[dict] = []
+        initial = copy.deepcopy(before or self._before())
+
+        def dispatch(request: dict) -> Response:
+            commands.append(json.loads(request["body"]))
+            sequence = metadata_sequence if len(commands) == 1 else turn_sequence
+            return Response(value={"sequence": sequence})
+
+        def metadata_readback(_request: dict) -> Response:
+            detail = copy.deepcopy(initial)
+            detail["snapshotSequence"] = metadata_sequence
+            detail["page"]["snapshotSequence"] = metadata_sequence
+            detail["page"]["threadSequence"] = metadata_sequence
+            detail["thread"]["modelSelection"] = copy.deepcopy(
+                commands[0]["modelSelection"]
+            )
+            return Response(value=detail)
+
+        def ready_readback(_request: dict) -> Response:
+            return metadata_readback(_request)
+
+        def turn_readback(_request: dict) -> Response:
+            command = commands[1]
+            target = command["modelSelection"]
+            switched_session = session(
+                status="running",
+                active_turn_id="turn-new",
+                provider_instance_id=target["instanceId"],
+            )
+            switched_session["updatedAt"] = command["createdAt"]
+            detail = detail_snapshot(
+                sequence=max(turn_sequence, metadata_sequence),
+                messages=[
+                    projected_message(
+                        message_id=command["message"]["messageId"],
+                        role="user",
+                        text=command["message"]["text"],
+                        turn_id="turn-new",
+                        created_at=command["createdAt"],
+                    )
+                ],
+                turn=latest_turn(turn_id="turn-new", state="running"),
+                current_session=switched_session,
+            )
+            detail["thread"]["modelSelection"] = copy.deepcopy(target)
+            detail["thread"]["branch"] = initial["thread"]["branch"]
+            detail["thread"]["worktreePath"] = initial["thread"]["worktreePath"]
+            if final_hook is not None:
+                final_hook(detail, command)
+            return Response(value=detail)
+
+        public_args = {
+            "thread_id": "thread-1",
+            "message": "Continue on the selected provider",
+            "instance_id": self.TARGET_PAIR["instanceId"],
+            "model": self.TARGET_PAIR["model"],
+            "busy_policy": "queue",
+            **(args or {}),
+        }
+        with LoopbackServer(
+            [
+                Response(value=initial),
+                dispatch,
+                metadata_readback,
+                ready_readback,
+                dispatch,
+                turn_readback,
+            ]
+        ) as server:
+            result = invoke(server, tools.t3_thread_send, public_args)
+            requests = list(server.requests)
+        return result, commands, requests
+
+    def test_changed_instance_uses_exact_two_phase_commands_and_compact_success(self) -> None:
+        result, commands, requests = self._successful_switch()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [request["method"] for request in requests],
+            ["GET", "POST", "GET", "GET", "POST", "GET"],
+        )
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(
+            commands[0],
+            {
+                "type": "thread.meta.update",
+                "commandId": commands[0]["commandId"],
+                "threadId": "thread-1",
+                "modelSelection": self.TARGET_PAIR,
+            },
+        )
+        self.assertEqual(commands[1]["type"], "thread.turn.start")
+        self.assertEqual(commands[1]["modelSelection"], commands[0]["modelSelection"])
+        self.assertEqual(result["action"], "model_switched_and_turn_started")
+        self.assertEqual(
+            result["previous_model_selection"], self.SOURCE_SELECTION
+        )
+        self.assertEqual(result["target_model_selection"], self.TARGET_PAIR)
+        self.assertEqual(result["metadata_command_id"], commands[0]["commandId"])
+        self.assertEqual(result["turn_command_id"], commands[1]["commandId"])
+        self.assertEqual(result["provider_instance_id"], "codex")
+        self.assertEqual(result["session_state"], "running")
+        self.assertEqual(result["turn_state"], "running")
+        self.assertEqual(result["verification"], "verified")
+        self.assertIn("TOCTOU", result["race_warning"])
+        for forbidden in ("detail", "provider_session", "latest_turn", "lastError"):
+            self.assertNotIn(forbidden, result)
+
+    def test_model_options_exact_precedence_preserves_empty_and_omission(self) -> None:
+        omitted, omitted_commands, _ = self._successful_switch()
+        self.assertTrue(omitted["ok"])
+        self.assertNotIn("options", omitted_commands[0]["modelSelection"])
+
+        explicit_empty, empty_commands, _ = self._successful_switch(
+            args={"model_options": []}
+        )
+        self.assertTrue(explicit_empty["ok"])
+        self.assertEqual(empty_commands[0]["modelSelection"]["options"], [])
+
+        exact_options = [
+            {"id": "reasoning_effort", "value": "xhigh"},
+            {"id": "web_search", "value": False},
+        ]
+        explicit, explicit_commands, _ = self._successful_switch(
+            args={"model_options": exact_options}
+        )
+        self.assertTrue(explicit["ok"])
+        self.assertEqual(
+            explicit_commands[0]["modelSelection"]["options"], exact_options
+        )
+
+        same_pair, same_commands, _ = self._successful_switch(
+            args={
+                "instance_id": "codex_20x",
+                "model": "gpt-current",
+                "model_options": [],
+            }
+        )
+        self.assertTrue(same_pair["ok"])
+        self.assertEqual(same_commands[0]["modelSelection"]["options"], [])
+
+    def test_same_explicit_selection_uses_legacy_single_turn_path(self) -> None:
+        commands: list[dict] = []
+        before = self._before()
+
+        def readback(_request: dict) -> Response:
+            command = commands[0]
+            after = detail_snapshot(
+                sequence=11,
+                messages=[
+                    message(
+                        message_id=command["message"]["messageId"],
+                        text=command["message"]["text"],
+                        turn_id="turn-new",
+                    )
+                ],
+                turn=latest_turn(turn_id="turn-new", state="running"),
+                current_session=session(
+                    status="running",
+                    active_turn_id="turn-new",
+                    provider_instance_id="codex_20x",
+                ),
+            )
+            after["thread"]["modelSelection"] = copy.deepcopy(
+                self.SOURCE_SELECTION
+            )
+            return Response(value=after)
+
+        for extra in (
+            {"instance_id": "codex_20x", "model": "gpt-current"},
+            {
+                "instance_id": "codex_20x",
+                "model": "gpt-current",
+                "model_options": copy.deepcopy(
+                    self.SOURCE_SELECTION["options"]
+                ),
+            },
+        ):
+            commands.clear()
+            with self.subTest(extra=extra), LoopbackServer(
+                [Response(value=before), captured_dispatch(commands), readback]
+            ) as server:
+                result = invoke(
+                    server,
+                    tools.t3_thread_send,
+                    {
+                        "thread_id": "thread-1",
+                        "message": "Legacy exact selection",
+                        "busy_policy": "queue",
+                        **extra,
+                    },
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["action"], "new_turn_same_thread")
+            self.assertEqual([command["type"] for command in commands], ["thread.turn.start"])
+            self.assertEqual(
+                commands[0]["modelSelection"], self.SOURCE_SELECTION
+            )
+            self.assertIn("detail", result)
+
+    def test_changed_selection_busy_states_are_retryable_and_never_post(self) -> None:
+        cases: list[tuple[str, dict]] = []
+        cases.append(
+            (
+                "starting",
+                self._before(current_session=session(status="starting")),
+            )
+        )
+        cases.append(
+            (
+                "running",
+                self._before(current_session=session(status="running")),
+            )
+        )
+        active = self._before(
+            current_session=session(status="ready", active_turn_id="turn-active")
+        )
+        cases.append(("active", active))
+        background = self._before()
+        background["thread"]["backgroundLiveness"] = "working"
+        cases.append(("background", background))
+        monitoring = self._before()
+        monitoring["thread"]["backgroundLiveness"] = "monitoring"
+        cases.append(("monitoring", monitoring))
+        pending = self._before()
+        pending["thread"]["hasPendingApprovals"] = True
+        cases.append(("pending", pending))
+        pending_input = self._before()
+        pending_input["thread"]["hasPendingUserInput"] = True
+        cases.append(("pending_input", pending_input))
+        activity_pending = self._before()
+        activity_pending["thread"]["activities"] = [
+            activity(
+                activity_id="approval-open",
+                kind="approval.requested",
+                payload={
+                    "requestId": "approval-open",
+                    "requestKind": "command",
+                    "requestType": "exec_command_approval",
+                },
+                sequence=10,
+                created_at="2026-08-21T12:00:01Z",
+                turn_id="turn-old",
+            )
+        ]
+        cases.append(("activity_pending", activity_pending))
+
+        for name, before in cases:
+            with self.subTest(name=name), LoopbackServer(
+                [Response(value=before)]
+            ) as server:
+                result = invoke(
+                    server,
+                    tools.t3_thread_send,
+                    {
+                        "thread_id": "thread-1",
+                        "message": "Switch only if idle",
+                        "instance_id": "codex",
+                        "model": "gpt-5.6",
+                        "busy_policy": "queue",
+                    },
+                )
+            self.assertEqual(result["error_code"], "model_switch_busy")
+            self.assertTrue(result["retryable"])
+            self.assertEqual([item["method"] for item in server.requests], ["GET"])
+            self.assertIn("interrupt", result["details"]["recovery"].casefold())
+            self.assertIn("wait", result["details"]["recovery"].casefold())
+            self.assertIn("never stop", result["details"]["recovery"].casefold())
+
+    def test_nonrestorable_preconditions_return_safe_new_thread_recovery(self) -> None:
+        stopped_with_stale_busy_projection = self._before(
+            current_session=session(status="stopped", active_turn_id="turn-stale")
+        )
+        stopped_with_stale_busy_projection["thread"]["backgroundLiveness"] = "working"
+        stopped_with_stale_busy_projection["thread"]["hasPendingApprovals"] = True
+        error_with_stale_busy_projection = self._before(
+            current_session=session(status="error", active_turn_id="turn-stale")
+        )
+        error_with_stale_busy_projection["thread"]["backgroundLiveness"] = "working"
+        error_with_stale_busy_projection["thread"]["hasPendingUserInput"] = True
+        cases = (
+            stopped_with_stale_busy_projection,
+            error_with_stale_busy_projection,
+            self._before(
+                current_session=session(
+                    status="ready", provider_instance_id=None
+                )
+            ),
+        )
+        for before in cases:
+            with LoopbackServer([Response(value=before)]) as server:
+                result = invoke(
+                    server,
+                    tools.t3_thread_send,
+                    {
+                        "thread_id": "thread-1",
+                        "message": "Try unsupported switch",
+                        "instance_id": "codex",
+                        "model": "gpt-5.6",
+                        "busy_policy": "queue",
+                    },
+                )
+            self.assertEqual(result["error_code"], "unsupported_model_switch")
+            self.assertFalse(result["retryable"])
+            self.assertEqual([item["method"] for item in server.requests], ["GET"])
+            recovery = result["details"]["recovery"]
+            self.assertEqual(recovery["tool"], "t3_thread_create")
+            self.assertEqual(recovery["arguments"]["project_id"], "project-1")
+            self.assertEqual(recovery["arguments"]["instance_id"], "codex")
+            self.assertEqual(recovery["arguments"]["interaction_mode"], "plan")
+            self.assertNotIn("branch", recovery["arguments"])
+            self.assertNotIn("worktree_path", recovery["arguments"])
+            self.assertIn("operator-approved summary", recovery["guidance"])
+
+    def test_both_model_switch_races_fail_as_concurrent_state_change(self) -> None:
+        commands: list[dict] = []
+        before = self._before()
+        raced_meta = copy.deepcopy(before)
+        raced_meta["snapshotSequence"] = 11
+        raced_meta["page"]["snapshotSequence"] = 11
+        raced_meta["page"]["threadSequence"] = 11
+        raced_meta["thread"]["modelSelection"] = copy.deepcopy(self.TARGET_PAIR)
+        raced_meta["thread"]["latestTurn"] = latest_turn(
+            turn_id="turn-race", state="running"
+        )
+        with LoopbackServer(
+            [
+                Response(value=before),
+                self._captured_dispatch_at(commands, 11),
+                Response(value=raced_meta),
+            ]
+        ) as server:
+            first = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Race one",
+                    "instance_id": "codex",
+                    "model": "gpt-5.6",
+                    "busy_policy": "queue",
+                },
+            )
+        self.assertEqual(first["error_code"], "concurrent_state_change")
+        self.assertEqual([item["method"] for item in server.requests].count("POST"), 1)
+
+        commands = []
+        metadata = copy.deepcopy(before)
+        metadata["snapshotSequence"] = 11
+        metadata["page"]["snapshotSequence"] = 11
+        metadata["page"]["threadSequence"] = 11
+        metadata["thread"]["modelSelection"] = copy.deepcopy(self.TARGET_PAIR)
+        second_race = copy.deepcopy(metadata)
+        second_race["snapshotSequence"] = 12
+        second_race["page"]["snapshotSequence"] = 12
+        second_race["page"]["threadSequence"] = 12
+        second_race["thread"]["latestTurn"] = latest_turn(
+            turn_id="turn-race", state="running"
+        )
+        with LoopbackServer(
+            [
+                Response(value=before),
+                self._captured_dispatch_at(commands, 11),
+                Response(value=metadata),
+                Response(value=second_race),
+            ]
+        ) as server:
+            second = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Race two",
+                    "instance_id": "codex",
+                    "model": "gpt-5.6",
+                    "busy_policy": "queue",
+                },
+            )
+        self.assertEqual(second["error_code"], "concurrent_state_change")
+        self.assertEqual([item["method"] for item in server.requests].count("POST"), 1)
+        self.assertEqual(
+            second["details"]["completed_phase"], "model_selection_metadata"
+        )
+
+    def _start_failure(self, error_text: str) -> tuple[dict, list[dict], list[dict]]:
+        def failed(detail: dict, command: dict) -> None:
+            current_session = detail["thread"]["session"]
+            current_session["status"] = "error"
+            current_session["activeTurnId"] = None
+            current_session["lastError"] = error_text
+            detail["thread"]["latestTurn"] = latest_turn(
+                turn_id="turn-new", state="error"
+            )
+            detail["thread"]["activities"] = [
+                activity(
+                    activity_id="provider-start-failed",
+                    kind="provider.turn.start.failed",
+                    payload={"detail": error_text},
+                    sequence=12,
+                    created_at=command["createdAt"],
+                    turn_id=None,
+                )
+            ]
+
+        return self._successful_switch(final_hook=failed)
+
+    def test_command_correlated_unrestorable_start_error_rehomes_without_raw_text(self) -> None:
+        for error_text in (
+            "Requested provider instance 'missing' is not configured in this build. SENTINEL-RAW",
+            "model change requires a new thread SENTINEL-RAW",
+            "incompatible resume driver SENTINEL-RAW",
+        ):
+            with self.subTest(error_text=error_text):
+                result, _commands, requests = self._start_failure(error_text)
+                encoded = json.dumps(result)
+                self.assertEqual(result["error_code"], "unsupported_model_switch")
+                self.assertNotIn("SENTINEL-RAW", encoded)
+                self.assertNotIn(error_text, encoded)
+                self.assertEqual(
+                    result["details"]["completed_phase"],
+                    "model_selection_metadata",
+                )
+                self.assertEqual(
+                    result["details"]["recovery"]["tool"], "t3_thread_create"
+                )
+                self.assertEqual(
+                    [item["method"] for item in requests].count("POST"), 2
+                )
+
+    def test_command_correlated_quota_error_is_typed_and_redacted(self) -> None:
+        error_text = "provider quota exceeded SENTINEL-PROVIDER-SECRET"
+        result, _commands, requests = self._start_failure(error_text)
+        encoded = json.dumps(result)
+        self.assertEqual(result["error_code"], "provider_limit_exhausted")
+        self.assertNotIn(error_text, encoded)
+        self.assertNotIn("SENTINEL-PROVIDER-SECRET", encoded)
+        self.assertEqual([item["method"] for item in requests].count("POST"), 2)
+
+    def test_unknown_or_stale_start_failure_is_not_mislabeled_or_replayed(self) -> None:
+        unknown_text = "temporary upstream transport failure SENTINEL-UNKNOWN"
+        unknown, _commands, unknown_requests = self._start_failure(unknown_text)
+        self.assertFalse(unknown["ok"])
+        self.assertEqual(unknown["verification"], "accepted_pending_projection")
+        self.assertNotIn("SENTINEL-UNKNOWN", json.dumps(unknown))
+        self.assertNotIn("recovery", unknown)
+        self.assertEqual(
+            [item["method"] for item in unknown_requests].count("POST"), 2
+        )
+
+        def stale_failure(detail: dict, command: dict) -> None:
+            current_session = detail["thread"]["session"]
+            current_session["status"] = "error"
+            current_session["activeTurnId"] = None
+            current_session["lastError"] = "quota exceeded SENTINEL-STALE"
+            current_session["updatedAt"] = "2026-08-21T12:00:00Z"
+            detail["thread"]["latestTurn"] = latest_turn(
+                turn_id="turn-new", state="error"
+            )
+            detail["thread"]["activities"] = [
+                activity(
+                    activity_id="stale-provider-failure",
+                    kind="provider.turn.start.failed",
+                    payload={"detail": "quota exceeded SENTINEL-STALE"},
+                    sequence=12,
+                    created_at="2026-08-21T12:00:00Z",
+                    turn_id=None,
+                )
+            ]
+
+        stale, _commands, stale_requests = self._successful_switch(
+            final_hook=stale_failure
+        )
+        self.assertFalse(stale["ok"])
+        self.assertEqual(stale["verification"], "accepted_pending_projection")
+        self.assertNotEqual(stale.get("error_code"), "provider_limit_exhausted")
+        self.assertNotIn("SENTINEL-STALE", json.dumps(stale))
+        self.assertEqual([item["method"] for item in stale_requests].count("POST"), 2)
+
+    def test_override_http_error_details_are_compactly_redacted(self) -> None:
+        raw_error = {
+            "code": "SENTINEL-SERVER-CODE",
+            "reason": "SENTINEL-SERVER-REASON",
+            "traceId": "SENTINEL-SERVER-TRACE",
+        }
+        cases = (
+            ("initial_read", [Response(status=400, value=raw_error)], 0),
+            (
+                "metadata_dispatch",
+                [Response(value=self._before()), Response(status=400, value=raw_error)],
+                1,
+            ),
+        )
+        for name, responses, post_count in cases:
+            with self.subTest(name=name), LoopbackServer(responses) as server:
+                result = invoke(
+                    server,
+                    tools.t3_thread_send,
+                    {
+                        "thread_id": "thread-1",
+                        "message": "Do not reflect server details",
+                        "instance_id": "codex",
+                        "model": "gpt-5.6",
+                        "busy_policy": "queue",
+                    },
+                )
+            encoded = json.dumps(result)
+            self.assertEqual(result["error_code"], "invalid_request")
+            self.assertNotIn("SENTINEL-SERVER", encoded)
+            self.assertEqual(
+                [item["method"] for item in server.requests].count("POST"),
+                post_count,
+            )
+
+    def test_accepted_pending_projection_is_compact_and_stops_each_phase(self) -> None:
+        before = self._before()
+        with LoopbackServer(
+            [
+                Response(value=before),
+                Response(value={"sequence": 11}),
+                Response(value={"malformed": "SENTINEL-RAW"}),
+            ]
+        ) as server:
+            metadata_pending = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Pending metadata",
+                    "instance_id": "codex",
+                    "model": "gpt-5.6",
+                    "busy_policy": "queue",
+                },
+            )
+        self.assertFalse(metadata_pending["ok"])
+        self.assertTrue(metadata_pending["accepted"])
+        self.assertEqual(metadata_pending["phase"], "metadata")
+        self.assertEqual(
+            metadata_pending["verification"], "accepted_pending_projection"
+        )
+        self.assertNotIn("detail", metadata_pending)
+        self.assertNotIn("SENTINEL-RAW", json.dumps(metadata_pending))
+        self.assertEqual([item["method"] for item in server.requests].count("POST"), 1)
+
+        commands: list[dict] = []
+        metadata = copy.deepcopy(before)
+        metadata["snapshotSequence"] = 11
+        metadata["page"]["snapshotSequence"] = 11
+        metadata["page"]["threadSequence"] = 11
+        metadata["thread"]["modelSelection"] = copy.deepcopy(self.TARGET_PAIR)
+        with LoopbackServer(
+            [
+                Response(value=before),
+                self._captured_dispatch_at(commands, 11),
+                Response(value=metadata),
+                Response(value=metadata),
+                self._captured_dispatch_at(commands, 12),
+                Response(value={"malformed": "SENTINEL-RAW"}),
+            ]
+        ) as server:
+            turn_pending = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Pending turn",
+                    "instance_id": "codex",
+                    "model": "gpt-5.6",
+                    "busy_policy": "queue",
+                },
+            )
+        self.assertFalse(turn_pending["ok"])
+        self.assertTrue(turn_pending["accepted"])
+        self.assertEqual(turn_pending["phase"], "turn")
+        self.assertNotIn("detail", turn_pending)
+        self.assertNotIn("SENTINEL-RAW", json.dumps(turn_pending))
+        self.assertEqual([item["method"] for item in server.requests].count("POST"), 2)
+        self.assertIn("metadata_command_id", turn_pending)
+        self.assertIn("turn_command_id", turn_pending)
+
+    def test_success_requires_monotonic_sequence_target_session_and_unique_linked_message(self) -> None:
+        nonmonotonic_metadata, _commands, metadata_requests = self._successful_switch(
+            metadata_sequence=10, turn_sequence=12
+        )
+        self.assertEqual(
+            nonmonotonic_metadata["error_code"], "concurrent_state_change"
+        )
+        self.assertEqual(
+            [item["method"] for item in metadata_requests].count("POST"), 1
+        )
+
+        regressed, _commands, _requests = self._successful_switch(
+            metadata_sequence=11, turn_sequence=10
+        )
+        self.assertEqual(regressed["error_code"], "concurrent_state_change")
+
+        def missing_instance(detail: dict, _command: dict) -> None:
+            detail["thread"]["session"].pop("providerInstanceId")
+
+        missing, _commands, _requests = self._successful_switch(
+            final_hook=missing_instance
+        )
+        self.assertEqual(missing["verification"], "accepted_pending_projection")
+        self.assertNotEqual(missing.get("action"), "model_switched_and_turn_started")
+
+        def duplicate(detail: dict, _command: dict) -> None:
+            detail["thread"]["messages"].append(
+                copy.deepcopy(detail["thread"]["messages"][0])
+            )
+
+        duplicated, _commands, _requests = self._successful_switch(final_hook=duplicate)
+        self.assertEqual(duplicated["verification"], "accepted_pending_projection")
+        self.assertNotEqual(
+            duplicated.get("action"), "model_switched_and_turn_started"
+        )
+
+        def late_old_instance(detail: dict, command: dict) -> None:
+            detail["thread"]["activities"] = [
+                activity(
+                    activity_id="late-old-instance",
+                    kind="provider.session.updated",
+                    payload={"providerInstanceId": "codex-main"},
+                    sequence=12,
+                    created_at=command["createdAt"],
+                    turn_id="turn-new",
+                )
+            ]
+
+        late, _commands, _requests = self._successful_switch(
+            final_hook=late_old_instance
+        )
+        self.assertEqual(late["error_code"], "concurrent_state_change")
+        self.assertEqual(
+            [item["method"] for item in _requests].count("POST"), 2
+        )
+
+    def test_final_projection_requires_consistent_nonterminal_target_turn(self) -> None:
+        def completed(detail: dict, _command: dict) -> None:
+            detail["thread"]["session"]["status"] = "ready"
+            detail["thread"]["session"]["activeTurnId"] = None
+            detail["thread"]["latestTurn"] = latest_turn(
+                turn_id="turn-new", state="completed"
+            )
+
+        completed_result, _commands, _requests = self._successful_switch(
+            final_hook=completed
+        )
+        self.assertTrue(completed_result["ok"])
+        self.assertEqual(completed_result["turn_state"], "completed")
+        self.assertEqual(completed_result["session_state"], "ready")
+
+        def stopped(detail: dict, _command: dict) -> None:
+            detail["thread"]["session"]["status"] = "stopped"
+            detail["thread"]["session"]["activeTurnId"] = None
+
+        def interrupted(detail: dict, _command: dict) -> None:
+            detail["thread"]["session"]["status"] = "interrupted"
+            detail["thread"]["session"]["activeTurnId"] = None
+            detail["thread"]["latestTurn"] = latest_turn(
+                turn_id="turn-new", state="interrupted"
+            )
+
+        for name, hook in (("stopped", stopped), ("interrupted", interrupted)):
+            with self.subTest(name=name):
+                result, _commands, requests = self._successful_switch(
+                    final_hook=hook
+                )
+                self.assertEqual(result["error_code"], "unsupported_model_switch")
+                self.assertFalse(result["retryable"])
+                self.assertNotEqual(
+                    result.get("action"), "model_switched_and_turn_started"
+                )
+                self.assertEqual(
+                    [item["method"] for item in requests].count("POST"), 2
+                )
+
+        def generic_post_start_error(detail: dict, command: dict) -> None:
+            current_session = detail["thread"]["session"]
+            current_session["status"] = "error"
+            current_session["activeTurnId"] = None
+            current_session["lastError"] = "runtime failed SENTINEL-RUNTIME"
+            current_session["updatedAt"] = command["createdAt"]
+            detail["thread"]["latestTurn"] = latest_turn(
+                turn_id="turn-new", state="error"
+            )
+
+        errored, _commands, error_requests = self._successful_switch(
+            final_hook=generic_post_start_error
+        )
+        self.assertFalse(errored["ok"])
+        self.assertEqual(errored["verification"], "accepted_pending_projection")
+        self.assertNotIn("SENTINEL-RUNTIME", json.dumps(errored))
+        self.assertEqual([item["method"] for item in error_requests].count("POST"), 2)
+
+        def mismatched_active_turn(detail: dict, _command: dict) -> None:
+            detail["thread"]["session"]["activeTurnId"] = "turn-concurrent"
+
+        mismatched, _commands, mismatch_requests = self._successful_switch(
+            final_hook=mismatched_active_turn
+        )
+        self.assertEqual(mismatched["error_code"], "concurrent_state_change")
+        self.assertEqual(
+            [item["method"] for item in mismatch_requests].count("POST"), 2
+        )
+
+    def test_post_turn_race_and_provenance_change_never_succeed_or_rollback(self) -> None:
+        def concurrent_message(detail: dict, command: dict) -> None:
+            detail["thread"]["messages"].append(
+                projected_message(
+                    message_id="message-concurrent",
+                    role="user",
+                    text="Concurrent user work",
+                    turn_id="turn-concurrent",
+                    created_at=command["createdAt"],
+                )
+            )
+
+        raced, commands, requests = self._successful_switch(
+            final_hook=concurrent_message
+        )
+        self.assertEqual(raced["error_code"], "concurrent_state_change")
+        self.assertEqual([command["type"] for command in commands], [
+            "thread.meta.update",
+            "thread.turn.start",
+        ])
+        self.assertEqual([item["method"] for item in requests].count("POST"), 2)
+
+        before = self._before()
+        before["thread"]["branch"] = "feature/original"
+        before["thread"]["worktreePath"] = "/work/original"
+        preserved, _commands, _requests = self._successful_switch(before=before)
+        self.assertTrue(preserved["ok"])
+
+        def changed_branch(detail: dict, _command: dict) -> None:
+            detail["thread"]["branch"] = "feature/concurrent"
+
+        changed, _commands, changed_requests = self._successful_switch(
+            before=before, final_hook=changed_branch
+        )
+        self.assertEqual(changed["error_code"], "concurrent_state_change")
+        self.assertEqual(
+            [item["method"] for item in changed_requests].count("POST"), 2
+        )
+
+    def test_quota_error_session_must_still_be_observed_ready_or_idle(self) -> None:
+        exhausted = session(status="error")
+        exhausted["lastError"] = "Usage limit reached for current provider"
+        before = self._before(current_session=exhausted)
+        with LoopbackServer([Response(value=before)]) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_send,
+                {
+                    "thread_id": "thread-1",
+                    "message": "Switch only from ready or idle",
+                    "instance_id": "codex",
+                    "model": "gpt-5.6",
+                    "busy_policy": "queue",
+                },
+            )
+        self.assertEqual(result["error_code"], "unsupported_model_switch")
+        self.assertFalse(result["retryable"])
+        self.assertEqual([item["method"] for item in server.requests], ["GET"])
+
+        historical = self._before()
+        historical["thread"]["latestTurn"] = latest_turn(
+            turn_id="turn-old", state="error"
+        )
+        historical["thread"]["session"]["lastError"] = (
+            "Historical provider failure must not override current readiness"
+        )
+        continued, _commands, _requests = self._successful_switch(before=historical)
+        self.assertTrue(continued["ok"])
+        self.assertEqual(continued["action"], "model_switched_and_turn_started")
 
 
 class AgentFacingWaitToolTests(unittest.TestCase):
@@ -2769,6 +3646,619 @@ class AgentFacingRespondToolTests(unittest.TestCase):
                     )
                 self.assertEqual(result["error_code"], "conflict")
                 self.assertEqual([request["method"] for request in server.requests], ["GET"])
+
+
+class AgentFacingSettleToolTests(unittest.TestCase):
+    @staticmethod
+    def _settlement_detail(
+        *,
+        sequence: int = 4,
+        settled_override: str | None = None,
+        settled_at: str | None = None,
+        pinned_at: str | None = None,
+        pin_order_key: str | None = None,
+        snoozed_until: str | None = None,
+        snoozed_at: str | None = None,
+        current_session: dict | None = None,
+        messages: list[dict] | None = None,
+        activities: list[dict] | None = None,
+    ) -> dict:
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=sequence,
+                turn=latest_turn(),
+                current_session=(
+                    session(status="ready")
+                    if current_session is None
+                    else current_session
+                ),
+                messages=messages,
+            ),
+            thread_sequence=sequence,
+        )
+        detail["thread"].update(
+            {
+                "settledOverride": settled_override,
+                "settledAt": settled_at,
+                "pinnedAt": pinned_at,
+                "pinOrderKey": pin_order_key,
+                "snoozedUntil": snoozed_until,
+                "snoozedAt": snoozed_at,
+            }
+        )
+        detail["thread"]["activities"] = list(activities or [])
+        return detail
+
+    def _invoke_settle(
+        self,
+        responses: list[Response],
+        *,
+        command_id: str | None = None,
+        transport_kwargs: dict | None = None,
+    ) -> tuple[dict, LoopbackServer]:
+        server = LoopbackServer(responses)  # type: ignore[arg-type]
+        server.__enter__()
+        self.addCleanup(server.__exit__, None, None, None)
+        selected_id = command_id or str(uuid.uuid4())
+        if transport_kwargs is None:
+            patcher = mock.patch.object(
+                tools.T3Client,
+                "new_uuid4",
+                return_value=selected_id,
+            )
+        else:
+            transport = tools.T3Client(
+                server.base_url,
+                server.token,
+                **transport_kwargs,
+            )
+            patcher = mock.patch.object(tools, "_make_client", return_value=transport)
+        with patcher:
+            if transport_kwargs is None:
+                result = invoke(
+                    server,
+                    tools.OPERATIONS["t3_thread_settle"],
+                    {"thread_id": "thread-1"},
+                )
+            else:
+                with mock.patch.object(
+                    tools.T3Client,
+                    "new_uuid4",
+                    return_value=selected_id,
+                ):
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_settle"],
+                        {"thread_id": "thread-1"},
+                    )
+        return result, server
+
+    def test_settle_rejects_missing_or_unknown_public_arguments_without_http(self) -> None:
+        with LoopbackServer([]) as server:
+            for args in ({}, {"thread_id": "thread-1", "unexpected": True}):
+                with self.subTest(fields=tuple(sorted(args))):
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_settle"],
+                        args,
+                    )
+                    self.assertEqual(result["error_code"], "invalid_input")
+                    self.assertEqual(server.requests, [])
+
+    def test_settle_dispatches_exact_native_command_and_waits_for_companion_clear(self) -> None:
+        command_id = str(uuid.uuid4())
+        settled_at = "2026-08-23T12:00:00Z"
+        before = self._settlement_detail(
+            settled_override="settled",
+            settled_at=settled_at,
+            pinned_at="2026-08-23T11:00:00Z",
+            pin_order_key="0001",
+            snoozed_until="2026-08-24T12:00:00Z",
+            snoozed_at="2026-08-23T11:30:00Z",
+        )
+        still_pinned = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at=settled_at,
+            pinned_at="2026-08-23T11:00:00Z",
+            pin_order_key="0001",
+            snoozed_until="2026-08-24T12:00:00Z",
+            snoozed_at="2026-08-23T11:30:00Z",
+        )
+        cleared = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at=settled_at,
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+                Response(value=still_pinned),
+                Response(value=cleared),
+            ],
+            command_id=command_id,
+        )
+
+        self.assertEqual(
+            [(item["method"], item["path"]) for item in server.requests],
+            [
+                ("GET", "/.well-known/t3/environment"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+                ("POST", "/api/orchestration/dispatch"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+            ],
+        )
+        command = json.loads(server.requests[2]["body"])
+        self.assertEqual(
+            command,
+            {
+                "type": "thread.settle",
+                "commandId": command_id,
+                "threadId": "thread-1",
+            },
+        )
+        self.assertTrue(uuid.UUID(command["commandId"]).version == 4)
+        encoded_command = json.dumps(command)
+        for forbidden_type in {
+                "thread.session.stop",
+                "thread.delete",
+                "thread.archive",
+                "thread.unpin",
+                "thread.unsnooze",
+        }:
+            self.assertNotIn(forbidden_type, encoded_command)
+        self.assertEqual(
+            set(result),
+            {
+                "ok",
+                "action",
+                "command_id",
+                "thread_id",
+                "dispatch_sequence",
+                "dispatch_attempts",
+                "recovered_after_ambiguous_dispatch",
+                "accepted",
+                "verification",
+                "completed",
+                "settled_override",
+                "settled_at",
+            },
+        )
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(result["command_id"], command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertEqual(result["settled_override"], "settled")
+        self.assertEqual(result["settled_at"], settled_at)
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["verification"], "verified")
+        self.assertNotIn("detail", result)
+        self.assertNotIn("messages", result)
+        self.assertNotIn("activities", result)
+
+    def test_fully_settled_thread_is_a_compact_noop_without_post(self) -> None:
+        settled_at = "2026-08-23T12:00:00Z"
+        settled = self._settlement_detail(
+            settled_override="settled",
+            settled_at=settled_at,
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=settled),
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "ok": True,
+                "action": "thread_already_settled",
+                "command_id": None,
+                "thread_id": "thread-1",
+                "settled_override": "settled",
+                "settled_at": settled_at,
+            },
+        )
+        self.assertEqual(
+            [item["method"] for item in server.requests],
+            ["GET", "GET"],
+        )
+
+    def test_settle_capability_preflight_fails_closed_before_detail_or_post(self) -> None:
+        for enabled in (None, False):
+            with self.subTest(enabled=enabled):
+                result, server = self._invoke_settle(
+                    [Response(value=settlement_descriptor(enabled=enabled))]
+                )
+                self.assertEqual(result["error_code"], "conflict")
+                self.assertEqual(
+                    [(item["method"], item["path"]) for item in server.requests],
+                    [("GET", "/.well-known/t3/environment")],
+                )
+
+    def test_settle_rejects_unsafe_thread_states_without_post(self) -> None:
+        now = datetime.now(timezone.utc)
+        fresh_user_at = (now - timedelta(seconds=30)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        pending_approval = activity(
+            activity_id="approval-open",
+            kind="approval.requested",
+            payload={"requestId": "request-approval"},
+            sequence=1,
+            created_at="2026-08-23T11:00:00Z",
+        )
+        pending_input = activity(
+            activity_id="input-open",
+            kind="user-input.requested",
+            payload={"requestId": "request-input", "questions": []},
+            sequence=1,
+            created_at="2026-08-23T11:00:00Z",
+        )
+        deleted = self._settlement_detail()
+        deleted["thread"]["deletedAt"] = "2026-08-23T11:00:00Z"
+        archived = self._settlement_detail()
+        archived["thread"]["archivedAt"] = "2026-08-23T11:00:00Z"
+        cases = {
+            "deleted": deleted,
+            "archived": archived,
+            "starting_session": self._settlement_detail(
+                current_session=session(status="starting")
+            ),
+            "running_session": self._settlement_detail(
+                current_session=session(status="running", active_turn_id="turn-1")
+            ),
+            "pending_approval": self._settlement_detail(
+                activities=[pending_approval]
+            ),
+            "pending_input": self._settlement_detail(activities=[pending_input]),
+            "queued_turn": self._settlement_detail(
+                messages=[
+                    projected_message(
+                        message_id="queued-user",
+                        role="user",
+                        text="queued work",
+                        turn_id=None,
+                        created_at=fresh_user_at,
+                    )
+                ]
+            ),
+        }
+        for name, detail in cases.items():
+            with self.subTest(state=name):
+                result, server = self._invoke_settle(
+                    [
+                        Response(value=settlement_descriptor()),
+                        Response(value=detail),
+                    ]
+                )
+                self.assertEqual(result["error_code"], "conflict")
+                self.assertEqual(
+                    [item["method"] for item in server.requests],
+                    ["GET", "GET"],
+                )
+                self.assertEqual(
+                    sum(item["method"] == "POST" for item in server.requests),
+                    0,
+                )
+
+    def test_settle_queued_turn_abs_age_includes_exact_boundaries_only(self) -> None:
+        fixed_now = datetime(2026, 8, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+        cases = (
+            ("past_exact_boundary", -120_000, True),
+            ("future_exact_boundary", 120_000, True),
+            ("past_just_outside", -120_001, False),
+            ("future_just_outside", 120_001, False),
+        )
+        for name, offset_milliseconds, queued in cases:
+            with self.subTest(case=name):
+                user_at = (
+                    fixed_now + timedelta(milliseconds=offset_milliseconds)
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                before = self._settlement_detail(
+                    messages=[
+                        projected_message(
+                            message_id=f"user-{name}",
+                            role="user",
+                            text="queued boundary work",
+                            turn_id=None,
+                            created_at=user_at,
+                        )
+                    ]
+                )
+                responses = [
+                    Response(value=settlement_descriptor()),
+                    Response(value=before),
+                ]
+                if not queued:
+                    responses.extend(
+                        [
+                            Response(value={"sequence": 5}),
+                            Response(
+                                value=self._settlement_detail(
+                                    sequence=5,
+                                    settled_override="settled",
+                                    settled_at="2026-08-23T12:00:00Z",
+                                    messages=before["thread"]["messages"],
+                                )
+                            ),
+                        ]
+                    )
+                with mock.patch.object(tools, "datetime", FixedDateTime):
+                    result, server = self._invoke_settle(responses)
+
+                self.assertEqual(
+                    result["error_code"] if queued else result["action"],
+                    "conflict" if queued else "thread_settled",
+                )
+                self.assertEqual(
+                    sum(item["method"] == "POST" for item in server.requests),
+                    0 if queued else 1,
+                )
+
+    def test_settle_post_dispatch_archive_or_delete_is_concurrent_state_change(self) -> None:
+        for field in ("archivedAt", "deletedAt"):
+            with self.subTest(field=field):
+                command_id = str(uuid.uuid4())
+                raced = self._settlement_detail(
+                    sequence=5,
+                    settled_override="settled",
+                    settled_at="2026-08-23T12:00:00Z",
+                )
+                raced["thread"][field] = "2026-08-23T12:00:01Z"
+                result, server = self._invoke_settle(
+                    [
+                        Response(value=settlement_descriptor()),
+                        Response(value=self._settlement_detail()),
+                        Response(value={"sequence": 5}),
+                        Response(value=raced),
+                    ],
+                    command_id=command_id,
+                )
+
+                posts = [
+                    item for item in server.requests if item["method"] == "POST"
+                ]
+                self.assertEqual(len(posts), 1)
+                self.assertEqual(
+                    json.loads(posts[0]["body"]),
+                    {
+                        "type": "thread.settle",
+                        "commandId": command_id,
+                        "threadId": "thread-1",
+                    },
+                )
+                self.assertEqual(result["error_code"], "concurrent_state_change")
+                self.assertTrue(result["outcome_ambiguous"])
+                self.assertEqual(result["command_id"], command_id)
+                self.assertEqual(result["thread_id"], "thread-1")
+                self.assertFalse(result["ok"])
+
+    def test_settle_opaque_500_retries_identical_command_until_accepted_sequence(self) -> None:
+        command_id = str(uuid.uuid4())
+        ambiguous_readback = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+        )
+        accepted_readback = self._settlement_detail(
+            sequence=6,
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=self._settlement_detail()),
+                Response(status=500, value={"opaque": True}),
+                Response(value=ambiguous_readback),
+                Response(value={"sequence": 6}),
+                Response(value=accepted_readback),
+            ],
+            command_id=command_id,
+            transport_kwargs={"retry_backoff": ()},
+        )
+
+        self.assertEqual(
+            [item["method"] for item in server.requests],
+            ["GET", "GET", "POST", "GET", "POST", "GET"],
+        )
+        post_bodies = [
+            item["body"] for item in server.requests if item["method"] == "POST"
+        ]
+        self.assertEqual(len(post_bodies), 2)
+        self.assertEqual(post_bodies[0], post_bodies[1])
+        self.assertEqual(
+            json.loads(post_bodies[0]),
+            {
+                "type": "thread.settle",
+                "commandId": command_id,
+                "threadId": "thread-1",
+            },
+        )
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(result["command_id"], command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertEqual(result["dispatch_sequence"], 6)
+        self.assertEqual(result["dispatch_attempts"], 2)
+        self.assertTrue(result["recovered_after_ambiguous_dispatch"])
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["verification"], "verified")
+
+    def test_settle_request_reducer_clears_resolved_and_stale_requests_by_id(self) -> None:
+        now = datetime.now(timezone.utc)
+        stale_user_at = (now - timedelta(seconds=121)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        activities = [
+            activity(
+                activity_id="approval-requested",
+                kind="approval.requested",
+                payload={"requestId": "approval-shared"},
+                sequence=1,
+                created_at="2026-08-23T11:00:00Z",
+                turn_id="turn-old",
+            ),
+            activity(
+                activity_id="approval-resolved",
+                kind="approval.resolved",
+                payload={"requestId": "approval-shared"},
+                sequence=2,
+                created_at="2026-08-23T11:00:01Z",
+                turn_id="turn-other",
+            ),
+            activity(
+                activity_id="input-requested",
+                kind="user-input.requested",
+                payload={"requestId": "input-shared", "questions": []},
+                sequence=3,
+                created_at="2026-08-23T11:00:02Z",
+                turn_id="turn-old",
+            ),
+            activity(
+                activity_id="input-stale-clear",
+                kind="provider.user-input.respond.failed",
+                payload={
+                    "requestId": "input-shared",
+                    "detail": "stale pending user-input request",
+                },
+                sequence=4,
+                created_at="2026-08-23T11:00:03Z",
+                turn_id=None,
+            ),
+        ]
+        before = self._settlement_detail(
+            messages=[
+                projected_message(
+                    message_id="stale-unlinked-user",
+                    role="user",
+                    text="old queued work",
+                    turn_id=None,
+                    created_at=stale_user_at,
+                )
+            ],
+            activities=activities,
+        )
+        after = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+            messages=before["thread"]["messages"],
+            activities=activities,
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+                Response(value=after),
+            ]
+        )
+
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(
+            [item["method"] for item in server.requests],
+            ["GET", "GET", "POST", "GET"],
+        )
+
+    def test_settle_recent_unlinked_user_is_not_queued_for_error_session(self) -> None:
+        fresh_user_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=15)
+        ).isoformat().replace("+00:00", "Z")
+        before = self._settlement_detail(
+            current_session=session(status="error"),
+            messages=[
+                projected_message(
+                    message_id="error-session-user",
+                    role="user",
+                    text="failed work",
+                    turn_id=None,
+                    created_at=fresh_user_at,
+                )
+            ],
+        )
+        after = self._settlement_detail(
+            sequence=5,
+            current_session=session(status="error"),
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+            messages=before["thread"]["messages"],
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+                Response(value=after),
+            ]
+        )
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(sum(item["method"] == "POST" for item in server.requests), 1)
+
+    def test_settle_accepted_pending_projection_is_compact_and_never_redispatches(self) -> None:
+        before = self._settlement_detail(sequence=4)
+        delayed = self._settlement_detail(sequence=5)
+        command_id = str(uuid.uuid4())
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+            ]
+            + [Response(value=delayed)] * 12,
+            command_id=command_id,
+            transport_kwargs={
+                "request_timeout": 0.1,
+                "mutation_timeout": 0.08,
+                "mutation_poll_timeout": 0.04,
+                "poll_interval": 0.01,
+                "retry_backoff": (),
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["action"], "thread_settle_accepted_pending_projection"
+        )
+        self.assertEqual(result["command_id"], command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["dispatch_sequence"], 5)
+        self.assertEqual(
+            result["reconciliation"],
+            {
+                "tool": "t3_thread_read",
+                "arguments": {
+                    "thread_id": "thread-1",
+                    "view": "raw",
+                    "turn_limit": 150,
+                },
+                "required_snapshot_sequence": 5,
+            },
+        )
+        self.assertNotIn("detail", result)
+        self.assertNotIn("settled_override", result)
+        self.assertNotIn("settled_at", result)
+        self.assertNotIn("messages", result)
+        self.assertNotIn("activities", result)
+        self.assertEqual(
+            sum(item["method"] == "POST" for item in server.requests),
+            1,
+        )
+        self.assertLess(len(json.dumps(result)), 4_000)
 
 
 class MutationToolTests(unittest.TestCase):

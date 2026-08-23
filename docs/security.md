@@ -43,6 +43,10 @@ Each mutation uses a new UUIDv4 command ID and immutable canonical body. Only a 
 
 Pinned T3 has no atomic idle guard, expected-turn guard for pending responses or interrupt, or expected-session guard for stop. The plugin therefore makes reject observation-only, requires explicit queue for sends, revalidates pending responses twice, and labels interrupt/stop correlation best-effort.
 
+An instance/model override adds an exact metadata-readback check and a second liveness check before turn start, but residual TOCTOU remains at both read/POST boundaries because T3 exposes no atomic transaction across them. Concurrent changes at either boundary return `concurrent_state_change`. The plugin does not automatically roll back metadata because that could overwrite a concurrent user's selection or options.
+
+The switch and rehome paths use only the allowlisted orchestration HTTP projection and dispatch route. They do not read or write T3 SQLite, JSONL/event logs, provider-event internals, or raw alternative dispatch paths. Compact receipts redact raw thread, command, and provider failures. Only a current command-time start-failure projection is classified: quota or usage-limit failures become `provider_limit_exhausted`, known incompatibility becomes `unsupported_model_switch`, and unknown failures remain incomplete pending reconciliation. Raw provider error text is not exposed.
+
 `full-access` permits a trusted provider to execute commands and modify or delete files without approval. Use it only for a trusted provider, project, and checkout.
 
 If temporary-session revocation cannot be confirmed after an accepted operation, the authoritative result is annotated with `auth_cleanup: failed`. Do not repeat the mutation; reconcile it and wait for the short lease deadline.

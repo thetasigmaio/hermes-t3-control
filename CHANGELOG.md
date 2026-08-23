@@ -2,6 +2,17 @@
 
 All notable changes to Hermes T3 Control are documented in this file.
 
+## [1.2.2] - 2026-08-23
+
+### Added
+
+- Added `t3_thread_settle` so Hermes can hide a finished inactive thread from T3's in-progress list without deleting it.
+- Added guarded same-thread Codex instance switching so work can move off an exhausted account without replacing the thread.
+
+### Changed
+
+- Moved the long signer-verified installer out of the README into `scripts/install-signed.sh` and left a five-line hash-gated launch in Quick start.
+
 ## [1.2.1] - 2026-08-22
 
 ### Changed
@@ -78,6 +89,7 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Rejects active-token reflection in request targets or mutation data before any HTTP request.
 - Publishes release artifacts through owner-private, inode-bound no-follow staging and rejects unsafe directories, links, or special files.
 
+[1.2.2]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.2
 [1.2.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.1
 [1.2.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.0
 [1.1.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.1.1

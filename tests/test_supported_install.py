@@ -29,6 +29,7 @@ EXPECTED_TOOLS = (
     "t3_session_stop",
     "t3_thread_wait",
     "t3_thread_respond",
+    "t3_thread_settle",
 )
 TEST_CREDENTIAL = "test-only-placeholder"
 DEVELOPMENT_UNTRACKED_ALLOWLIST = (
@@ -84,7 +85,7 @@ assert manifest.manifest_version == 1
 assert manifest.api_version == 1
 assert (manifest.name, manifest.version, manifest.kind) == (
     "hermes-t3-control",
-    "1.2.1",
+    "1.2.2",
     "standalone",
 )
 assert tuple(manifest.provides_tools) == expected_tools
@@ -433,7 +434,7 @@ class SupportedInstallHarnessContractTests(unittest.TestCase):
     def test_supported_flow_exercises_a_scanner_blocking_revision(self) -> None:
         flow = inspect.getsource(
             SupportedInstallRegressionTests.
-            test_pinned_install_enable_and_fresh_load_register_and_call_exactly_ten_tools
+            test_pinned_install_enable_and_fresh_load_register_and_call_exactly_eleven_tools
         )
         self.assertIn("_assert_scanner_enforcement(", flow)
 
@@ -443,7 +444,7 @@ class SupportedInstallHarnessContractTests(unittest.TestCase):
     "set HERMES_SUPPORTED_INSTALL_TEST=1 with a pinned Hermes CLI installed",
 )
 class SupportedInstallRegressionTests(unittest.TestCase):
-    def test_pinned_install_enable_and_fresh_load_register_and_call_exactly_ten_tools(
+    def test_pinned_install_enable_and_fresh_load_register_and_call_exactly_eleven_tools(
         self,
     ) -> None:
         hermes = pathlib.Path(sys.executable).with_name("hermes")
@@ -509,7 +510,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
             disabled_plugins = json.loads(listed_disabled.stdout)
             self.assertEqual(len(disabled_plugins), 1)
             self.assertEqual(disabled_plugins[0]["name"], "hermes-t3-control")
-            self.assertEqual(disabled_plugins[0]["version"], "1.2.1")
+            self.assertEqual(disabled_plugins[0]["version"], "1.2.2")
             self.assertEqual(disabled_plugins[0]["source"], "git")
             self.assertEqual(disabled_plugins[0]["status"], "not enabled")
 
@@ -518,7 +519,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 (installed_root / "plugin.yaml").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["manifest_version"], 1)
-            self.assertEqual(manifest["version"], "1.2.1")
+            self.assertEqual(manifest["version"], "1.2.2")
             self.assertEqual(tuple(manifest["provides_tools"]), EXPECTED_TOOLS)
             after_install = (installed_root / "after-install.md").read_text(
                 encoding="utf-8"
@@ -548,7 +549,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 f"stdout:\n{doctor_disabled.stdout}\nstderr:\n{doctor_disabled.stderr}",
             )
             self.assertIn(
-                "registrations: 10 tool(s), 0 hook(s)", doctor_disabled.stdout
+                "registrations: 11 tool(s), 0 hook(s)", doctor_disabled.stdout
             )
             self.assertNotIn("WARN:", doctor_disabled.stdout)
 
@@ -654,7 +655,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 0,
                 f"stdout:\n{doctor.stdout}\nstderr:\n{doctor.stderr}",
             )
-            self.assertIn("registrations: 10 tool(s), 0 hook(s)", doctor.stdout)
+            self.assertIn("registrations: 11 tool(s), 0 hook(s)", doctor.stdout)
             self.assertNotIn("WARN:", doctor.stdout)
 
             remove_help = _run(

@@ -12,6 +12,7 @@ EXPECTED_TOOLS = {
     "t3_thread_send",
     "t3_thread_wait",
     "t3_thread_respond",
+    "t3_thread_settle",
     "t3_thread_set_mode",
     "t3_thread_implement_plan",
     "t3_turn_interrupt",
@@ -27,10 +28,11 @@ class AgentFacingSchemaTests(unittest.TestCase):
         self.assertFalse(schema["parameters"]["additionalProperties"])
         return schema["parameters"]["properties"]
 
-    def test_exactly_ten_public_tools_include_wait_and_respond(self) -> None:
-        self.assertEqual(len(schemas.SCHEMAS), 10)
+    def test_exactly_eleven_public_tools_append_settle_after_respond(self) -> None:
+        self.assertEqual(len(schemas.SCHEMAS), 11)
         self.assertEqual(set(schemas.SCHEMAS), EXPECTED_TOOLS)
         self.assertEqual(set(schemas.TOOL_NAMES), EXPECTED_TOOLS)
+        self.assertEqual(schemas.TOOL_NAMES[-2:], ("t3_thread_respond", "t3_thread_settle"))
 
     def test_threads_schema_pins_compact_default_and_bounded_filters(self) -> None:
         properties = self.properties("t3_threads")
@@ -96,7 +98,17 @@ class AgentFacingSchemaTests(unittest.TestCase):
         )
 
         send = self.properties("t3_thread_send")
-        self.assertEqual(set(send), {"thread_id", "message", "busy_policy"})
+        self.assertEqual(
+            set(send),
+            {
+                "thread_id",
+                "message",
+                "instance_id",
+                "model",
+                "model_options",
+                "busy_policy",
+            },
+        )
         self.assertEqual(send["busy_policy"]["type"], "string")
         self.assertEqual(send["busy_policy"]["enum"], ["reject", "queue"])
         self.assertEqual(send["busy_policy"]["default"], "reject")
@@ -142,6 +154,18 @@ class AgentFacingSchemaTests(unittest.TestCase):
         self.assertIn(
             "requires instance_id and model",
             create["model_options"]["description"],
+        )
+        send = self.properties("t3_thread_send")
+        self.assertIn("supplied together", send["instance_id"]["description"])
+        self.assertIn("supplied together", send["model"]["description"])
+        self.assertIn(
+            "requires instance_id and model",
+            send["model_options"]["description"],
+        )
+        self.assertEqual(send["model_options"]["maxItems"], 64)
+        self.assertEqual(
+            set(send["model_options"]["items"]["properties"]),
+            {"id", "value"},
         )
 
     def test_respond_schema_is_an_exact_approval_or_user_input_union(self) -> None:
@@ -204,6 +228,27 @@ class AgentFacingSchemaTests(unittest.TestCase):
             ],
         )
 
+    def test_settle_schema_accepts_only_one_bounded_required_thread_id(self) -> None:
+        settle_schema = schemas.SCHEMAS.get("t3_thread_settle")
+        self.assertIsNotNone(settle_schema)
+        assert settle_schema is not None
+        parameters = settle_schema["parameters"]
+        self.assertEqual(
+            parameters,
+            {
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                    }
+                },
+                "required": ["thread_id"],
+                "additionalProperties": False,
+            },
+        )
+
     def test_set_mode_schema_warns_about_full_access(self) -> None:
         description = schemas.SCHEMAS["t3_thread_set_mode"]["description"]
         self.assertIn("full-access", description)
@@ -244,12 +289,15 @@ class AgentFacingSchemaTests(unittest.TestCase):
             ("t3_threads", "properties", "lifecycle"),
             ("t3_thread_read", "properties", "view"),
             ("t3_thread_send", "properties", "busy_policy"),
+            ("t3_thread_send", "properties", "instance_id"),
+            ("t3_thread_send", "properties", "model"),
             ("t3_thread_wait", "properties", "thread_id"),
             ("t3_thread_wait", "properties", "until"),
             ("t3_thread_respond", "properties", "thread_id"),
             ("t3_thread_respond", "properties", "request_id"),
             ("t3_thread_respond", "properties", "turn_id"),
             ("t3_thread_respond", "properties", "decision"),
+            ("t3_thread_settle", "properties", "thread_id"),
         }
         self.assertTrue(required_new_paths <= string_paths)
 

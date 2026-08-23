@@ -1,21 +1,22 @@
 # Tool reference
 
-Hermes T3 Control registers ten synchronous tools in the `t3_control` toolset. Every handler rejects unknown fields, keeps output bounded, and returns JSON with `ok`. Errors also include a stable code, retryability, ambiguity, and safe recovery metadata.
+Hermes T3 Control registers eleven synchronous tools in the `t3_control` toolset. Every handler rejects unknown fields, keeps output bounded, and returns JSON with `ok`. Errors also include a stable code, retryability, ambiguity, and safe recovery metadata.
 
-## Ten tools
+## Eleven tools
 
 | Tool | Purpose and important defaults |
 |---|---|
 | `t3_threads` | Filtered compact summaries by default; bounded explicit `raw` view. |
 | `t3_thread_read` | Exact bounded material summary by default; optional raw page and cursor. |
 | `t3_thread_create` | Create one native thread, optionally with one verified initial turn. |
-| `t3_thread_send` | `reject` is observation-only; explicit `queue` acknowledges start-or-queue. |
+| `t3_thread_send` | Continue unchanged by default, or request one guarded instance/model switch; actual sends require `queue`. |
 | `t3_thread_set_mode` | Set exactly one stored runtime or interaction mode. |
 | `t3_thread_implement_plan` | Verify and implement one stored same-thread plan. |
 | `t3_turn_interrupt` | Best-effort interrupt of the provider session current for the exact thread. |
 | `t3_session_stop` | Best-effort stop without deleting or replacing the thread. |
 | `t3_thread_wait` | Wait for change/running/blocked/terminal/error for at most 30 seconds. |
 | `t3_thread_respond` | Best-effort current-session response by exact request ID and expected turn ID. |
+| `t3_thread_settle` | Apply native T3 thread settlement after completed work. |
 
 Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`.
 
@@ -52,7 +53,7 @@ Material readback includes project/workspace, title, model and modes, lifecycle,
 
 ### Continue and wait
 
-Sending preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree. It never creates a replacement thread.
+Without an override, sending preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree exactly as before. To request a same-thread switch, supply `instance_id` and `model` together; optional `model_options` requires that pair. Explicit options replace the target options exactly, including `[]`; omission preserves stored options only when the instance/model pair is unchanged, and otherwise omits options so T3 applies the target defaults. The toolset still contains ten tools: switching is part of `t3_thread_send`, not a separate tool.
 
 Pinned T3 has no atomic idle guard. Therefore the default `busy_policy: reject` is an observation-only check and never dispatches. Every actual send requires `queue`, acknowledging that T3 may start or queue that exact message.
 
@@ -65,6 +66,19 @@ Example for `t3_thread_send`:
   "busy_policy": "queue"
 }
 ```
+
+Changing the selection is stricter than an ordinary queued continuation. It is attempted only when the exact thread is observed `idle`/`ready`, with no active turn, live background work, or pending request. Otherwise `model_switch_busy` is returned before any POST. The safe recovery is `t3_turn_interrupt`, then `t3_thread_wait` until `ready`, then retry the same override. Do not use `t3_session_stop` for switch recovery.
+
+The supported path mirrors T3's two-phase UI sequence:
+
+1. POST `thread.meta.update` with the exact target `modelSelection`, then require exact readback.
+2. Check liveness again, then POST `thread.turn.start` with that same selection and exactly one linked message.
+
+Success requires the original thread, project, branch, and worktree; exact selection and options; exactly one linked message; and `session.providerInstanceId` equal to the target instance. No replacement thread is silently created.
+
+An accepted command whose projection cannot yet prove that complete success returns `ok:false`, `accepted:true`, `completed:false`, and `verification:"accepted_pending_projection"`. Reconcile the named command and snapshot; do not treat that receipt as switch success or dispatch another phase speculatively.
+
+There is no orchestration HTTP provider catalog and no honest remaining-quota preflight. A missing target, different driver, or incompatible continuation becomes authoritative only if T3 projects the turn-start failure. Such failures, a stopped or interrupted thread, or an unrestorable error-state thread are non-retryable `unsupported_model_switch`. Projected quota or usage-limit failures are sanitized to `provider_limit_exhausted`; raw provider error text is never returned.
 
 Command states distinguish `started`, `queued`, `completed`, `blocked`, `error`, and `accepted_pending_projection`. Full-access sends repeat the modification/deletion warning at the action point.
 
@@ -101,6 +115,14 @@ Example for `t3_thread_respond`:
 ```
 
 The compact receipt contains request, thread, command, and verification/reconciliation identities, never the full raw detail.
+
+### Settle completed work
+
+After completed work, call `t3_thread_settle {"thread_id":"exact-thread-id"}` explicitly. This is the manual T3 UI-equivalent settlement action and is available only when the connected T3 server advertises the native capability. The tool verifies native readback; it does not emulate settlement locally.
+
+Settlement conflicts while a turn is starting or running, approval or user input is pending, or a recent queued turn is present. An already-settled thread succeeds. T3 itself clears any pin and snooze as part of settlement. The thread remains available and is not stopped, deleted, or archived. There is no public unsettle tool.
+
+Thread settlement is distinct from turn-liveness `settled`: the liveness value means the current provider and background work are no longer active, but does not apply the native thread settlement state.
 
 ### Create
 
