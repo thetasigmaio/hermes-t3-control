@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import re
+import subprocess
+import tempfile
 import unittest
 
 import schemas
@@ -10,6 +13,10 @@ import schemas
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README_PATH = ROOT / "README.md"
+INSTALL_SCRIPT_PATH = ROOT / "scripts" / "install-signed.sh"
+INSTALL_SCRIPT_SHA256 = (
+    "7ae2ee2e2a78355d6e318538b05754004679af113c316edf3bef3dc4c855cc6c"
+)
 AFTER_INSTALL_PATH = ROOT / "after-install.md"
 TOOLS_PATH = ROOT / "docs" / "tools.md"
 COMPATIBILITY_PATH = ROOT / "docs" / "compatibility.md"
@@ -85,49 +92,236 @@ class ProductDocumentationContractTests(unittest.TestCase):
         self.assertNotIn("OpenCode | Supported", readme)
         self.assertNotRegex(readme, r"\| (?:Native Windows|macOS) \| Supported \|")
 
-    def test_quick_start_verifies_signer_profile_and_splits_catalog_owners(self) -> None:
+    def test_quick_start_is_a_five_line_hash_gated_wrapper(self) -> None:
         readme = _read(README_PATH)
+        script = _read(INSTALL_SCRIPT_PATH)
         quick = readme.split("## Quick start", 1)[1].split("## First safe check", 1)[0]
+        readme_blocks = re.findall(r"```bash\n(.*?)\n```", readme, re.DOTALL)
         command_blocks = re.findall(r"```bash\n(.*?)\n```", quick, re.DOTALL)
         self.assertGreaterEqual(len(command_blocks), 3)
         commands = command_blocks[0]
-        for command in (
-            "hermes config path",
-            "hermes config set plugins.scan_on_install true",
-            "env -i",
-            "GIT_CONFIG_GLOBAL=/dev/null",
-            "protocol.file.allow=never",
-            "verify-tag --raw v1.2.1",
-            "SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4",
-            "rev-parse --verify 'v1.2.1^{}'",
-            "Release tag signature did not match the pinned signer.",
-            "grep -Eq '^[0-9a-f]{40}$'",
-            'hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable',
-            "hermes plugins doctor hermes-t3-control --ci",
-            "hermes plugins enable hermes-t3-control --no-allow-tool-override",
-        ):
-            with self.subTest(command=command):
-                self.assertIn(command, quick)
-        self.assertLess(commands.index("hermes config path"), commands.index("hermes config set"))
-        self.assertLess(
-            quick.index("hermes plugins doctor"),
-            quick.index("hermes plugins enable"),
+        self.assertEqual(readme_blocks[0], commands)
+        digest = hashlib.sha256(INSTALL_SCRIPT_PATH.read_bytes()).hexdigest()
+        self.assertEqual(digest, INSTALL_SCRIPT_SHA256)
+        self.assertEqual(
+            commands.splitlines(),
+            [
+                "( git clone --depth 1 "
+                "https://github.com/thetasigmaio/hermes-t3-control &&",
+                "cd ./hermes-t3-control &&",
+                'SCRIPT=scripts/install-signed.sh && exec 3<"$SCRIPT" '
+                "&& test -f /dev/fd/3 &&",
+                f"HASH={INSTALL_SCRIPT_SHA256} &&",
+                "printf '%s  /dev/fd/3\\n' \"$HASH\" | sha256sum -c - "
+                "&& bash /dev/fd/3 )",
+            ],
         )
-        self.assertNotIn("--force", commands)
-        self.assertNotIn("T3_ORCHESTRATION_TOKEN", commands)
-        self.assertNotIn("settings.auth_mode", commands)
-        self.assertNotIn("git ls-remote", commands)
-        self.assertNotIn("hermes gateway", commands)
+        self.assertEqual(len(commands.splitlines()), 5)
+        self.assertTrue(all(len(line) <= 80 for line in commands.splitlines()))
+        self.assertTrue(script.endswith("\n"))
+        self.assertNotRegex(readme, r"(?im)\bcurl\b[^\n|]*\|\s*(?:ba)?sh\b")
+        for implementation_detail in (
+            "safe_git",
+            "VERIFY_DIR",
+            "env -i",
+            "XDG_CONFIG_HOME",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "protocol.file.allow",
+            "gpg.format=ssh",
+            "gpg.ssh.allowedSignersFile",
+            "verify-tag",
+            "rev-parse",
+            "SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4",
+        ):
+            with self.subTest(implementation_detail=implementation_detail):
+                self.assertNotIn(implementation_detail, readme)
         self.assertIn("automatic local authentication", quick)
         self.assertIn("When no profile-scoped T3 token is configured", quick)
         self.assertIn("Git supports SSH signature verification", quick)
         self.assertIn("approval-required", quick)
         self.assertIn("managed messaging gateway", quick)
-        self.assertIn("hermes gateway restart", command_blocks[1])
-        self.assertIn("hermes gateway status", command_blocks[1])
+        self.assertEqual(
+            command_blocks[1],
+            "hermes gateway restart\nhermes gateway status",
+        )
         self.assertIn("Desktop or `hermes serve`", quick)
-        self.assertIn("hermes serve --status", command_blocks[2])
+        self.assertEqual(command_blocks[2], "hermes serve --status")
         self.assertIn("Restart only the process that owns your Hermes session", quick)
+        self.assertEqual(quick.count("registrations: 10 tool(s), 0 hook(s)"), 1)
+
+    def test_quick_start_failure_paths_do_not_execute_the_installer(self) -> None:
+        readme = _read(README_PATH)
+        commands = re.findall(r"```bash\n(.*?)\n```", readme, re.DOTALL)[0]
+        scenarios = (
+            (
+                "failed clone with pre-existing checkout",
+                "exit 1\n",
+                True,
+                False,
+                False,
+            ),
+            (
+                "checksum mismatch",
+                "mkdir -p hermes-t3-control/scripts\n"
+                "printf 'tampered\\n' > "
+                "hermes-t3-control/scripts/install-signed.sh\n",
+                False,
+                False,
+                False,
+            ),
+            (
+                "verified descriptor",
+                "mkdir -p hermes-t3-control/scripts\n"
+                "cp \"$SOURCE\" hermes-t3-control/scripts/install-signed.sh\n",
+                False,
+                True,
+                False,
+            ),
+            (
+                "hostile CDPATH",
+                "mkdir -p hermes-t3-control/scripts\n"
+                "cp \"$SOURCE\" hermes-t3-control/scripts/install-signed.sh\n",
+                False,
+                True,
+                True,
+            ),
+            (
+                "non-regular descriptor",
+                "mkdir -p hermes-t3-control/scripts\n"
+                "ln -s /dev/null hermes-t3-control/scripts/install-signed.sh\n",
+                False,
+                False,
+                False,
+            ),
+        )
+        for name, git_body, pre_existing, should_execute, hostile_cdpath in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                sandbox = pathlib.Path(temporary)
+                command_dir = sandbox / "commands"
+                command_dir.mkdir()
+                marker = sandbox / "installer-ran"
+                fake_git = command_dir / "git"
+                fake_git.write_text("#!/bin/sh\n" + git_body, encoding="utf-8")
+                fake_git.chmod(0o700)
+                fake_bash = command_dir / "bash"
+                fake_bash.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' ran > \"$MARKER\"\n",
+                    encoding="utf-8",
+                )
+                fake_bash.chmod(0o700)
+                if pre_existing:
+                    script = sandbox / "hermes-t3-control" / "scripts" / INSTALL_SCRIPT_PATH.name
+                    script.parent.mkdir(parents=True)
+                    script.write_bytes(INSTALL_SCRIPT_PATH.read_bytes())
+
+                environment = {
+                    "MARKER": str(marker),
+                    "PATH": f"{command_dir}:/usr/bin:/bin",
+                    "SOURCE": str(INSTALL_SCRIPT_PATH),
+                }
+                if hostile_cdpath:
+                    hostile_script = (
+                        sandbox
+                        / "hostile"
+                        / "hermes-t3-control"
+                        / "scripts"
+                        / INSTALL_SCRIPT_PATH.name
+                    )
+                    hostile_script.parent.mkdir(parents=True)
+                    hostile_script.write_text("tampered\n", encoding="utf-8")
+                    environment["CDPATH"] = str(sandbox / "hostile")
+
+                result = subprocess.run(
+                    ["/usr/bin/bash", "-c", commands],
+                    cwd=sandbox,
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(marker.exists(), should_execute, result.stderr)
+                self.assertEqual(result.returncode == 0, should_execute, result.stderr)
+
+    def test_signed_installer_preserves_the_secured_install_flow(self) -> None:
+        script = _read(INSTALL_SCRIPT_PATH)
+        self.assertTrue(script.startswith("#!/usr/bin/env bash\n"))
+        for command in (
+            "set -eu",
+            "umask 077",
+            'if [ "$#" -ne 0 ]; then',
+            "hermes config path",
+            "Install into this Hermes profile? [y/N]",
+            'case "$CONFIRM" in y|Y)',
+            'VERIFY_DIR="$(mktemp -d)"',
+            'trap \'rm -rf -- "$VERIFY_DIR"\' EXIT',
+            'mkdir -m 700 "$VERIFY_DIR/home" "$VERIFY_DIR/xdg" "$VERIFY_DIR/repo"',
+            "safe_git() {",
+            "env -i",
+            'PATH="$PATH"',
+            "LC_ALL=C",
+            'HOME="$VERIFY_DIR/home"',
+            'XDG_CONFIG_HOME="$VERIFY_DIR/xdg"',
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "protocol.file.allow=never",
+            "fetch -q --no-tags",
+            "https://github.com/thetasigmaio/hermes-t3-control.git",
+            "refs/tags/v1.2.1:refs/tags/v1.2.1",
+            "gpg.format=ssh",
+            "gpg.ssh.allowedSignersFile=/dev/null",
+            "verify-tag --raw v1.2.1",
+            "SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4",
+            "rev-parse --verify 'v1.2.1^{}'",
+            "Release tag signature did not match the pinned signer.",
+            "grep -Eq '^[0-9a-f]{40}$'",
+            "hermes config set plugins.scan_on_install true",
+            'hermes plugins install thetasigmaio/hermes-t3-control --ref "$HERMES_T3_CONTROL_REF" --no-enable',
+            "hermes plugins doctor hermes-t3-control --ci",
+            "hermes plugins enable hermes-t3-control --no-allow-tool-override",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, script)
+        ordered_commands = (
+            "hermes config path",
+            "Install into this Hermes profile? [y/N]",
+            "verify-tag --raw v1.2.1",
+            "rev-parse --verify 'v1.2.1^{}'",
+            "hermes config set plugins.scan_on_install true",
+            "hermes plugins install",
+            "hermes plugins doctor",
+            "hermes plugins enable",
+        )
+        positions = [script.index(command) for command in ordered_commands]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "hermes config set plugins.scan_on_install true",
+            "hermes plugins install thetasigmaio/hermes-t3-control",
+            "hermes plugins doctor hermes-t3-control --ci",
+            "hermes plugins enable hermes-t3-control --no-allow-tool-override",
+        ):
+            with self.subTest(single_command=command):
+                self.assertEqual(script.count(command), 1)
+        self.assertNotIn("$1", script)
+        self.assertNotIn("${", script)
+        for forbidden in (
+            "--force",
+            "token",
+            "auth_mode",
+            "auth-mode",
+            "git ls-remote",
+            "hermes gateway",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, script.casefold())
+        syntax = subprocess.run(
+            ["bash", "-n", str(INSTALL_SCRIPT_PATH)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     def test_after_install_is_a_minimal_supported_next_step(self) -> None:
         after_install = _read(AFTER_INSTALL_PATH)
