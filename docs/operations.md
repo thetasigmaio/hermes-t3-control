@@ -58,13 +58,13 @@ Verify the release tag against the pinned signer, confirm the active profile, th
     env -i PATH="$PATH" LC_ALL=C HOME="$VERIFY_DIR/home" XDG_CONFIG_HOME="$VERIFY_DIR/xdg" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"
   }
   safe_git -C "$VERIFY_DIR/repo" init -q
-  safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.2.1:refs/tags/v1.2.1'
-  TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.2.1 2>&1 || true)"
+  safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.2.2:refs/tags/v1.2.2'
+  TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.2.2 2>&1 || true)"
   if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
     printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
     exit 1
   fi
-  HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.2.1^{}')"
+  HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.2.2^{}')"
   printf '%s\n' "$HERMES_T3_CONTROL_REF" | grep -Eq '^[0-9a-f]{40}$'
   hermes plugins disable hermes-t3-control
   hermes plugins remove hermes-t3-control
@@ -105,20 +105,20 @@ The detached checksum detects transfer corruption; it comes from the same releas
     env -i PATH="$PATH" LC_ALL=C HOME="$RELEASE_DIR/home" XDG_CONFIG_HOME="$RELEASE_DIR/xdg" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"
   }
   safe_git -C "$RELEASE_DIR/repo" init -q
-  safe_git -C "$RELEASE_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.2.1:refs/tags/v1.2.1'
-  TAG_VERIFY="$(safe_git -C "$RELEASE_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.2.1 2>&1 || true)"
+  safe_git -C "$RELEASE_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.2.2:refs/tags/v1.2.2'
+  TAG_VERIFY="$(safe_git -C "$RELEASE_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.2.2 2>&1 || true)"
   if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
     printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
     exit 1
   fi
-  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.2.1^{}')"
+  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.2.2^{}')"
   printf '%s\n' "$RELEASE_REF" | grep -Eq '^[0-9a-f]{40}$'
   safe_git -C "$RELEASE_DIR/repo" checkout -q --detach "$RELEASE_REF"
-  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.2.1.tar.gz" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.2.1/hermes-t3-control-1.2.1.tar.gz
-  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.2.1.tar.gz.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.2.1/hermes-t3-control-1.2.1.tar.gz.sha256
-  python3 -B "$RELEASE_DIR/repo/scripts/verify_release.py" "$RELEASE_DIR/download/hermes-t3-control-1.2.1.tar.gz.sha256"
+  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.2.2.tar.gz" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.2.2/hermes-t3-control-1.2.2.tar.gz
+  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.2.2.tar.gz.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.2.2/hermes-t3-control-1.2.2.tar.gz.sha256
+  python3 -B "$RELEASE_DIR/repo/scripts/verify_release.py" "$RELEASE_DIR/download/hermes-t3-control-1.2.2.tar.gz.sha256"
   python3 -B "$RELEASE_DIR/repo/scripts/build_release.py" --output-dir "$RELEASE_DIR/reproduced"
-  cmp -- "$RELEASE_DIR/download/hermes-t3-control-1.2.1.tar.gz" "$RELEASE_DIR/reproduced/hermes-t3-control-1.2.1.tar.gz"
+  cmp -- "$RELEASE_DIR/download/hermes-t3-control-1.2.2.tar.gz" "$RELEASE_DIR/reproduced/hermes-t3-control-1.2.2.tar.gz"
 )
 ```
 
@@ -130,7 +130,7 @@ Run the dependency-free suite and local release gates from a clean checkout:
 PYTHONWARNINGS=error python3.11 -B -m unittest discover -s tests -v
 env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci
 python3 -B scripts/build_release.py --output-dir dist
-python3 -B scripts/verify_release.py dist/hermes-t3-control-1.2.1.tar.gz.sha256
+python3 -B scripts/verify_release.py dist/hermes-t3-control-1.2.2.tar.gz.sha256
 ```
 
 Supported-install CI uses uv 0.12.0 and `uv sync --frozen` against these exact Hermes commits:
@@ -138,4 +138,4 @@ Supported-install CI uses uv 0.12.0 and `uv sync --frozen` against these exact H
 - 0.20.4: `e624e9fde561e1add9388384012b295fde669ade`
 - 0.20.5: `fcbd1076a93841fa88855acce810e342a5b78101`
 
-The fresh-process inspector permits only its expected loopback TCP connection and asserts that the plugin is enabled, manifest v1, version 1.2.1, and exactly eleven tools are registered, discoverable, and callable.
+The fresh-process inspector permits only its expected loopback TCP connection and asserts that the plugin is enabled, manifest v1, version 1.2.2, and exactly eleven tools are registered, discoverable, and callable.
