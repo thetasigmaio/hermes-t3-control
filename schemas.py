@@ -268,6 +268,13 @@ T3_SESSION_STOP_SCHEMA = _schema(
     ["thread_id"],
 )
 
+T3_THREAD_SETTLE_SCHEMA = _schema(
+    "t3_thread_settle",
+    "Settle one inactive T3 thread after fail-closed native capability and pending-work checks.",
+    {"thread_id": dict(_ID)},
+    ["thread_id"],
+)
+
 SCHEMAS = {
     schema["name"]: schema
     for schema in (
@@ -281,6 +288,7 @@ SCHEMAS = {
         T3_SESSION_STOP_SCHEMA,
         T3_THREAD_WAIT_SCHEMA,
         T3_THREAD_RESPOND_SCHEMA,
+        T3_THREAD_SETTLE_SCHEMA,
     )
 }
 

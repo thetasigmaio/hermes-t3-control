@@ -168,6 +168,10 @@ class ReadAndSchemaTests(unittest.TestCase):
         descriptor = {
             "environmentId": "environment-test",
             "serverVersion": "0.0.34-nightly.20260820.1141",
+            "capabilities": {
+                "threadSettlement": True,
+                "futureCapability": {"preserved": True},
+            },
             "futureField": {"preserved": True},
         }
         with LoopbackServer([Response(value=descriptor)]) as server:
@@ -192,6 +196,35 @@ class ReadAndSchemaTests(unittest.TestCase):
         ):
             invalid = dict(descriptor, **{field: value})
             with self.subTest(field=field, value_type=type(value).__name__), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_environment_descriptor(invalid)
+
+        without_capabilities = {
+            "environmentId": descriptor["environmentId"],
+            "serverVersion": descriptor["serverVersion"],
+        }
+        self.assertIs(
+            client.validate_environment_descriptor(without_capabilities),
+            without_capabilities,
+        )
+        disabled_capability = dict(
+            without_capabilities,
+            capabilities={"threadSettlement": False},
+        )
+        self.assertIs(
+            client.validate_environment_descriptor(disabled_capability),
+            disabled_capability,
+        )
+        for capabilities in (
+            None,
+            [],
+            {"threadSettlement": None},
+            {"threadSettlement": 1},
+            {"threadSettlement": "true"},
+        ):
+            invalid = dict(descriptor, capabilities=capabilities)
+            with self.subTest(capabilities=capabilities), self.assertRaises(
                 client.ResponseSchemaError
             ):
                 client.validate_environment_descriptor(invalid)
@@ -380,6 +413,42 @@ class ReadAndSchemaTests(unittest.TestCase):
             invalid = copy.deepcopy(detail)
             invalid["thread"]["activities"][0][field] = value
             with self.subTest(activity_field=field), self.assertRaises(
+                client.ResponseSchemaError
+            ):
+                client.validate_thread_detail(invalid)
+
+    def test_native_settlement_and_companion_fields_are_validated_when_present(self) -> None:
+        detail = detail_snapshot()
+        detail["thread"].update(
+            {
+                "settledOverride": "settled",
+                "settledAt": "2026-08-23T12:00:00Z",
+                "pinnedAt": None,
+                "pinOrderKey": None,
+                "snoozedUntil": None,
+                "snoozedAt": None,
+            }
+        )
+        self.assertIs(client.validate_thread_detail(detail), detail)
+        for settled_override in (None, "active", "settled"):
+            valid = copy.deepcopy(detail)
+            valid["thread"]["settledOverride"] = settled_override
+            with self.subTest(settled_override=settled_override):
+                self.assertIs(client.validate_thread_detail(valid), valid)
+
+        invalid_fields = (
+            ("settledOverride", False),
+            ("settledOverride", "unsupported"),
+            ("settledAt", "not-a-timestamp"),
+            ("pinnedAt", 1),
+            ("pinOrderKey", []),
+            ("snoozedUntil", "2026-08-23T12:00:00"),
+            ("snoozedAt", {}),
+        )
+        for field, value in invalid_fields:
+            invalid = copy.deepcopy(detail)
+            invalid["thread"][field] = value
+            with self.subTest(field=field), self.assertRaises(
                 client.ResponseSchemaError
             ):
                 client.validate_thread_detail(invalid)

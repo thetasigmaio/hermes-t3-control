@@ -9,7 +9,7 @@ The simple mental model is:
 3. Continue or control that exact thread.
 4. Monitor with `t3_thread_wait`.
 
-Ten focused tools cover discovery, creation, continuation, modes, Plan to Build, interrupt, stop, wait, and typed responses. Outputs stay bounded, mutations fail closed on ambiguous selectors, and no mutation creates a replacement thread implicitly.
+Eleven focused tools cover discovery, creation, continuation, modes, Plan to Build, interrupt, stop, wait, typed responses, and explicit thread settlement. Outputs stay bounded, mutations fail closed on ambiguous selectors, and no mutation creates a replacement thread implicitly.
 
 ## Compatibility
 
@@ -42,7 +42,7 @@ HASH=7ae2ee2e2a78355d6e318538b05754004679af113c316edf3bef3dc4c855cc6c &&
 printf '%s  /dev/fd/3\n' "$HASH" | sha256sum -c - && bash /dev/fd/3 )
 ```
 
-Doctor runs while disabled and must report `registrations: 10 tool(s), 0 hook(s)`. This path does not use `--force`.
+Doctor runs while disabled and must report `registrations: 11 tool(s), 0 hook(s)`. This path does not use `--force`.
 
 Restart only the process that owns your Hermes session. For a managed messaging gateway:
 
@@ -85,15 +85,21 @@ Then wait without dumping a full snapshot:
 
 `t3_thread_wait {"thread_id":"exact-thread-id","until":"terminal","timeout_seconds":30}`
 
+After work is complete, explicitly apply the same settlement as the T3 UI when the server advertises that capability:
+
+`t3_thread_settle {"thread_id":"exact-thread-id"}`
+
+Settlement conflicts with starting/running work, pending approval or user input, and a recent queued turn. An already-settled thread succeeds. T3 clears pin and snooze itself; the thread remains available and is not stopped, deleted, or archived. This is distinct from turn-liveness `settled`, and there is no public unsettle tool.
+
 Zero or multiple matches require a narrower selector. A send never creates a replacement thread. If a mutation returns `accepted_pending_projection`, do not send it again; read back the exact command/message identity as described in [Operations and recovery](docs/operations.md#accepted-but-not-yet-projected).
 
 `full-access` lets the selected provider execute commands and modify or delete files without approval. Use it only for a trusted provider and checkout.
 
-For creation, Plan to Build, approvals/user input, mode changes, and all ten tools, see the [Tool reference](docs/tools.md).
+For creation, Plan to Build, approvals/user input, mode changes, settlement, and all eleven tools, see the [Tool reference](docs/tools.md).
 
 ## More detail
 
-- [Tool reference](docs/tools.md) — all ten tools, limits, and workflows.
+- [Tool reference](docs/tools.md) — all eleven tools, limits, and workflows.
 - [Compatibility evidence](docs/compatibility.md) — provider and OS claims plus acceptance gates.
 - [Security model](docs/security.md) — credential lifecycle, transport bounds, and race boundaries.
 - [Operations and recovery](docs/operations.md) — restart, update, rollback, troubleshooting, and release verification.

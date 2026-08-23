@@ -163,6 +163,16 @@ AUTH_CLEANUP_FAILURE_WARNING = (
     "session expires automatically. Do not repeat an accepted mutation before "
     "reconciling its exact state."
 )
+SETTLE_STALE_REQUEST_FAILURE_DETAILS = (
+    "stale pending approval request",
+    "unknown pending approval request",
+    "unknown pending permission request",
+    "stale pending user-input request",
+    "unknown pending user-input request",
+    "unknown pending user input request",
+    "unknown pending codex user input request",
+)
+QUEUED_TURN_START_GRACE_MILLISECONDS = 120_000
 
 
 def _profile_secret(name: str) -> str | None:
@@ -343,6 +353,91 @@ def _normalize_model_options(value: Any) -> list[dict[str, Any]]:
 def _ensure_mutable_thread(thread: dict[str, Any]) -> None:
     if thread["deletedAt"] is not None or thread["archivedAt"] is not None:
         raise ConflictError("The target thread is deleted or archived.")
+
+
+def _settle_has_open_blocking_request(thread: dict[str, Any]) -> bool:
+    open_request_ids: set[str] = set()
+    for activity in thread.get("activities", []):
+        payload = activity.get("payload")
+        request_id = payload.get("requestId") if isinstance(payload, dict) else None
+        if not isinstance(request_id, str):
+            continue
+        kind = activity.get("kind")
+        if kind in {"approval.requested", "user-input.requested"}:
+            open_request_ids.add(request_id)
+        elif kind in {"approval.resolved", "user-input.resolved"}:
+            open_request_ids.discard(request_id)
+        elif kind in {
+            "provider.approval.respond.failed",
+            "provider.user-input.respond.failed",
+        }:
+            detail = payload.get("detail")
+            if isinstance(detail, str) and any(
+                marker in detail.lower()
+                for marker in SETTLE_STALE_REQUEST_FAILURE_DETAILS
+            ):
+                open_request_ids.discard(request_id)
+    return bool(open_request_ids)
+
+
+def _settle_has_queued_turn_start(
+    thread: dict[str, Any], preflight_time: datetime
+) -> bool:
+    current_session = thread.get("session")
+    if (
+        isinstance(current_session, dict)
+        and current_session.get("status") == "error"
+    ):
+        return False
+    user_message_times = [
+        _timestamp_value(message["createdAt"])
+        for message in thread.get("messages", [])
+        if message.get("role") == "user"
+    ]
+    if not user_message_times:
+        return False
+    latest_user_message_time = max(user_message_times)
+    latest_turn = thread.get("latestTurn")
+    latest_turn_times = (
+        [
+            _timestamp_value(value)
+            for value in (
+                latest_turn["requestedAt"],
+                latest_turn["startedAt"],
+                latest_turn["completedAt"],
+            )
+            if value is not None
+        ]
+        if isinstance(latest_turn, dict)
+        else []
+    )
+    if latest_turn_times and latest_user_message_time <= max(latest_turn_times):
+        return False
+    age_milliseconds = abs(
+        (preflight_time - latest_user_message_time).total_seconds() * 1_000
+    )
+    return age_milliseconds <= QUEUED_TURN_START_GRACE_MILLISECONDS
+
+
+def _ensure_thread_settle_ready(
+    thread: dict[str, Any], preflight_time: datetime
+) -> None:
+    current_session = thread.get("session")
+    if (
+        isinstance(current_session, dict)
+        and current_session.get("status") in {"starting", "running"}
+    ):
+        raise ConflictError(
+            "The target thread has a starting or running provider session and cannot be settled."
+        )
+    if _settle_has_open_blocking_request(thread):
+        raise ConflictError(
+            "The target thread has a pending approval or user-input request and cannot be settled."
+        )
+    if _settle_has_queued_turn_start(thread, preflight_time):
+        raise ConflictError(
+            "The target thread has a queued turn start and cannot be settled."
+        )
 
 
 def _active_turn_id(thread: dict[str, Any]) -> str | None:
@@ -3004,6 +3099,98 @@ def t3_session_stop(ctx: Any, raw_args: Any) -> dict[str, Any]:
     return _execute_operation(ctx, normalized, perform)
 
 
+def t3_thread_settle(ctx: Any, raw_args: Any) -> dict[str, Any]:
+    args = _args(raw_args, allowed={"thread_id"}, required={"thread_id"})
+    thread_id = normalize_string(
+        args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS
+    )
+    normalized = {"thread_id": thread_id}
+
+    def perform(transport: T3Client) -> dict[str, Any]:
+        descriptor = transport.get_environment_descriptor()
+        capabilities = descriptor.get("capabilities")
+        if not isinstance(capabilities, dict) or capabilities.get(
+            "threadSettlement"
+        ) is not True:
+            raise ConflictError(
+                "The connected T3 environment does not support thread settlement."
+            )
+
+        before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
+        stored = before["thread"]
+        _ensure_mutable_thread(stored)
+        _ensure_thread_settle_ready(stored, datetime.now(timezone.utc))
+
+        already_settled = (
+            stored.get("settledOverride") == "settled"
+            and stored.get("settledAt") is not None
+        )
+        companion_state_clear = all(
+            stored.get(field) is None
+            for field in ("pinnedAt", "pinOrderKey", "snoozedUntil", "snoozedAt")
+        )
+        if already_settled and companion_state_clear:
+            return {
+                "action": "thread_already_settled",
+                "command_id": None,
+                "thread_id": thread_id,
+                "settled_override": stored["settledOverride"],
+                "settled_at": stored["settledAt"],
+            }
+
+        command = {
+            "type": "thread.settle",
+            "commandId": transport.new_uuid4(),
+            "threadId": thread_id,
+        }
+
+        def settled(detail: dict[str, Any]) -> bool:
+            thread = detail["thread"]
+            return (
+                thread["id"] == thread_id
+                and thread.get("settledOverride") == "settled"
+                and thread.get("settledAt") is not None
+                and all(
+                    thread.get(field) is None
+                    for field in (
+                        "pinnedAt",
+                        "pinOrderKey",
+                        "snoozedUntil",
+                        "snoozedAt",
+                    )
+                )
+            )
+
+        def archived_or_deleted(detail: dict[str, Any]) -> bool:
+            thread = detail["thread"]
+            return thread["archivedAt"] is not None or thread["deletedAt"] is not None
+
+        result = transport.mutate(
+            thread_id,
+            command,
+            settled,
+            race_detector=archived_or_deleted,
+            require_accepted_sequence=True,
+        )
+        detail = result.pop("detail", None)
+        if result["verification"] == "accepted_pending_projection":
+            return {
+                "action": "thread_settle_accepted_pending_projection",
+                **result,
+            }
+        if not isinstance(detail, dict):
+            raise T3ClientError()
+        observed = detail["thread"]
+        return {
+            "action": "thread_settled",
+            **result,
+            "settled_override": observed["settledOverride"],
+            "settled_at": observed["settledAt"],
+        }
+
+    return _execute_operation(ctx, normalized, perform)
+
+
 OPERATIONS = {
     "t3_threads": t3_threads,
     "t3_thread_read": t3_thread_read,
@@ -3015,4 +3202,5 @@ OPERATIONS = {
     "t3_session_stop": t3_session_stop,
     "t3_thread_wait": t3_thread_wait,
     "t3_thread_respond": t3_thread_respond,
+    "t3_thread_settle": t3_thread_settle,
 }

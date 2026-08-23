@@ -28,6 +28,7 @@ The Codex live gate covered list/filter, exact read, create, idle send, explicit
 | `t3_session_stop` | Generic T3 command with provider-adapter best-effort stop semantics. |
 | `t3_thread_wait` | Generic canonical projection; correctness depends on provider liveness/activity mapping. |
 | `t3_thread_respond` | The canonical request/response envelope is generic; native mapping and behavior are provider-specific. |
+| `t3_thread_settle` | Native manual UI-equivalent T3 mutation, gated by advertised server capability and verified through native readback; distinct from provider turn-liveness. |
 
 The code preserves arbitrary T3 `modelSelection` values and contains no Codex allowlist. That is necessary for portability, but it is not sufficient to claim another provider works.
 
@@ -65,7 +66,7 @@ Native Windows or macOS support requires all of the following on a real runner a
 
 1. A maintainable way to authenticate without placing a bearer in argv, settings, logs, or repository files.
 2. Numeric-loopback enforcement, no proxies/redirects, bounded responses, credential-reflection preflight, and exact cleanup behavior.
-3. Python 3.11-3.13 unit/contract tests, supported Hermes install/Doctor, fresh-process discovery, and all ten callable definitions.
+3. Python 3.11-3.13 unit/contract tests, supported Hermes install/Doctor, fresh-process discovery, and all eleven callable definitions.
 4. One disposable real-provider create/send/wait completion plus exact readback and duplicate prevention.
 5. Deterministic release verification or an explicitly documented build-host boundary when POSIX publishing primitives are unavailable.
 

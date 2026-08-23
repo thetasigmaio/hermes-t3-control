@@ -1,8 +1,8 @@
 # Tool reference
 
-Hermes T3 Control registers ten synchronous tools in the `t3_control` toolset. Every handler rejects unknown fields, keeps output bounded, and returns JSON with `ok`. Errors also include a stable code, retryability, ambiguity, and safe recovery metadata.
+Hermes T3 Control registers eleven synchronous tools in the `t3_control` toolset. Every handler rejects unknown fields, keeps output bounded, and returns JSON with `ok`. Errors also include a stable code, retryability, ambiguity, and safe recovery metadata.
 
-## Ten tools
+## Eleven tools
 
 | Tool | Purpose and important defaults |
 |---|---|
@@ -16,6 +16,7 @@ Hermes T3 Control registers ten synchronous tools in the `t3_control` toolset. E
 | `t3_session_stop` | Best-effort stop without deleting or replacing the thread. |
 | `t3_thread_wait` | Wait for change/running/blocked/terminal/error for at most 30 seconds. |
 | `t3_thread_respond` | Best-effort current-session response by exact request ID and expected turn ID. |
+| `t3_thread_settle` | Apply native T3 thread settlement after completed work. |
 
 Runtime modes are `approval-required`, `auto-accept-edits`, `auto`, and `full-access`. Interaction modes are `default` and `plan`.
 
@@ -114,6 +115,14 @@ Example for `t3_thread_respond`:
 ```
 
 The compact receipt contains request, thread, command, and verification/reconciliation identities, never the full raw detail.
+
+### Settle completed work
+
+After completed work, call `t3_thread_settle {"thread_id":"exact-thread-id"}` explicitly. This is the manual T3 UI-equivalent settlement action and is available only when the connected T3 server advertises the native capability. The tool verifies native readback; it does not emulate settlement locally.
+
+Settlement conflicts while a turn is starting or running, approval or user input is pending, or a recent queued turn is present. An already-settled thread succeeds. T3 itself clears any pin and snooze as part of settlement. The thread remains available and is not stopped, deleted, or archived. There is no public unsettle tool.
+
+Thread settlement is distinct from turn-liveness `settled`: the liveness value means the current provider and background work are no longer active, but does not apply the native thread settlement state.
 
 ### Create
 

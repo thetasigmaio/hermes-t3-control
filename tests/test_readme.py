@@ -56,8 +56,8 @@ class ProductDocumentationContractTests(unittest.TestCase):
         self.assertNotIn("## Ten-tool reference", readme)
         self.assertNotIn("## Published asset verification", readme)
         self.assertNotIn("## Development verification", readme)
-        self.assertIn("all ten tools", readme)
-        self.assertNotIn("all ten schemas", readme)
+        self.assertIn("all eleven tools", readme)
+        self.assertNotIn("all eleven schemas", readme)
 
     def test_provider_and_os_matrix_make_only_evidenced_claims(self) -> None:
         readme = _read(README_PATH)
@@ -399,9 +399,9 @@ class ProductDocumentationContractTests(unittest.TestCase):
                     if "enum" in field_schema:
                         self.assertIn(value, field_schema["enum"])
 
-    def test_detailed_tool_reference_matches_the_public_ten_tool_surface(self) -> None:
+    def test_detailed_tool_reference_matches_the_public_eleven_tool_surface(self) -> None:
         tools = _read(TOOLS_PATH)
-        table = tools.split("## Ten tools", 1)[1].split("## Workflows", 1)[0]
+        table = tools.split("## Eleven tools", 1)[1].split("## Workflows", 1)[0]
         documented = tuple(re.findall(r"(?m)^\| `([^`]+)` \|", table))
         self.assertEqual(documented, schemas.TOOL_NAMES)
         for phrase in (
@@ -418,6 +418,17 @@ class ProductDocumentationContractTests(unittest.TestCase):
             "expected-session guard for stop",
             "T3 owns `sourceProposedPlan` provenance",
             "persisted T3 transition",
+            't3_thread_settle {"thread_id":"exact-thread-id"}',
+            "manual T3 UI-equivalent settlement",
+            "native readback",
+            "starting or running",
+            "approval or user input is pending",
+            "recent queued turn",
+            "already-settled thread succeeds",
+            "T3 itself clears any pin and snooze",
+            "not stopped, deleted, or archived",
+            "There is no public unsettle tool",
+            "distinct from turn-liveness `settled`",
             "full-access",
         ):
             self.assertIn(phrase, tools)

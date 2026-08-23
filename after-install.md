@@ -7,7 +7,7 @@ hermes plugins doctor hermes-t3-control --ci
 hermes plugins enable hermes-t3-control --no-allow-tool-override
 ```
 
-Doctor must report 10 tools and 0 hooks. Restart only the process that owns Hermes.
+Doctor must report `registrations: 11 tool(s), 0 hook(s)`. Restart only the process that owns Hermes.
 
 If a managed messaging gateway is the owner:
 

@@ -139,6 +139,16 @@ def projection_responder(shell: dict, detail: dict):
     return responder
 
 
+def settlement_descriptor(*, enabled: bool | None = True) -> dict:
+    descriptor = {
+        "environmentId": "environment-test",
+        "serverVersion": "0.0.34-nightly.20260820.1141",
+    }
+    if enabled is not None:
+        descriptor["capabilities"] = {"threadSettlement": enabled}
+    return descriptor
+
+
 class ReadToolTests(unittest.TestCase):
     def test_threads_and_detail_reads(self) -> None:
         shell = shell_snapshot(sequence=3)
@@ -1059,6 +1069,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 "turn_id": "turn-1",
                 "decision": "accept",
             },
+            "t3_thread_settle": {"thread_id": "thread-1"},
         }
         public_string_paths = {
             (tool_name, (field_name,))
@@ -1093,7 +1104,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             ("t3_thread_wait", ("until",)): "terminal",
             ("t3_thread_respond", ("decision",)): "accept",
         }
-        self.assertEqual(len(public_string_paths), 40)
+        self.assertEqual(len(public_string_paths), 41)
 
         with LoopbackServer([]) as server:
             for tool_name, field_path in sorted(public_string_paths):
@@ -1159,6 +1170,7 @@ class PublicArgumentPreflightTests(unittest.TestCase):
                 "turn_id": "turn-1",
                 "decision": "accept",
             },
+            "t3_thread_settle": {"thread_id": "thread-1"},
         }
         schema_matrix = {
             (tool_name, field_name)
@@ -3634,6 +3646,619 @@ class AgentFacingRespondToolTests(unittest.TestCase):
                     )
                 self.assertEqual(result["error_code"], "conflict")
                 self.assertEqual([request["method"] for request in server.requests], ["GET"])
+
+
+class AgentFacingSettleToolTests(unittest.TestCase):
+    @staticmethod
+    def _settlement_detail(
+        *,
+        sequence: int = 4,
+        settled_override: str | None = None,
+        settled_at: str | None = None,
+        pinned_at: str | None = None,
+        pin_order_key: str | None = None,
+        snoozed_until: str | None = None,
+        snoozed_at: str | None = None,
+        current_session: dict | None = None,
+        messages: list[dict] | None = None,
+        activities: list[dict] | None = None,
+    ) -> dict:
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=sequence,
+                turn=latest_turn(),
+                current_session=(
+                    session(status="ready")
+                    if current_session is None
+                    else current_session
+                ),
+                messages=messages,
+            ),
+            thread_sequence=sequence,
+        )
+        detail["thread"].update(
+            {
+                "settledOverride": settled_override,
+                "settledAt": settled_at,
+                "pinnedAt": pinned_at,
+                "pinOrderKey": pin_order_key,
+                "snoozedUntil": snoozed_until,
+                "snoozedAt": snoozed_at,
+            }
+        )
+        detail["thread"]["activities"] = list(activities or [])
+        return detail
+
+    def _invoke_settle(
+        self,
+        responses: list[Response],
+        *,
+        command_id: str | None = None,
+        transport_kwargs: dict | None = None,
+    ) -> tuple[dict, LoopbackServer]:
+        server = LoopbackServer(responses)  # type: ignore[arg-type]
+        server.__enter__()
+        self.addCleanup(server.__exit__, None, None, None)
+        selected_id = command_id or str(uuid.uuid4())
+        if transport_kwargs is None:
+            patcher = mock.patch.object(
+                tools.T3Client,
+                "new_uuid4",
+                return_value=selected_id,
+            )
+        else:
+            transport = tools.T3Client(
+                server.base_url,
+                server.token,
+                **transport_kwargs,
+            )
+            patcher = mock.patch.object(tools, "_make_client", return_value=transport)
+        with patcher:
+            if transport_kwargs is None:
+                result = invoke(
+                    server,
+                    tools.OPERATIONS["t3_thread_settle"],
+                    {"thread_id": "thread-1"},
+                )
+            else:
+                with mock.patch.object(
+                    tools.T3Client,
+                    "new_uuid4",
+                    return_value=selected_id,
+                ):
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_settle"],
+                        {"thread_id": "thread-1"},
+                    )
+        return result, server
+
+    def test_settle_rejects_missing_or_unknown_public_arguments_without_http(self) -> None:
+        with LoopbackServer([]) as server:
+            for args in ({}, {"thread_id": "thread-1", "unexpected": True}):
+                with self.subTest(fields=tuple(sorted(args))):
+                    result = invoke(
+                        server,
+                        tools.OPERATIONS["t3_thread_settle"],
+                        args,
+                    )
+                    self.assertEqual(result["error_code"], "invalid_input")
+                    self.assertEqual(server.requests, [])
+
+    def test_settle_dispatches_exact_native_command_and_waits_for_companion_clear(self) -> None:
+        command_id = str(uuid.uuid4())
+        settled_at = "2026-08-23T12:00:00Z"
+        before = self._settlement_detail(
+            settled_override="settled",
+            settled_at=settled_at,
+            pinned_at="2026-08-23T11:00:00Z",
+            pin_order_key="0001",
+            snoozed_until="2026-08-24T12:00:00Z",
+            snoozed_at="2026-08-23T11:30:00Z",
+        )
+        still_pinned = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at=settled_at,
+            pinned_at="2026-08-23T11:00:00Z",
+            pin_order_key="0001",
+            snoozed_until="2026-08-24T12:00:00Z",
+            snoozed_at="2026-08-23T11:30:00Z",
+        )
+        cleared = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at=settled_at,
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+                Response(value=still_pinned),
+                Response(value=cleared),
+            ],
+            command_id=command_id,
+        )
+
+        self.assertEqual(
+            [(item["method"], item["path"]) for item in server.requests],
+            [
+                ("GET", "/.well-known/t3/environment"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+                ("POST", "/api/orchestration/dispatch"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+                ("GET", "/api/orchestration/threads/thread-1?turnLimit=150"),
+            ],
+        )
+        command = json.loads(server.requests[2]["body"])
+        self.assertEqual(
+            command,
+            {
+                "type": "thread.settle",
+                "commandId": command_id,
+                "threadId": "thread-1",
+            },
+        )
+        self.assertTrue(uuid.UUID(command["commandId"]).version == 4)
+        encoded_command = json.dumps(command)
+        for forbidden_type in {
+                "thread.session.stop",
+                "thread.delete",
+                "thread.archive",
+                "thread.unpin",
+                "thread.unsnooze",
+        }:
+            self.assertNotIn(forbidden_type, encoded_command)
+        self.assertEqual(
+            set(result),
+            {
+                "ok",
+                "action",
+                "command_id",
+                "thread_id",
+                "dispatch_sequence",
+                "dispatch_attempts",
+                "recovered_after_ambiguous_dispatch",
+                "accepted",
+                "verification",
+                "completed",
+                "settled_override",
+                "settled_at",
+            },
+        )
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(result["command_id"], command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertEqual(result["settled_override"], "settled")
+        self.assertEqual(result["settled_at"], settled_at)
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["verification"], "verified")
+        self.assertNotIn("detail", result)
+        self.assertNotIn("messages", result)
+        self.assertNotIn("activities", result)
+
+    def test_fully_settled_thread_is_a_compact_noop_without_post(self) -> None:
+        settled_at = "2026-08-23T12:00:00Z"
+        settled = self._settlement_detail(
+            settled_override="settled",
+            settled_at=settled_at,
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=settled),
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "ok": True,
+                "action": "thread_already_settled",
+                "command_id": None,
+                "thread_id": "thread-1",
+                "settled_override": "settled",
+                "settled_at": settled_at,
+            },
+        )
+        self.assertEqual(
+            [item["method"] for item in server.requests],
+            ["GET", "GET"],
+        )
+
+    def test_settle_capability_preflight_fails_closed_before_detail_or_post(self) -> None:
+        for enabled in (None, False):
+            with self.subTest(enabled=enabled):
+                result, server = self._invoke_settle(
+                    [Response(value=settlement_descriptor(enabled=enabled))]
+                )
+                self.assertEqual(result["error_code"], "conflict")
+                self.assertEqual(
+                    [(item["method"], item["path"]) for item in server.requests],
+                    [("GET", "/.well-known/t3/environment")],
+                )
+
+    def test_settle_rejects_unsafe_thread_states_without_post(self) -> None:
+        now = datetime.now(timezone.utc)
+        fresh_user_at = (now - timedelta(seconds=30)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        pending_approval = activity(
+            activity_id="approval-open",
+            kind="approval.requested",
+            payload={"requestId": "request-approval"},
+            sequence=1,
+            created_at="2026-08-23T11:00:00Z",
+        )
+        pending_input = activity(
+            activity_id="input-open",
+            kind="user-input.requested",
+            payload={"requestId": "request-input", "questions": []},
+            sequence=1,
+            created_at="2026-08-23T11:00:00Z",
+        )
+        deleted = self._settlement_detail()
+        deleted["thread"]["deletedAt"] = "2026-08-23T11:00:00Z"
+        archived = self._settlement_detail()
+        archived["thread"]["archivedAt"] = "2026-08-23T11:00:00Z"
+        cases = {
+            "deleted": deleted,
+            "archived": archived,
+            "starting_session": self._settlement_detail(
+                current_session=session(status="starting")
+            ),
+            "running_session": self._settlement_detail(
+                current_session=session(status="running", active_turn_id="turn-1")
+            ),
+            "pending_approval": self._settlement_detail(
+                activities=[pending_approval]
+            ),
+            "pending_input": self._settlement_detail(activities=[pending_input]),
+            "queued_turn": self._settlement_detail(
+                messages=[
+                    projected_message(
+                        message_id="queued-user",
+                        role="user",
+                        text="queued work",
+                        turn_id=None,
+                        created_at=fresh_user_at,
+                    )
+                ]
+            ),
+        }
+        for name, detail in cases.items():
+            with self.subTest(state=name):
+                result, server = self._invoke_settle(
+                    [
+                        Response(value=settlement_descriptor()),
+                        Response(value=detail),
+                    ]
+                )
+                self.assertEqual(result["error_code"], "conflict")
+                self.assertEqual(
+                    [item["method"] for item in server.requests],
+                    ["GET", "GET"],
+                )
+                self.assertEqual(
+                    sum(item["method"] == "POST" for item in server.requests),
+                    0,
+                )
+
+    def test_settle_queued_turn_abs_age_includes_exact_boundaries_only(self) -> None:
+        fixed_now = datetime(2026, 8, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+        cases = (
+            ("past_exact_boundary", -120_000, True),
+            ("future_exact_boundary", 120_000, True),
+            ("past_just_outside", -120_001, False),
+            ("future_just_outside", 120_001, False),
+        )
+        for name, offset_milliseconds, queued in cases:
+            with self.subTest(case=name):
+                user_at = (
+                    fixed_now + timedelta(milliseconds=offset_milliseconds)
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                before = self._settlement_detail(
+                    messages=[
+                        projected_message(
+                            message_id=f"user-{name}",
+                            role="user",
+                            text="queued boundary work",
+                            turn_id=None,
+                            created_at=user_at,
+                        )
+                    ]
+                )
+                responses = [
+                    Response(value=settlement_descriptor()),
+                    Response(value=before),
+                ]
+                if not queued:
+                    responses.extend(
+                        [
+                            Response(value={"sequence": 5}),
+                            Response(
+                                value=self._settlement_detail(
+                                    sequence=5,
+                                    settled_override="settled",
+                                    settled_at="2026-08-23T12:00:00Z",
+                                    messages=before["thread"]["messages"],
+                                )
+                            ),
+                        ]
+                    )
+                with mock.patch.object(tools, "datetime", FixedDateTime):
+                    result, server = self._invoke_settle(responses)
+
+                self.assertEqual(
+                    result["error_code"] if queued else result["action"],
+                    "conflict" if queued else "thread_settled",
+                )
+                self.assertEqual(
+                    sum(item["method"] == "POST" for item in server.requests),
+                    0 if queued else 1,
+                )
+
+    def test_settle_post_dispatch_archive_or_delete_is_concurrent_state_change(self) -> None:
+        for field in ("archivedAt", "deletedAt"):
+            with self.subTest(field=field):
+                command_id = str(uuid.uuid4())
+                raced = self._settlement_detail(
+                    sequence=5,
+                    settled_override="settled",
+                    settled_at="2026-08-23T12:00:00Z",
+                )
+                raced["thread"][field] = "2026-08-23T12:00:01Z"
+                result, server = self._invoke_settle(
+                    [
+                        Response(value=settlement_descriptor()),
+                        Response(value=self._settlement_detail()),
+                        Response(value={"sequence": 5}),
+                        Response(value=raced),
+                    ],
+                    command_id=command_id,
+                )
+
+                posts = [
+                    item for item in server.requests if item["method"] == "POST"
+                ]
+                self.assertEqual(len(posts), 1)
+                self.assertEqual(
+                    json.loads(posts[0]["body"]),
+                    {
+                        "type": "thread.settle",
+                        "commandId": command_id,
+                        "threadId": "thread-1",
+                    },
+                )
+                self.assertEqual(result["error_code"], "concurrent_state_change")
+                self.assertTrue(result["outcome_ambiguous"])
+                self.assertEqual(result["command_id"], command_id)
+                self.assertEqual(result["thread_id"], "thread-1")
+                self.assertFalse(result["ok"])
+
+    def test_settle_opaque_500_retries_identical_command_until_accepted_sequence(self) -> None:
+        command_id = str(uuid.uuid4())
+        ambiguous_readback = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+        )
+        accepted_readback = self._settlement_detail(
+            sequence=6,
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=self._settlement_detail()),
+                Response(status=500, value={"opaque": True}),
+                Response(value=ambiguous_readback),
+                Response(value={"sequence": 6}),
+                Response(value=accepted_readback),
+            ],
+            command_id=command_id,
+            transport_kwargs={"retry_backoff": ()},
+        )
+
+        self.assertEqual(
+            [item["method"] for item in server.requests],
+            ["GET", "GET", "POST", "GET", "POST", "GET"],
+        )
+        post_bodies = [
+            item["body"] for item in server.requests if item["method"] == "POST"
+        ]
+        self.assertEqual(len(post_bodies), 2)
+        self.assertEqual(post_bodies[0], post_bodies[1])
+        self.assertEqual(
+            json.loads(post_bodies[0]),
+            {
+                "type": "thread.settle",
+                "commandId": command_id,
+                "threadId": "thread-1",
+            },
+        )
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(result["command_id"], command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertEqual(result["dispatch_sequence"], 6)
+        self.assertEqual(result["dispatch_attempts"], 2)
+        self.assertTrue(result["recovered_after_ambiguous_dispatch"])
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["verification"], "verified")
+
+    def test_settle_request_reducer_clears_resolved_and_stale_requests_by_id(self) -> None:
+        now = datetime.now(timezone.utc)
+        stale_user_at = (now - timedelta(seconds=121)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        activities = [
+            activity(
+                activity_id="approval-requested",
+                kind="approval.requested",
+                payload={"requestId": "approval-shared"},
+                sequence=1,
+                created_at="2026-08-23T11:00:00Z",
+                turn_id="turn-old",
+            ),
+            activity(
+                activity_id="approval-resolved",
+                kind="approval.resolved",
+                payload={"requestId": "approval-shared"},
+                sequence=2,
+                created_at="2026-08-23T11:00:01Z",
+                turn_id="turn-other",
+            ),
+            activity(
+                activity_id="input-requested",
+                kind="user-input.requested",
+                payload={"requestId": "input-shared", "questions": []},
+                sequence=3,
+                created_at="2026-08-23T11:00:02Z",
+                turn_id="turn-old",
+            ),
+            activity(
+                activity_id="input-stale-clear",
+                kind="provider.user-input.respond.failed",
+                payload={
+                    "requestId": "input-shared",
+                    "detail": "stale pending user-input request",
+                },
+                sequence=4,
+                created_at="2026-08-23T11:00:03Z",
+                turn_id=None,
+            ),
+        ]
+        before = self._settlement_detail(
+            messages=[
+                projected_message(
+                    message_id="stale-unlinked-user",
+                    role="user",
+                    text="old queued work",
+                    turn_id=None,
+                    created_at=stale_user_at,
+                )
+            ],
+            activities=activities,
+        )
+        after = self._settlement_detail(
+            sequence=5,
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+            messages=before["thread"]["messages"],
+            activities=activities,
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+                Response(value=after),
+            ]
+        )
+
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(
+            [item["method"] for item in server.requests],
+            ["GET", "GET", "POST", "GET"],
+        )
+
+    def test_settle_recent_unlinked_user_is_not_queued_for_error_session(self) -> None:
+        fresh_user_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=15)
+        ).isoformat().replace("+00:00", "Z")
+        before = self._settlement_detail(
+            current_session=session(status="error"),
+            messages=[
+                projected_message(
+                    message_id="error-session-user",
+                    role="user",
+                    text="failed work",
+                    turn_id=None,
+                    created_at=fresh_user_at,
+                )
+            ],
+        )
+        after = self._settlement_detail(
+            sequence=5,
+            current_session=session(status="error"),
+            settled_override="settled",
+            settled_at="2026-08-23T12:00:00Z",
+            messages=before["thread"]["messages"],
+        )
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+                Response(value=after),
+            ]
+        )
+        self.assertEqual(result["action"], "thread_settled")
+        self.assertEqual(sum(item["method"] == "POST" for item in server.requests), 1)
+
+    def test_settle_accepted_pending_projection_is_compact_and_never_redispatches(self) -> None:
+        before = self._settlement_detail(sequence=4)
+        delayed = self._settlement_detail(sequence=5)
+        command_id = str(uuid.uuid4())
+        result, server = self._invoke_settle(
+            [
+                Response(value=settlement_descriptor()),
+                Response(value=before),
+                Response(value={"sequence": 5}),
+            ]
+            + [Response(value=delayed)] * 12,
+            command_id=command_id,
+            transport_kwargs={
+                "request_timeout": 0.1,
+                "mutation_timeout": 0.08,
+                "mutation_poll_timeout": 0.04,
+                "poll_interval": 0.01,
+                "retry_backoff": (),
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["action"], "thread_settle_accepted_pending_projection"
+        )
+        self.assertEqual(result["command_id"], command_id)
+        self.assertEqual(result["thread_id"], "thread-1")
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["verification"], "accepted_pending_projection")
+        self.assertEqual(result["dispatch_sequence"], 5)
+        self.assertEqual(
+            result["reconciliation"],
+            {
+                "tool": "t3_thread_read",
+                "arguments": {
+                    "thread_id": "thread-1",
+                    "view": "raw",
+                    "turn_limit": 150,
+                },
+                "required_snapshot_sequence": 5,
+            },
+        )
+        self.assertNotIn("detail", result)
+        self.assertNotIn("settled_override", result)
+        self.assertNotIn("settled_at", result)
+        self.assertNotIn("messages", result)
+        self.assertNotIn("activities", result)
+        self.assertEqual(
+            sum(item["method"] == "POST" for item in server.requests),
+            1,
+        )
+        self.assertLess(len(json.dumps(result)), 4_000)
 
 
 class MutationToolTests(unittest.TestCase):
