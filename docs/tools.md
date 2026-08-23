@@ -9,7 +9,7 @@ Hermes T3 Control registers ten synchronous tools in the `t3_control` toolset. E
 | `t3_threads` | Filtered compact summaries by default; bounded explicit `raw` view. |
 | `t3_thread_read` | Exact bounded material summary by default; optional raw page and cursor. |
 | `t3_thread_create` | Create one native thread, optionally with one verified initial turn. |
-| `t3_thread_send` | `reject` is observation-only; explicit `queue` acknowledges start-or-queue. |
+| `t3_thread_send` | Continue unchanged by default, or request one guarded instance/model switch; actual sends require `queue`. |
 | `t3_thread_set_mode` | Set exactly one stored runtime or interaction mode. |
 | `t3_thread_implement_plan` | Verify and implement one stored same-thread plan. |
 | `t3_turn_interrupt` | Best-effort interrupt of the provider session current for the exact thread. |
@@ -52,7 +52,7 @@ Material readback includes project/workspace, title, model and modes, lifecycle,
 
 ### Continue and wait
 
-Sending preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree. It never creates a replacement thread.
+Without an override, sending preserves the stored model selection, model options, runtime mode, interaction mode, project, branch, and worktree exactly as before. To request a same-thread switch, supply `instance_id` and `model` together; optional `model_options` requires that pair. Explicit options replace the target options exactly, including `[]`; omission preserves stored options only when the instance/model pair is unchanged, and otherwise omits options so T3 applies the target defaults. The toolset still contains ten tools: switching is part of `t3_thread_send`, not a separate tool.
 
 Pinned T3 has no atomic idle guard. Therefore the default `busy_policy: reject` is an observation-only check and never dispatches. Every actual send requires `queue`, acknowledging that T3 may start or queue that exact message.
 
@@ -65,6 +65,19 @@ Example for `t3_thread_send`:
   "busy_policy": "queue"
 }
 ```
+
+Changing the selection is stricter than an ordinary queued continuation. It is attempted only when the exact thread is observed `idle`/`ready`, with no active turn, live background work, or pending request. Otherwise `model_switch_busy` is returned before any POST. The safe recovery is `t3_turn_interrupt`, then `t3_thread_wait` until `ready`, then retry the same override. Do not use `t3_session_stop` for switch recovery.
+
+The supported path mirrors T3's two-phase UI sequence:
+
+1. POST `thread.meta.update` with the exact target `modelSelection`, then require exact readback.
+2. Check liveness again, then POST `thread.turn.start` with that same selection and exactly one linked message.
+
+Success requires the original thread, project, branch, and worktree; exact selection and options; exactly one linked message; and `session.providerInstanceId` equal to the target instance. No replacement thread is silently created.
+
+An accepted command whose projection cannot yet prove that complete success returns `ok:false`, `accepted:true`, `completed:false`, and `verification:"accepted_pending_projection"`. Reconcile the named command and snapshot; do not treat that receipt as switch success or dispatch another phase speculatively.
+
+There is no orchestration HTTP provider catalog and no honest remaining-quota preflight. A missing target, different driver, or incompatible continuation becomes authoritative only if T3 projects the turn-start failure. Such failures, a stopped or interrupted thread, or an unrestorable error-state thread are non-retryable `unsupported_model_switch`. Projected quota or usage-limit failures are sanitized to `provider_limit_exhausted`; raw provider error text is never returned.
 
 Command states distinguish `started`, `queued`, `completed`, `blocked`, `error`, and `accepted_pending_projection`. Full-access sends repeat the modification/deletion warning at the action point.
 
