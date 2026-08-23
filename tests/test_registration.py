@@ -24,6 +24,7 @@ EXPECTED_TOOLS = (
     "t3_session_stop",
     "t3_thread_wait",
     "t3_thread_respond",
+    "t3_thread_settle",
 )
 
 RUNTIME_FILES = ("__init__.py", "auth.py", "schemas.py", "tools.py", "client.py")

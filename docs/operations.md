@@ -22,6 +22,7 @@ Run the literal first non-thread-mutating check after restart. Default local aut
 - **Zero/multiple selector matches:** narrow project, workspace, and title filters; do not guess a UUID.
 - **Busy target:** `reject` is non-mutating. Use `queue` only when start-or-queue is acceptable.
 - **Pending approval/input:** exact-read the request and current turn, then answer that exact pair.
+- **Settlement conflict:** wait for starting/running work and any recent queued turn to finish, or answer the pending approval/input, then exact-read before retrying `t3_thread_settle`. An already-settled thread succeeds.
 - **Provider limitation:** check [Compatibility evidence](compatibility.md); a generic model selection is not proof of support.
 
 ## Accepted but not yet projected
@@ -128,4 +129,4 @@ Supported-install CI uses uv 0.12.0 and `uv sync --frozen` against these exact H
 - 0.20.4: `e624e9fde561e1add9388384012b295fde669ade`
 - 0.20.5: `fcbd1076a93841fa88855acce810e342a5b78101`
 
-The fresh-process inspector permits only its expected loopback TCP connection and asserts that the plugin is enabled, manifest v1, version 1.2.1, and exactly ten tools are registered, discoverable, and callable.
+The fresh-process inspector permits only its expected loopback TCP connection and asserts that the plugin is enabled, manifest v1, version 1.2.1, and exactly eleven tools are registered, discoverable, and callable.

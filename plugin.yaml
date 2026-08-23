@@ -19,7 +19,8 @@
     "t3_turn_interrupt",
     "t3_session_stop",
     "t3_thread_wait",
-    "t3_thread_respond"
+    "t3_thread_respond",
+    "t3_thread_settle"
   ],
   "python_dependencies": [],
   "config_schema": {

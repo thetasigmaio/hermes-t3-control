@@ -48,6 +48,7 @@ SESSION_STATUSES = frozenset(
 )
 LATEST_TURN_STATES = frozenset({"running", "interrupted", "completed", "error"})
 BACKGROUND_LIVENESS_STATES = frozenset({"working", "monitoring"})
+SETTLED_OVERRIDES = frozenset({"settled", "active"})
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _BEARER_CREDENTIAL_RE = re.compile(r"[A-Za-z0-9\-._~+/]+={0,}", re.ASCII)
@@ -338,6 +339,14 @@ def validate_environment_descriptor(value: Any) -> dict[str, Any]:
     root = _object(value, "environment")
     _bounded_response_string(root, "environmentId", "environment")
     _bounded_response_string(root, "serverVersion", "environment")
+    if "capabilities" in root:
+        capabilities = _object(root["capabilities"], "environment.capabilities")
+        if "threadSettlement" in capabilities:
+            _boolean(
+                capabilities,
+                "threadSettlement",
+                "environment.capabilities",
+            )
     return root
 
 
@@ -395,9 +404,19 @@ def _validate_thread(value: Any, path: str, *, detail: bool) -> None:
     _nullable_timestamp(thread, "archivedAt", path)
     _timestamp(thread, "createdAt", path)
     _timestamp(thread, "updatedAt", path)
-    for field in ("settledAt", "latestUserMessageAt"):
+    if "settledOverride" in thread and thread["settledOverride"] is not None:
+        _enum(thread, "settledOverride", SETTLED_OVERRIDES, path)
+    for field in (
+        "settledAt",
+        "latestUserMessageAt",
+        "snoozedUntil",
+        "snoozedAt",
+        "pinnedAt",
+    ):
         if field in thread:
             _nullable_timestamp(thread, field, path)
+    if "pinOrderKey" in thread:
+        _nullable_string(thread, "pinOrderKey", path)
     for field in (
         "hasPendingApprovals",
         "hasPendingUserInput",
