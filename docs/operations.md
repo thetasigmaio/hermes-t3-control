@@ -21,14 +21,23 @@ Run the literal first non-thread-mutating check after restart. Default local aut
 - **No T3 connection:** start the matching local T3 environment. Default auth intentionally does not discover remote or hostname-based endpoints.
 - **Zero/multiple selector matches:** narrow project, workspace, and title filters; do not guess a UUID.
 - **Busy target:** `reject` is non-mutating. Use `queue` only when start-or-queue is acceptable.
+- **Busy model switch:** `model_switch_busy` made zero POSTs. Call `t3_turn_interrupt`, wait with `t3_thread_wait` until the thread is `ready`, then retry the override. Never use `t3_session_stop` as switch recovery.
 - **Pending approval/input:** exact-read the request and current turn, then answer that exact pair.
-- **Provider limitation:** check [Compatibility evidence](compatibility.md); a generic model selection is not proof of support.
+- **Unsupported model switch:** stopped, interrupted, or unrestorable error-state threads fail non-retryably. A missing target, different driver, or incompatible continuation is authoritative only after T3 projects that turn-start failure; preflight cannot prove it.
+- **Provider limit:** `provider_limit_exhausted` is a sanitized, command-correlated projection of a quota or usage-limit failure. Exact-read the failed thread before choosing another operator-approved override or waiting for quota recovery. There is no honest remaining-quota preflight and no raw provider error text in the receipt.
+- **Provider limitation:** check [Compatibility evidence](compatibility.md); a generic model selection is not proof of support, and the allowed orchestration HTTP surface exposes no provider catalog.
 
 ## Accepted but not yet projected
 
 `accepted_pending_projection` is not a failure. It includes command/message identity and a bounded raw-read reconciliation recipe with `required_snapshot_sequence` and, for turns, `expected_message_id`. Repeat that exact read until the sequence catches up. Do not send a new command: that can create duplicate work.
 
 `mutation_ambiguous` means the transport failed before acceptance could be established; exact-read before considering a byte-identical same-command retry. `network_error` is a read failure. `conflict` means the target is busy/stale/archived/ambiguous or not in the required state. `auth_cleanup: failed` means the accepted operation remains authoritative while session revocation could not be confirmed.
+
+## Rehome an incompatible continuation
+
+Rehome is an explicit operator workflow, never an automatic fallback from `t3_thread_send`. After the operator approves the target and summary, create a **new Plan-mode** thread on that target with `t3_thread_create`. The initial message may contain only the approved summary of the goal, acceptance criteria, and original thread ID.
+
+Never auto-copy conversation history, tokens, environment or credential paths, logs or raw events, branch, or worktree. Rehome does not further mutate, archive, or delete the original thread; any metadata or turn command already accepted during the failed switch remains authoritative and must be reconciled. Do not dispatch through SQLite, JSONL/event logs, provider-event internals, or another raw/provider-specific path.
 
 ## Update
 

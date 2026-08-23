@@ -96,7 +96,17 @@ class AgentFacingSchemaTests(unittest.TestCase):
         )
 
         send = self.properties("t3_thread_send")
-        self.assertEqual(set(send), {"thread_id", "message", "busy_policy"})
+        self.assertEqual(
+            set(send),
+            {
+                "thread_id",
+                "message",
+                "instance_id",
+                "model",
+                "model_options",
+                "busy_policy",
+            },
+        )
         self.assertEqual(send["busy_policy"]["type"], "string")
         self.assertEqual(send["busy_policy"]["enum"], ["reject", "queue"])
         self.assertEqual(send["busy_policy"]["default"], "reject")
@@ -142,6 +152,18 @@ class AgentFacingSchemaTests(unittest.TestCase):
         self.assertIn(
             "requires instance_id and model",
             create["model_options"]["description"],
+        )
+        send = self.properties("t3_thread_send")
+        self.assertIn("supplied together", send["instance_id"]["description"])
+        self.assertIn("supplied together", send["model"]["description"])
+        self.assertIn(
+            "requires instance_id and model",
+            send["model_options"]["description"],
+        )
+        self.assertEqual(send["model_options"]["maxItems"], 64)
+        self.assertEqual(
+            set(send["model_options"]["items"]["properties"]),
+            {"id", "value"},
         )
 
     def test_respond_schema_is_an_exact_approval_or_user_input_union(self) -> None:
@@ -244,6 +266,8 @@ class AgentFacingSchemaTests(unittest.TestCase):
             ("t3_threads", "properties", "lifecycle"),
             ("t3_thread_read", "properties", "view"),
             ("t3_thread_send", "properties", "busy_policy"),
+            ("t3_thread_send", "properties", "instance_id"),
+            ("t3_thread_send", "properties", "model"),
             ("t3_thread_wait", "properties", "thread_id"),
             ("t3_thread_wait", "properties", "until"),
             ("t3_thread_respond", "properties", "thread_id"),

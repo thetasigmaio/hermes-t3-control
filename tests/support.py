@@ -162,9 +162,12 @@ def proposed_plan(
 
 
 def session(
-    *, status: str = "ready", active_turn_id: str | None = None
+    *,
+    status: str = "ready",
+    active_turn_id: str | None = None,
+    provider_instance_id: str | None = "codex-main",
 ) -> dict[str, Any]:
-    return {
+    value = {
         "threadId": "thread-1",
         "status": status,
         "providerName": "codex",
@@ -173,6 +176,9 @@ def session(
         "lastError": None,
         "updatedAt": NOW,
     }
+    if provider_instance_id is not None:
+        value["providerInstanceId"] = provider_instance_id
+    return value
 
 
 def thread_core(

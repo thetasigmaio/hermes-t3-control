@@ -15,6 +15,7 @@ from typing import Any
 
 try:
     from .client import (
+        ConcurrentStateChangeError,
         ConflictError,
         ConfigurationError,
         INTERACTION_MODES,
@@ -23,9 +24,12 @@ try:
         MAX_IDENTIFIER_CHARS,
         MAX_TITLE_CHARS,
         MAX_TURN_LIMIT,
+        ModelSwitchBusyError,
+        ProviderLimitExhaustedError,
         RUNTIME_MODES,
         T3Client,
         T3ClientError,
+        UnsupportedModelSwitchError,
         is_valid_bearer_credential,
         normalize_message,
         normalize_string,
@@ -33,6 +37,7 @@ try:
     )
 except ImportError:  # Direct repository import used by unit tests.
     from client import (
+        ConcurrentStateChangeError,
         ConflictError,
         ConfigurationError,
         INTERACTION_MODES,
@@ -41,9 +46,12 @@ except ImportError:  # Direct repository import used by unit tests.
         MAX_IDENTIFIER_CHARS,
         MAX_TITLE_CHARS,
         MAX_TURN_LIMIT,
+        ModelSwitchBusyError,
+        ProviderLimitExhaustedError,
         RUNTIME_MODES,
         T3Client,
         T3ClientError,
+        UnsupportedModelSwitchError,
         is_valid_bearer_credential,
         normalize_message,
         normalize_string,
@@ -111,6 +119,39 @@ _MODEL_PROJECTION_PROTECTED_KEYS = frozenset(
 QUEUE_SEMANTICS = (
     "Explicit busy_policy queue acknowledges that T3 may start immediately or queue "
     "the exact persisted message; the server has no atomic idle guard."
+)
+MODEL_SWITCH_RACE_WARNING = (
+    "T3 has no atomic expected-thread-state guard between the final verified readback "
+    "and turn dispatch; exact provenance and command-correlated readback reduce but do "
+    "not eliminate this residual TOCTOU race."
+)
+MODEL_SWITCH_BUSY_RECOVERY = (
+    "Interrupt the active turn, wait until the same thread is ready with no background "
+    "work or pending request, then retry. Never stop the session for this recovery."
+)
+MODEL_SWITCH_NEW_THREAD_RECOVERY = (
+    "Create a new Plan-mode thread in the same project with the target selection and "
+    "provide only an operator-approved summary of the goal, acceptance criteria, and "
+    "original thread ID as its initial message. Do not copy history, tokens, environment "
+    "values, credentials, logs, or raw events; the original thread is not otherwise "
+    "modified by this recovery."
+)
+_MODEL_SWITCH_ERROR_DETAIL_KEYS = frozenset(
+    {
+        "auth_cleanup",
+        "auth_cleanup_warning",
+        "completed_phase",
+        "message_id",
+        "metadata_command_id",
+        "metadata_dispatch_sequence",
+        "queue_semantics",
+        "race_semantics",
+        "race_warning",
+        "recovery",
+        "target_model_selection",
+        "warning",
+        "workflow_phase",
+    }
 )
 RESPONSE_RACE_WARNING = (
     "T3 has no atomic expected-turn guard for pending responses. This best-effort "
@@ -322,11 +363,13 @@ def _build_turn_command(
     text: str,
     *,
     source_plan: dict[str, str] | None = None,
+    message_id: str | None = None,
+    command_id: str | None = None,
 ) -> tuple[dict[str, Any], str]:
-    message_id = transport.new_uuid4()
+    message_id = message_id or transport.new_uuid4()
     command: dict[str, Any] = {
         "type": "thread.turn.start",
-        "commandId": transport.new_uuid4(),
+        "commandId": command_id or transport.new_uuid4(),
         "threadId": thread["id"],
         "message": {
             "messageId": message_id,
@@ -381,8 +424,380 @@ def _turn_observed(
     )
 
 
+def _switch_provenance(thread: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": thread["id"],
+        "projectId": thread["projectId"],
+        "branch": thread["branch"],
+        "worktreePath": thread["worktreePath"],
+    }
+
+
+def _switch_anchor(thread: dict[str, Any]) -> dict[str, Any]:
+    session = thread.get("session")
+    session_anchor = None
+    if isinstance(session, dict):
+        session_anchor = {
+            "status": session["status"],
+            "providerInstanceId": session.get("providerInstanceId"),
+            "runtimeMode": session["runtimeMode"],
+            "activeTurnId": session["activeTurnId"],
+            "lastError": session["lastError"],
+        }
+    return {
+        "provenance": _switch_provenance(thread),
+        "runtimeMode": thread["runtimeMode"],
+        "interactionMode": thread["interactionMode"],
+        "latestTurn": copy.deepcopy(thread.get("latestTurn")),
+        "session": session_anchor,
+        "backgroundLiveness": thread.get("backgroundLiveness"),
+        "hasPendingApprovals": bool(thread.get("hasPendingApprovals", False)),
+        "hasPendingUserInput": bool(thread.get("hasPendingUserInput", False)),
+        "pendingRequests": copy.deepcopy(_pending_requests(thread)),
+        "messages": [
+            {
+                "id": item["id"],
+                "role": item["role"],
+                "text": item["text"],
+                "turnId": item["turnId"],
+            }
+            for item in thread["messages"]
+        ],
+    }
+
+
+def _provider_limit_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.casefold()
+    for separator in ("_", "-", ".", ":"):
+        text = text.replace(separator, " ")
+    text = " ".join(text.split())
+    return any(
+        marker in text
+        for marker in (
+            "quota exceeded",
+            "quota exhausted",
+            "insufficient quota",
+            "quota depleted",
+            "quota reached",
+            "usage limit",
+            "usage exhausted",
+            "usage cap",
+            "usage exceeded",
+            "rate limit",
+            "too many requests",
+            "credits exhausted",
+            "credit exhausted",
+            "insufficient credits",
+            "credits depleted",
+            "credit depleted",
+            "out of credits",
+            "no credits",
+            "credit balance",
+            "resource exhausted",
+        )
+    )
+
+
+def _unsupported_model_switch_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.casefold()
+    for separator in ("_", "-", ".", ":"):
+        text = text.replace(separator, " ")
+    text = " ".join(text.split())
+    return any(
+        marker in text
+        for marker in (
+            "missing provider instance",
+            "unknown provider instance",
+            "provider instance is not configured",
+            "not configured in this build",
+            "provider instance without a provider instance id",
+            "without a provider instance id",
+            "unknown provider driver",
+            "driver is not installed",
+            "different driver",
+            "driver mismatch",
+            "bound to driver",
+            "cannot switch models",
+            "requires a new thread",
+            "start a new thread",
+            "incompatible continuation",
+            "incompatible resume",
+            "resume state is incompatible",
+        )
+    )
+
+
+def _model_switch_recovery(
+    thread: dict[str, Any], target_selection: dict[str, Any]
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "project_id": thread["projectId"],
+        "title": "New thread for selected model",
+        "instance_id": target_selection["instanceId"],
+        "model": target_selection["model"],
+        "interaction_mode": "plan",
+    }
+    if "options" in target_selection:
+        arguments["model_options"] = copy.deepcopy(target_selection["options"])
+    return {
+        "tool": "t3_thread_create",
+        "arguments": arguments,
+        "guidance": MODEL_SWITCH_NEW_THREAD_RECOVERY,
+    }
+
+
+def _require_model_switch_ready(
+    thread: dict[str, Any], target_selection: dict[str, Any]
+) -> None:
+    _ensure_mutable_thread(thread)
+    session = thread.get("session")
+    latest = thread.get("latestTurn")
+    recovery = _model_switch_recovery(thread, target_selection)
+    if not isinstance(session, dict):
+        raise UnsupportedModelSwitchError(details={"recovery": recovery})
+    provider_instance_id = session.get("providerInstanceId")
+    if not isinstance(provider_instance_id, str) or not provider_instance_id:
+        raise UnsupportedModelSwitchError(details={"recovery": recovery})
+    status = session["status"]
+    latest_state = latest.get("state") if isinstance(latest, dict) else None
+    if status in {"stopped", "interrupted", "error"} or latest_state == "interrupted":
+        raise UnsupportedModelSwitchError(details={"recovery": recovery})
+    pending = (
+        bool(thread.get("hasPendingApprovals"))
+        or bool(thread.get("hasPendingUserInput"))
+        or bool(_pending_requests(thread))
+    )
+    busy = (
+        pending
+        or thread.get("backgroundLiveness") in {"working", "monitoring"}
+        or (
+            isinstance(session, dict)
+            and session.get("status") in {"starting", "running"}
+        )
+        or _active_turn_id(thread) is not None
+    )
+    if busy:
+        raise ModelSwitchBusyError(
+            details={
+                "recovery": MODEL_SWITCH_BUSY_RECOVERY,
+                "target_model_selection": copy.deepcopy(target_selection),
+            }
+        )
+    if status not in {"idle", "ready"}:
+        raise UnsupportedModelSwitchError(details={"recovery": recovery})
+
+
+def _switch_message_matches(
+    thread: dict[str, Any], command: dict[str, Any], message_id: str
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in thread["messages"]
+        if item["id"] == message_id
+        and item["role"] == "user"
+        and item["text"] == command["message"]["text"]
+    ]
+
+
+def _switch_turn_state_consistent(
+    latest: dict[str, Any], session: dict[str, Any]
+) -> bool:
+    if latest["state"] == "running":
+        return (
+            session["status"] == "running"
+            and session["activeTurnId"] == latest["turnId"]
+        )
+    if latest["state"] == "completed":
+        return (
+            session["status"] in {"idle", "ready"}
+            and session["activeTurnId"] is None
+        )
+    return False
+
+
+def _walk_string_fields(value: Any, names: frozenset[str]) -> list[str]:
+    values: list[str] = []
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > MAX_MODEL_PROJECTION_DEPTH:
+            continue
+        if isinstance(current, dict):
+            for key, nested in current.items():
+                normalized_key = (
+                    key.replace("_", "").replace("-", "").casefold()
+                    if isinstance(key, str)
+                    else ""
+                )
+                if normalized_key in names and isinstance(nested, str):
+                    values.append(nested)
+                elif isinstance(nested, (dict, list, tuple)):
+                    pending.append((nested, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            pending.extend((nested, depth + 1) for nested in current)
+    return values
+
+
+def _failure_text(value: Any) -> str:
+    parts = _walk_string_fields(
+        value,
+        frozenset(
+            {
+                "error",
+                "message",
+                "detail",
+                "reason",
+                "code",
+                "summary",
+            }
+        ),
+    )
+    return " ".join(parts)
+
+
+def _correlated_start_failure(
+    detail: dict[str, Any], command: dict[str, Any], message_id: str
+) -> T3ClientError | None:
+    thread = detail["thread"]
+    matches = _switch_message_matches(thread, command, message_id)
+    latest = thread.get("latestTurn")
+    if (
+        len(matches) != 1
+        or matches[0]["turnId"] is None
+        or not isinstance(latest, dict)
+        or matches[0]["turnId"] != latest["turnId"]
+    ):
+        return None
+    recovery = _model_switch_recovery(thread, command["modelSelection"])
+    session = thread.get("session")
+    if isinstance(session, dict) and session["status"] in {"stopped", "interrupted"}:
+        return UnsupportedModelSwitchError(details={"recovery": recovery})
+    if latest["state"] == "interrupted":
+        return UnsupportedModelSwitchError(details={"recovery": recovery})
+    command_created_at = _timestamp_value(command["createdAt"])
+    candidates: list[dict[str, Any]] = []
+    for item in thread.get("activities", []):
+        if (
+            item["kind"] != "provider.turn.start.failed"
+            or _timestamp_value(item["createdAt"]) < command_created_at
+        ):
+            continue
+        payload = item["payload"]
+        command_ids = _walk_string_fields(payload, frozenset({"commandid"}))
+        message_ids = _walk_string_fields(payload, frozenset({"messageid"}))
+        if command_ids and command["commandId"] not in command_ids:
+            continue
+        if message_ids and message_id not in message_ids:
+            continue
+        if (
+            not command_ids
+            and not message_ids
+            and not (
+                item.get("turnId") == matches[0]["turnId"]
+                or (
+                    item.get("turnId") is None
+                    and item["createdAt"] == command["createdAt"]
+                )
+            )
+        ):
+            continue
+        candidates.append(item)
+    if (
+        not candidates
+        or not isinstance(session, dict)
+        or session["status"] != "error"
+        or session["activeTurnId"] is not None
+        or session["updatedAt"] != command["createdAt"]
+    ):
+        return None
+    failure = max(candidates, key=_activity_order)
+    error_text = _failure_text(failure["payload"])
+    if _provider_limit_text(error_text):
+        return ProviderLimitExhaustedError(
+            details={
+                "recovery": (
+                    "Exact-read the thread, then choose another operator-approved "
+                    "instance/model override or wait for quota recovery. No remaining-quota "
+                    "preflight is available."
+                ),
+            }
+        )
+    if _unsupported_model_switch_text(error_text):
+        return UnsupportedModelSwitchError(details={"recovery": recovery})
+    return None
+
+
+def _late_old_provider_instance(
+    thread: dict[str, Any], command: dict[str, Any], target_instance_id: str
+) -> bool:
+    created_at = _timestamp_value(command["createdAt"])
+    for item in thread.get("activities", []):
+        if _timestamp_value(item["createdAt"]) < created_at:
+            continue
+        instance_ids = _walk_string_fields(
+            item["payload"], frozenset({"providerinstanceid"})
+        )
+        if any(instance_id != target_instance_id for instance_id in instance_ids):
+            return True
+    return False
+
+
+def _compact_pending_switch_result(
+    result: dict[str, Any],
+    *,
+    action: str,
+    phase: str,
+    previous_selection: dict[str, Any],
+    target_selection: dict[str, Any],
+    metadata_result: dict[str, Any] | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "action": action,
+        "accepted": True,
+        "verification": "accepted_pending_projection",
+        "completed": False,
+        "thread_id": result["thread_id"],
+        "phase": phase,
+        "previous_model_selection": copy.deepcopy(previous_selection),
+        "target_model_selection": copy.deepcopy(target_selection),
+        "reconciliation": copy.deepcopy(result["reconciliation"]),
+        "race_warning": MODEL_SWITCH_RACE_WARNING,
+    }
+    if phase == "metadata":
+        payload["metadata_command_id"] = result["command_id"]
+        payload["metadata_dispatch_sequence"] = result["dispatch_sequence"]
+    else:
+        if metadata_result is None or message_id is None:
+            raise T3ClientError()
+        payload.update(
+            {
+                "metadata_command_id": metadata_result["command_id"],
+                "metadata_dispatch_sequence": metadata_result["dispatch_sequence"],
+                "turn_command_id": result["command_id"],
+                "turn_dispatch_sequence": result["dispatch_sequence"],
+                "message_id": message_id,
+            }
+        )
+    return payload
+
+
 def _annotate_error(exc: T3ClientError, **details: Any) -> T3ClientError:
     exc.details.update(details)
+    return exc
+
+
+def _compact_model_switch_error(exc: T3ClientError) -> T3ClientError:
+    exc.details = {
+        key: copy.deepcopy(value)
+        for key, value in exc.details.items()
+        if key in _MODEL_SWITCH_ERROR_DETAIL_KEYS
+    }
     return exc
 
 
@@ -1352,16 +1767,295 @@ def t3_thread_create(ctx: Any, raw_args: Any) -> dict[str, Any]:
     return _execute_operation(ctx, normalized, perform)
 
 
+def _send_with_model_switch(
+    transport: T3Client,
+    before: dict[str, Any],
+    target_selection: dict[str, Any],
+    text: str,
+) -> dict[str, Any]:
+    stored = before["thread"]
+    previous_selection = copy.deepcopy(stored["modelSelection"])
+    _require_model_switch_ready(stored, target_selection)
+    initial_anchor = _switch_anchor(stored)
+    metadata_command = {
+        "type": "thread.meta.update",
+        "commandId": transport.new_uuid4(),
+        "threadId": stored["id"],
+        "modelSelection": copy.deepcopy(target_selection),
+    }
+
+    def metadata_race_detector(detail: dict[str, Any]) -> bool:
+        thread = detail["thread"]
+        return (
+            detail["snapshotSequence"] < before["snapshotSequence"]
+            or _switch_anchor(thread) != initial_anchor
+            or (
+                thread["modelSelection"] != previous_selection
+                and thread["modelSelection"] != target_selection
+            )
+        )
+
+    def metadata_observed(detail: dict[str, Any]) -> bool:
+        thread = detail["thread"]
+        return (
+            _switch_provenance(thread) == initial_anchor["provenance"]
+            and thread["modelSelection"] == target_selection
+            and thread["runtimeMode"] == initial_anchor["runtimeMode"]
+            and thread["interactionMode"] == initial_anchor["interactionMode"]
+        )
+
+    metadata_result = transport.mutate(
+        stored["id"],
+        metadata_command,
+        metadata_observed,
+        race_detector=metadata_race_detector,
+        require_accepted_sequence=True,
+    )
+    metadata_sequence = metadata_result["dispatch_sequence"]
+    if (
+        not isinstance(metadata_sequence, int)
+        or metadata_sequence <= before["snapshotSequence"]
+    ):
+        raise ConcurrentStateChangeError(
+            command_id=metadata_result["command_id"],
+            thread_id=stored["id"],
+        )
+    if metadata_result["verification"] == "accepted_pending_projection":
+        return _compact_pending_switch_result(
+            metadata_result,
+            action="model_switch_metadata_accepted_pending_projection",
+            phase="metadata",
+            previous_selection=previous_selection,
+            target_selection=target_selection,
+        )
+
+    metadata_detail = metadata_result.get("detail")
+    if not isinstance(metadata_detail, dict):
+        raise T3ClientError()
+    metadata_thread = metadata_detail["thread"]
+    metadata_anchor = _switch_anchor(metadata_thread)
+    message_id = transport.new_uuid4()
+    turn_command_id = transport.new_uuid4()
+    phase_details = {
+        "workflow_phase": "model_switch_turn",
+        "completed_phase": "model_selection_metadata",
+        "metadata_command_id": metadata_result["command_id"],
+        "metadata_dispatch_sequence": metadata_sequence,
+        "target_model_selection": copy.deepcopy(target_selection),
+        "message_id": message_id,
+        "race_warning": MODEL_SWITCH_RACE_WARNING,
+    }
+    try:
+        ready = transport.get_thread(stored["id"], turn_limit=MAX_TURN_LIMIT)
+        ready_thread = ready["thread"]
+        if (
+            ready["snapshotSequence"] < metadata_detail["snapshotSequence"]
+            or _switch_anchor(ready_thread) != metadata_anchor
+            or _switch_provenance(ready_thread) != initial_anchor["provenance"]
+            or ready_thread["modelSelection"] != target_selection
+        ):
+            raise ConcurrentStateChangeError(
+                command_id=metadata_result["command_id"],
+                thread_id=stored["id"],
+            )
+        _require_model_switch_ready(ready_thread, target_selection)
+        turn_command, _ = _build_turn_command(
+            transport,
+            ready_thread,
+            text,
+            message_id=message_id,
+            command_id=turn_command_id,
+        )
+    except T3ClientError as exc:
+        raise _annotate_error(exc, **phase_details)
+    ready_user_messages = {
+        (item["id"], item["text"], item["turnId"])
+        for item in ready_thread["messages"]
+        if item["role"] == "user"
+    }
+    ready_latest = copy.deepcopy(ready_thread.get("latestTurn"))
+
+    def turn_raced(detail: dict[str, Any]) -> bool:
+        thread = detail["thread"]
+        if (
+            detail["snapshotSequence"] < ready["snapshotSequence"]
+            or _switch_provenance(thread) != initial_anchor["provenance"]
+            or thread["modelSelection"] != target_selection
+            or thread["runtimeMode"] != initial_anchor["runtimeMode"]
+            or thread["interactionMode"] != initial_anchor["interactionMode"]
+        ):
+            return True
+        if _late_old_provider_instance(
+            thread, turn_command, target_selection["instanceId"]
+        ):
+            return True
+        matches = _switch_message_matches(thread, turn_command, message_id)
+        unexpected_user_message = any(
+            item["role"] == "user"
+            and item["id"] != message_id
+            and (item["id"], item["text"], item["turnId"])
+            not in ready_user_messages
+            for item in thread["messages"]
+        )
+        if unexpected_user_message:
+            return True
+        if not matches:
+            latest = thread.get("latestTurn")
+            return latest != ready_latest
+        latest = thread.get("latestTurn")
+        if not isinstance(latest, dict) or all(
+            item["turnId"] != latest["turnId"] for item in matches
+        ):
+            return True
+        session = thread.get("session")
+        return (
+            isinstance(session, dict)
+            and session["activeTurnId"] is not None
+            and session["activeTurnId"] != latest["turnId"]
+        )
+
+    def switched_turn_observed(detail: dict[str, Any]) -> bool:
+        thread = detail["thread"]
+        matches = _switch_message_matches(thread, turn_command, message_id)
+        generated_messages = [
+            item for item in thread["messages"] if item["id"] == message_id
+        ]
+        latest = thread.get("latestTurn")
+        session = thread.get("session")
+        return (
+            _switch_provenance(thread) == initial_anchor["provenance"]
+            and thread["modelSelection"] == target_selection
+            and thread["runtimeMode"] == initial_anchor["runtimeMode"]
+            and thread["interactionMode"] == initial_anchor["interactionMode"]
+            and len(generated_messages) == 1
+            and len(matches) == 1
+            and matches[0]["turnId"] is not None
+            and isinstance(latest, dict)
+            and matches[0]["turnId"] == latest["turnId"]
+            and isinstance(session, dict)
+            and session["runtimeMode"] == initial_anchor["runtimeMode"]
+            and session.get("providerInstanceId")
+            == target_selection["instanceId"]
+            and _switch_turn_state_consistent(latest, session)
+        )
+
+    try:
+        turn_result = transport.mutate(
+            stored["id"],
+            turn_command,
+            switched_turn_observed,
+            race_detector=turn_raced,
+            terminal_error_detector=lambda detail: _correlated_start_failure(
+                detail, turn_command, message_id
+            ),
+            require_accepted_sequence=True,
+        )
+    except T3ClientError as exc:
+        raise _annotate_error(exc, **phase_details)
+    turn_sequence = turn_result["dispatch_sequence"]
+    if not isinstance(turn_sequence, int) or turn_sequence <= metadata_sequence:
+        raise ConcurrentStateChangeError(
+            command_id=turn_result["command_id"],
+            thread_id=stored["id"],
+            details=phase_details,
+        )
+    if turn_result["verification"] == "accepted_pending_projection":
+        return _compact_pending_switch_result(
+            turn_result,
+            action="model_switch_turn_accepted_pending_projection",
+            phase="turn",
+            previous_selection=previous_selection,
+            target_selection=target_selection,
+            metadata_result=metadata_result,
+            message_id=message_id,
+        )
+    turn_detail = turn_result.get("detail")
+    if (
+        not isinstance(turn_detail, dict)
+        or turn_detail["snapshotSequence"] < ready["snapshotSequence"]
+    ):
+        raise ConcurrentStateChangeError(
+            command_id=turn_result["command_id"],
+            thread_id=stored["id"],
+            details={
+                "workflow_phase": "model_switch_turn",
+                "completed_phase": "model_selection_metadata",
+                "metadata_command_id": metadata_result["command_id"],
+                "metadata_dispatch_sequence": metadata_sequence,
+                "target_model_selection": copy.deepcopy(target_selection),
+                "message_id": message_id,
+                "race_warning": MODEL_SWITCH_RACE_WARNING,
+            },
+        )
+    observed = turn_detail["thread"]
+    observed_session = observed["session"]
+    observed_turn = observed["latestTurn"]
+    return {
+        "action": "model_switched_and_turn_started",
+        "thread_id": stored["id"],
+        "previous_model_selection": previous_selection,
+        "target_model_selection": copy.deepcopy(target_selection),
+        "metadata_command_id": metadata_result["command_id"],
+        "metadata_dispatch_sequence": metadata_sequence,
+        "turn_command_id": turn_result["command_id"],
+        "turn_dispatch_sequence": turn_sequence,
+        "message_id": message_id,
+        "provider_instance_id": observed_session["providerInstanceId"],
+        "session_state": observed_session["status"],
+        "turn_state": observed_turn["state"],
+        "verification": "verified",
+        "completed": True,
+        "race_warning": MODEL_SWITCH_RACE_WARNING,
+    }
+
+
 def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
     args = _args(
         raw_args,
-        allowed={"thread_id", "message", "busy_policy"},
+        allowed={
+            "thread_id",
+            "message",
+            "instance_id",
+            "model",
+            "model_options",
+            "busy_policy",
+        },
         required={"thread_id", "message"},
     )
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     text = normalize_message(args["message"])
+    has_instance = "instance_id" in args
+    has_model = "model" in args
+    if has_instance != has_model:
+        _invalid("instance_id and model must be supplied together.")
+    if "model_options" in args and not has_instance:
+        _invalid("model_options requires an explicit instance_id and model pair.")
+    explicit_selection: dict[str, Any] | None = None
+    if has_instance:
+        explicit_selection = {
+            "instanceId": normalize_string(
+                args["instance_id"], "instance_id", max_chars=MAX_IDENTIFIER_CHARS
+            ),
+            "model": normalize_string(
+                args["model"], "model", max_chars=MAX_IDENTIFIER_CHARS
+            ),
+        }
+    explicit_options = (
+        _normalize_model_options(args["model_options"])
+        if "model_options" in args
+        else None
+    )
     busy_policy = _enum(args.get("busy_policy", "reject"), "busy_policy", BUSY_POLICIES)
     normalized = {"thread_id": thread_id, "message": text, "busy_policy": busy_policy}
+    if explicit_selection is not None:
+        normalized.update(
+            {
+                "instance_id": explicit_selection["instanceId"],
+                "model": explicit_selection["model"],
+            }
+        )
+        if explicit_options is not None:
+            normalized["model_options"] = explicit_options
 
     def perform(transport: T3Client) -> dict[str, Any]:
         before = transport.get_thread(thread_id, turn_limit=MAX_TURN_LIMIT)
@@ -1384,6 +2078,36 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "start-or-queue semantics."
             )
         warning = FULL_ACCESS_WARNING if stored["runtimeMode"] == "full-access" else None
+        target_selection: dict[str, Any] | None = None
+        if explicit_selection is not None:
+            same_pair = (
+                explicit_selection["instanceId"]
+                == stored["modelSelection"]["instanceId"]
+                and explicit_selection["model"]
+                == stored["modelSelection"]["model"]
+            )
+            target_selection = (
+                copy.deepcopy(stored["modelSelection"])
+                if same_pair and explicit_options is None
+                else copy.deepcopy(explicit_selection)
+            )
+            if explicit_options is not None:
+                target_selection["options"] = copy.deepcopy(explicit_options)
+        if (
+            target_selection is not None
+            and target_selection != stored["modelSelection"]
+        ):
+            try:
+                payload = _send_with_model_switch(
+                    transport, before, target_selection, text
+                )
+            except T3ClientError as exc:
+                if warning is not None:
+                    _annotate_error(exc, warning=warning)
+                raise
+            if warning is not None:
+                payload["warning"] = warning
+            return payload
         try:
             command, message_id = _build_turn_command(transport, stored, text)
 
@@ -1462,7 +2186,12 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             payload["warning"] = warning
         return payload
 
-    return _execute_operation(ctx, normalized, perform)
+    try:
+        return _execute_operation(ctx, normalized, perform)
+    except T3ClientError as exc:
+        if explicit_selection is None:
+            raise
+        raise _compact_model_switch_error(exc)
 
 
 def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
