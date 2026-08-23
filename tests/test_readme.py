@@ -148,7 +148,7 @@ class ProductDocumentationContractTests(unittest.TestCase):
         self.assertIn("Desktop or `hermes serve`", quick)
         self.assertEqual(command_blocks[2], "hermes serve --status")
         self.assertIn("Restart only the process that owns your Hermes session", quick)
-        self.assertEqual(quick.count("registrations: 10 tool(s), 0 hook(s)"), 1)
+        self.assertEqual(quick.count("registrations: 11 tool(s), 0 hook(s)"), 1)
 
     def test_quick_start_failure_paths_do_not_execute_the_installer(self) -> None:
         readme = _read(README_PATH)
