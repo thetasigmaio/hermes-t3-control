@@ -506,7 +506,7 @@ class ProductDocumentationContractTests(unittest.TestCase):
                 "author": "Jakub Sladek",
                 "tags": ["t3", "codex", "orchestration"],
                 "repo": "thetasigmaio/hermes-t3-control",
-                "ref": "8f42cb301fa065465e7d50e04e99577c328717f0",
+                "ref": "f5bf7bf35eaef86dbb1fc34956077ddb3315b5b9",
                 "homepage": "https://github.com/thetasigmaio/hermes-t3-control",
                 "capabilities": ["tools"],
                 "api_version": 1,

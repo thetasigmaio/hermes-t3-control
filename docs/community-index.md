@@ -13,7 +13,7 @@ $ hermes plugins search t3 --json --refresh
 }
 ```
 
-Upstream state as of 2026-08-22:
+Upstream state as of 2026-08-25:
 
 - The documented destination `https://github.com/NousResearch/hermes-plugin-index` is unavailable.
 - `https://github.com/NousResearch/hermes-agent/issues/86154` remains open for the dead index/submission path.
@@ -25,7 +25,7 @@ Do not submit the entry to the non-existent repository or present the unmerged t
 
 ## Prepared entry
 
-[`community-index-entry.json`](community-index-entry.json) is valid schema-v1 entry metadata and pins the current public supported v1.2.0 release commit. It declares only the discovery capability `tools`; the plugin has no hooks, commands, dashboard, or tool overrides.
+[`community-index-entry.json`](community-index-entry.json) is valid schema-v1 entry metadata and pins the current public supported v1.2.2 release commit with its eleven-tool surface. It declares only the discovery capability `tools`; the plugin has no hooks, commands, dashboard, or tool overrides.
 
 When an official target exists:
 
