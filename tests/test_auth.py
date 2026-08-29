@@ -369,6 +369,104 @@ class LocalRuntimeDiscoveryTests(unittest.TestCase):
             process_exe.assert_called_once_with(PID)
             validate.assert_not_called()
 
+    def test_resolves_hashed_wsl_runtime_without_package_json(self) -> None:
+        digest = "sha256-" + ("ab" * 32)
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            write_runtime_fixture(base_dir)
+            hashed = (
+                base_dir
+                / "wsl-runtime"
+                / digest
+                / "apps"
+                / "server"
+                / "dist"
+                / "bin.mjs"
+            )
+            hashed.parent.mkdir(parents=True)
+            hashed.write_text("// hashed runtime\n", encoding="utf-8")
+            node_path = base_dir / "bin" / "node"
+            with mock.patch.object(
+                auth, "_process_uid", return_value=os.getuid()
+            ), mock.patch.object(
+                auth,
+                "_process_argv",
+                return_value=(str(node_path), str(hashed), "--bootstrap-fd", "0"),
+            ), mock.patch.object(auth, "_process_exe", return_value=node_path):
+                resolved = auth.resolve_local_runtime(base_dir)
+
+            self.assertEqual(resolved.cli_path, hashed.resolve(strict=False))
+            self.assertEqual(resolved.server_version, "")
+            self.assertEqual(resolved.environment_id, ENVIRONMENT_ID)
+            self.assertEqual(resolved.origin, ORIGIN)
+            self.assertTrue(
+                auth._environment_matches_runtime(
+                    {
+                        "environmentId": ENVIRONMENT_ID,
+                        "serverVersion": "0.0.37-nightly.20260829.1224",
+                    },
+                    resolved,
+                )
+            )
+            self.assertFalse(
+                auth._environment_matches_runtime(
+                    {
+                        "environmentId": ENVIRONMENT_ID,
+                        "serverVersion": "not a version",
+                    },
+                    resolved,
+                )
+            )
+            self.assertFalse(
+                auth._environment_matches_runtime(
+                    {
+                        "environmentId": "other-environment",
+                        "serverVersion": "0.0.37-nightly.20260829.1224",
+                    },
+                    resolved,
+                )
+            )
+
+    def test_rejects_missing_package_json_outside_hashed_wsl_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            write_runtime_fixture(base_dir)
+            (
+                base_dir
+                / "userdata"
+                / "wsl-server-tree"
+                / SERVER_VERSION
+                / "package.json"
+            ).unlink()
+            with self.assertRaises(client.ConfigurationError):
+                self._resolve_fixture(base_dir)
+
+    def test_rejects_unhashed_wsl_runtime_without_package_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            write_runtime_fixture(base_dir)
+            bogus = (
+                base_dir
+                / "wsl-runtime"
+                / "not-a-digest"
+                / "apps"
+                / "server"
+                / "dist"
+                / "bin.mjs"
+            )
+            bogus.parent.mkdir(parents=True)
+            bogus.write_text("// bogus runtime\n", encoding="utf-8")
+            node_path = base_dir / "bin" / "node"
+            with mock.patch.object(
+                auth, "_process_uid", return_value=os.getuid()
+            ), mock.patch.object(
+                auth,
+                "_process_argv",
+                return_value=(str(node_path), str(bogus), "--bootstrap-fd", "0"),
+            ), mock.patch.object(auth, "_process_exe", return_value=node_path):
+                with self.assertRaises(client.ConfigurationError):
+                    auth.resolve_local_runtime(base_dir)
+
     def test_rejects_non_numeric_loopback_dead_or_foreign_process(self) -> None:
         cases = (
             ("origin", "http://localhost:9137"),

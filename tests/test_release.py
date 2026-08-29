@@ -40,7 +40,7 @@ ARCHIVE_FILES = {
     "schemas.py",
     "tools.py",
 }
-ARCHIVE_NAME = "hermes-t3-control-1.2.2.tar.gz"
+ARCHIVE_NAME = "hermes-t3-control-1.2.3.tar.gz"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
 RELEASE_ARTIFACT_NAMES = (ARCHIVE_NAME, CHECKSUM_NAME)
 ACTION_PINS = {
@@ -95,14 +95,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
-        self.assertEqual(manifest["version"], "1.2.2")
+        self.assertEqual(manifest["version"], "1.2.3")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"],
             "https://github.com/thetasigmaio/hermes-t3-control",
         )
-        self.assertIn("## [1.2.2] - 2026-08-23", changelog)
-        self.assertIn("1.2.2", readme)
+        self.assertIn("## [1.2.3] - 2026-08-30", changelog)
+        self.assertIn("1.2.3", readme)
         self.assertIn("first non-thread-mutating prompt", changelog)
         self.assertIn("MIT", readme)
         self.assertTrue(license_text.startswith("MIT License\n"))
@@ -511,15 +511,15 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         upload = workflow.split("- name: Upload release artifacts", 1)[1]
         self.assertIn("python -B scripts/build_release.py --output-dir dist", workflow)
         self.assertIn(
-            "python -B scripts/verify_release.py dist/hermes-t3-control-1.2.2.tar.gz.sha256",
+            "python -B scripts/verify_release.py dist/hermes-t3-control-1.2.3.tar.gz.sha256",
             workflow,
         )
         paths = re.findall(r"(?m)^            (dist/\S+)$", upload)
         self.assertEqual(
             paths,
             [
-                "dist/hermes-t3-control-1.2.2.tar.gz",
-                "dist/hermes-t3-control-1.2.2.tar.gz.sha256",
+                "dist/hermes-t3-control-1.2.3.tar.gz",
+                "dist/hermes-t3-control-1.2.3.tar.gz.sha256",
             ],
         )
 

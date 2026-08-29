@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 README_PATH = ROOT / "README.md"
 INSTALL_SCRIPT_PATH = ROOT / "scripts" / "install-signed.sh"
 INSTALL_SCRIPT_SHA256 = (
-    "18a98d7c4e247318af8728ecf79f64efd43491fd83faf884636e3119ede944d2"
+    "9400d055d46fda4dc1862752980e065f1bac49d12d13294c8fb06ed6c852c939"
 )
 AFTER_INSTALL_PATH = ROOT / "after-install.md"
 TOOLS_PATH = ROOT / "docs" / "tools.md"
@@ -35,7 +35,7 @@ class ProductDocumentationContractTests(unittest.TestCase):
         readme = _read(README_PATH)
         self.assertLessEqual(len(readme.splitlines()), 170)
         for phrase in (
-            "# Hermes T3 Control 1.2.2",
+            "# Hermes T3 Control 1.2.3",
             "Control T3 work from Hermes",
             "core thread lifecycle is verified end-to-end with Codex",
             "## Compatibility",
@@ -267,12 +267,12 @@ class ProductDocumentationContractTests(unittest.TestCase):
             "protocol.file.allow=never",
             "fetch -q --no-tags",
             "https://github.com/thetasigmaio/hermes-t3-control.git",
-            "refs/tags/v1.2.2:refs/tags/v1.2.2",
+            "refs/tags/v1.2.3:refs/tags/v1.2.3",
             "gpg.format=ssh",
             "gpg.ssh.allowedSignersFile=/dev/null",
-            "verify-tag --raw v1.2.2",
+            "verify-tag --raw v1.2.3",
             "SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4",
-            "rev-parse --verify 'v1.2.2^{}'",
+            "rev-parse --verify 'v1.2.3^{}'",
             "Release tag signature did not match the pinned signer.",
             "grep -Eq '^[0-9a-f]{40}$'",
             "hermes config set plugins.scan_on_install true",
@@ -285,8 +285,8 @@ class ProductDocumentationContractTests(unittest.TestCase):
         ordered_commands = (
             "hermes config path",
             "Install into this Hermes profile? [y/N]",
-            "verify-tag --raw v1.2.2",
-            "rev-parse --verify 'v1.2.2^{}'",
+            "verify-tag --raw v1.2.3",
+            "rev-parse --verify 'v1.2.3^{}'",
             "hermes config set plugins.scan_on_install true",
             "hermes plugins install",
             "hermes plugins doctor",
@@ -487,9 +487,9 @@ class ProductDocumentationContractTests(unittest.TestCase):
         self.assertIn("trap 'rm -rf -- \"$RELEASE_DIR\"' EXIT", block)
         self.assertEqual(block.count("--proto '=https'"), 2)
         self.assertEqual(block.count("--proto-redir '=https'"), 2)
-        self.assertIn("hermes-t3-control-1.2.2.tar.gz.sha256", block)
+        self.assertIn("hermes-t3-control-1.2.3.tar.gz.sha256", block)
         self.assertIn("scripts/verify_release.py", block)
-        self.assertIn("verify-tag --raw v1.2.2", block)
+        self.assertIn("verify-tag --raw v1.2.3", block)
         self.assertIn("SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4", block)
         self.assertIn("scripts/build_release.py", block)
         self.assertIn("cmp --", block)

@@ -2,6 +2,12 @@
 
 All notable changes to Hermes T3 Control are documented in this file.
 
+## [1.2.3] - 2026-08-30
+
+### Fixed
+
+- Discovers T3 0.0.37+ content-hashed WSL runtimes that no longer ship `package.json`, while still failing closed on unversioned trees and malformed live versions.
+
 ## [1.2.2] - 2026-08-23
 
 ### Added
@@ -89,6 +95,7 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Rejects active-token reflection in request targets or mutation data before any HTTP request.
 - Publishes release artifacts through owner-private, inode-bound no-follow staging and rejects unsafe directories, links, or special files.
 
+[1.2.3]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.3
 [1.2.2]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.2
 [1.2.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.1
 [1.2.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.0

@@ -1,4 +1,4 @@
-# Hermes T3 Control 1.2.2
+# Hermes T3 Control 1.2.3
 
 Control T3 work from Hermes without copying tokens or hunting for thread UUIDs. The plugin lets an agent find the right thread, see its latest result, running status, pending questions, and stored plan, continue it safely, and wait for the outcome. The core thread lifecycle is verified end-to-end with Codex.
 
@@ -32,13 +32,13 @@ See [Compatibility evidence](docs/compatibility.md) for the exact provider bound
 
 ## Quick start
 
-Prerequisites: T3 is running, Hermes 0.20.4 or 0.20.5 is available, and Git supports SSH signature verification. The block prints the active Hermes profile for confirmation, verifies the v1.2.2 tag against the pinned release-signing key, installs that exact commit disabled with the scanner on, runs Doctor, and enables without tool override.
+Prerequisites: T3 is running, Hermes 0.20.4 or 0.20.5 is available, and Git supports SSH signature verification. The block prints the active Hermes profile for confirmation, verifies the v1.2.3 tag against the pinned release-signing key, installs that exact commit disabled with the scanner on, runs Doctor, and enables without tool override.
 
 ```bash
 ( git clone --depth 1 https://github.com/thetasigmaio/hermes-t3-control &&
 cd ./hermes-t3-control &&
 SCRIPT=scripts/install-signed.sh && exec 3<"$SCRIPT" && test -f /dev/fd/3 &&
-HASH=18a98d7c4e247318af8728ecf79f64efd43491fd83faf884636e3119ede944d2 &&
+HASH=9400d055d46fda4dc1862752980e065f1bac49d12d13294c8fb06ed6c852c939 &&
 printf '%s  /dev/fd/3\n' "$HASH" | sha256sum -c - && bash /dev/fd/3 )
 ```
 
