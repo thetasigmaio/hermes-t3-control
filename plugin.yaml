@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "api_version": 1,
   "name": "hermes-t3-control",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Control T3 work from Hermes with bounded tools and operation-scoped local authentication; core thread lifecycle verified end-to-end with Codex.",
   "author": "Jakub Sladek",
   "license": "MIT",

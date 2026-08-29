@@ -65,6 +65,7 @@ PROC_ROOT = "/proc/"
 
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9._:-]+", re.ASCII)
 _SAFE_VERSION_RE = re.compile(r"[A-Za-z0-9._+-]+", re.ASCII)
+_HASHED_RUNTIME_DIR_RE = re.compile(r"sha256-[0-9a-f]{64}", re.ASCII)
 _SOCKET_LINK_RE = re.compile(r"socket:\[([0-9]+)\]", re.ASCII)
 
 
@@ -477,10 +478,7 @@ def _validate_unauthenticated_runtime(
 ) -> None:
     _validate_local_runtime_process(runtime, guard)
     descriptor = probe_environment_descriptor(runtime.origin)
-    if (
-        descriptor.get("environmentId") != runtime.environment_id
-        or descriptor.get("serverVersion") != runtime.server_version
-    ):
+    if not _environment_matches_runtime(descriptor, runtime):
         raise _configuration_error("The live T3 environment does not match local metadata.")
     _validate_local_runtime_process(runtime, guard)
 
@@ -591,16 +589,27 @@ def resolve_local_runtime(base_dir: Any = None) -> LocalRuntime:
         raise _configuration_error("The local T3 CLI entrypoint is unavailable.")
 
     package_root = cli_path.parents[3]
-    package = _read_local_json_file(
-        package_root / "package.json", MAX_PACKAGE_JSON_BYTES
+    package_path = package_root / "package.json"
+    hashed_runtime = (
+        package_root.parent.name == "wsl-runtime"
+        and _HASHED_RUNTIME_DIR_RE.fullmatch(package_root.name) is not None
     )
-    if not isinstance(package, dict) or package.get("name") != "t3code-server":
+    if _regular_file(package_path):
+        package = _read_local_json_file(package_path, MAX_PACKAGE_JSON_BYTES)
+        if not isinstance(package, dict) or package.get("name") != "t3code-server":
+            raise _configuration_error("The local T3 CLI package metadata is invalid.")
+        server_version = _bounded_text(
+            package.get("version"), maximum=128, pattern=_SAFE_VERSION_RE
+        )
+        if package_root.name != server_version:
+            raise _configuration_error("The local T3 CLI version metadata is inconsistent.")
+    elif hashed_runtime:
+        # T3 0.0.37+ ships a content-hashed WSL runtime without package.json.
+        # Bind identity to the live process and environment id; accept a
+        # well-formed live serverVersion during later environment matching.
+        server_version = ""
+    else:
         raise _configuration_error("The local T3 CLI package metadata is invalid.")
-    server_version = _bounded_text(
-        package.get("version"), maximum=128, pattern=_SAFE_VERSION_RE
-    )
-    if package_root.name != server_version:
-        raise _configuration_error("The local T3 CLI version metadata is inconsistent.")
 
     try:
         environment_id = _read_local_metadata_file(
@@ -958,13 +967,24 @@ def revoke_local_session(runtime: LocalRuntime, session_id: str) -> None:
         raise _configuration_error("Temporary T3 authentication cleanup was not confirmed.")
 
 
+def _environment_matches_runtime(descriptor: Any, runtime: LocalRuntime) -> bool:
+    if not isinstance(descriptor, dict):
+        return False
+    if descriptor.get("environmentId") != runtime.environment_id:
+        return False
+    live_version = descriptor.get("serverVersion")
+    if runtime.server_version:
+        return live_version == runtime.server_version
+    return (
+        isinstance(live_version, str)
+        and _SAFE_VERSION_RE.fullmatch(live_version) is not None
+        and len(live_version) <= 128
+    )
+
+
 def _validate_runtime_environment(client: T3Client, runtime: LocalRuntime) -> None:
     descriptor = client.get_environment_descriptor()
-    if (
-        not isinstance(descriptor, dict)
-        or descriptor.get("environmentId") != runtime.environment_id
-        or descriptor.get("serverVersion") != runtime.server_version
-    ):
+    if not _environment_matches_runtime(descriptor, runtime):
         raise _configuration_error("The live T3 environment does not match local metadata.")
 
 
