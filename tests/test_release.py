@@ -30,9 +30,14 @@ ARCHIVE_FILES = {
     "after-install.md",
     "auth.py",
     "client.py",
+    "continuation.py",
+    "continuation_cli.py",
+    "continuation_state.py",
+    "continuation_transport.py",
     "docs/community-index-entry.json",
     "docs/community-index.md",
     "docs/compatibility.md",
+    "docs/experimental-continuation.md",
     "docs/operations.md",
     "docs/security.md",
     "docs/tools.md",
@@ -40,9 +45,40 @@ ARCHIVE_FILES = {
     "schemas.py",
     "tools.py",
 }
-ARCHIVE_NAME = "hermes-t3-control-1.2.3.tar.gz"
+ARCHIVE_NAME = "hermes-t3-control-1.3.0.tar.gz"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
-RELEASE_ARTIFACT_NAMES = (ARCHIVE_NAME, CHECKSUM_NAME)
+PATCH_NAME = "hermes-gateway-continuation-1.3.0.patch"
+PATCH_CHECKSUM_NAME = f"{PATCH_NAME}.sha256"
+PATCH_SOURCE = ROOT / "patches" / "hermes-gateway-continuation-63279301.patch"
+SIGNED_MANIFEST = ROOT / "release" / "v1.3.0.sha256"
+UPSTREAM_PATCH_LICENSE = """MIT License
+
+Copyright (c) 2025 Nous Research
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+RELEASE_ARTIFACT_NAMES = (
+    ARCHIVE_NAME,
+    CHECKSUM_NAME,
+    PATCH_NAME,
+    PATCH_CHECKSUM_NAME,
+)
 ACTION_PINS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",
@@ -52,6 +88,7 @@ ACTION_PINS = {
 HERMES_COMMITS = {
     "e624e9fde561e1add9388384012b295fde669ade",
     "fcbd1076a93841fa88855acce810e342a5b78101",
+    "29112bef099274229cadff79cdff7bf7b99c4b77",
 }
 SECRET_LITERAL_RE = re.compile(
     rb"(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|"
@@ -95,14 +132,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
-        self.assertEqual(manifest["version"], "1.2.3")
+        self.assertEqual(manifest["version"], "1.3.0")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"],
             "https://github.com/thetasigmaio/hermes-t3-control",
         )
-        self.assertIn("## [1.2.3] - 2026-08-30", changelog)
-        self.assertIn("1.2.3", readme)
+        self.assertIn("## [1.3.0] - 2026-09-06", changelog)
+        self.assertIn("1.3.0", readme)
         self.assertIn("first non-thread-mutating prompt", changelog)
         self.assertIn("MIT", readme)
         self.assertTrue(license_text.startswith("MIT License\n"))
@@ -131,13 +168,17 @@ class ReleaseMetadataTests(unittest.TestCase):
                 self.assertIn(required, ignore)
 
 class DeterministicArtifactTests(unittest.TestCase):
-    def _build(self, directory: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    def _build(
+        self, directory: pathlib.Path
+    ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
         result = _run(str(BUILD_SCRIPT), "--output-dir", str(directory))
         self.assertEqual(result.returncode, 0, result.stderr)
         archive = directory / ARCHIVE_NAME
         checksum = directory / CHECKSUM_NAME
-        self.assertEqual(set(directory.iterdir()), {archive, checksum})
-        return archive, checksum
+        patch = directory / PATCH_NAME
+        patch_checksum = directory / PATCH_CHECKSUM_NAME
+        self.assertEqual(set(directory.iterdir()), {archive, checksum, patch, patch_checksum})
+        return archive, checksum, patch, patch_checksum
 
     def _assert_rejected_without_residue(
         self, directory: pathlib.Path, artifact: pathlib.Path
@@ -153,6 +194,25 @@ class DeterministicArtifactTests(unittest.TestCase):
             )
         )
         return result
+
+    def test_public_patch_uses_only_the_synthetic_topic_fixture(self) -> None:
+        patch = PATCH_SOURCE.read_text(encoding="utf-8")
+        fixture = patch.split(
+            "test_system_event_accepts_native_default_profile_topic_route", 1
+        )[1].split("@pytest.mark.asyncio", 1)[0]
+        self.assertEqual(re.findall(r'thread_id="([^"]+)"', fixture), ["42"])
+        self.assertEqual(
+            re.findall(r'entry\.session_key == "[^"]+:([^"]+)"', fixture),
+            ["42"],
+        )
+        self.assertEqual(
+            re.findall(r'expected_route\.topic_id == "([^"]+)"', fixture),
+            ["42"],
+        )
+
+    def test_standalone_patch_retains_exact_upstream_mit_notice(self) -> None:
+        patch = PATCH_SOURCE.read_text(encoding="utf-8")
+        self.assertTrue(patch.startswith(f"{UPSTREAM_PATCH_LICENSE}\ndiff --git "))
 
     def test_release_inputs_reject_a_symlinked_parent_directory(self) -> None:
         build = _load_build_module()
@@ -295,11 +355,32 @@ class DeterministicArtifactTests(unittest.TestCase):
     def test_builds_are_byte_identical_and_checksum_is_portable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = pathlib.Path(temporary)
-            first_archive, first_checksum = self._build(base / "first")
-            second_archive, second_checksum = self._build(base / "second")
+            first_archive, first_checksum, first_patch, first_patch_checksum = self._build(base / "first")
+            second_archive, second_checksum, second_patch, second_patch_checksum = self._build(base / "second")
 
             self.assertEqual(first_archive.read_bytes(), second_archive.read_bytes())
             self.assertEqual(first_checksum.read_bytes(), second_checksum.read_bytes())
+            self.assertEqual(first_patch.read_bytes(), second_patch.read_bytes())
+            self.assertEqual(first_patch_checksum.read_bytes(), second_patch_checksum.read_bytes())
+            self.assertEqual(first_patch.read_bytes(), PATCH_SOURCE.read_bytes())
+            self.assertIsNone(SECRET_LITERAL_RE.search(first_patch.read_bytes()))
+            for private_pattern in (
+                rb"codex_[0-9]+x",
+                rb"gpt-[0-9]+\.[0-9]+-[a-z]+",
+                rb"/home/[a-z0-9_-]+/Projects/",
+            ):
+                self.assertIsNone(re.search(private_pattern, first_patch.read_bytes()))
+            patch_digest = hashlib.sha256(first_patch.read_bytes()).hexdigest()
+            self.assertEqual(
+                first_patch_checksum.read_text(encoding="ascii"),
+                f"{patch_digest}  {first_patch.name}\n",
+            )
+            patch_verified = _run(str(VERIFY_SCRIPT), str(first_patch_checksum))
+            self.assertEqual(patch_verified.returncode, 0, patch_verified.stderr)
+            self.assertEqual(
+                SIGNED_MANIFEST.read_bytes(),
+                first_checksum.read_bytes() + first_patch_checksum.read_bytes(),
+            )
             self.assertEqual(first_archive.read_bytes()[4:8], b"\x00\x00\x00\x00")
             digest = hashlib.sha256(first_archive.read_bytes()).hexdigest()
             self.assertEqual(
@@ -312,7 +393,7 @@ class DeterministicArtifactTests(unittest.TestCase):
 
     def test_archive_has_one_safe_allowlisted_root_and_fixed_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            archive, _ = self._build(pathlib.Path(temporary) / "release")
+            archive, _, _, _ = self._build(pathlib.Path(temporary) / "release")
             with tarfile.open(archive, mode="r:gz") as package:
                 members = package.getmembers()
                 names = [member.name for member in members]
@@ -425,7 +506,7 @@ class DeterministicArtifactTests(unittest.TestCase):
     def test_verifier_fails_closed_on_tampering_and_unsafe_checksum_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
-            archive, checksum = self._build(directory)
+            archive, checksum, _, _ = self._build(directory)
             archive.write_bytes(archive.read_bytes() + b"tampered")
             mismatch = _run(str(VERIFY_SCRIPT), str(checksum))
             self.assertNotEqual(mismatch.returncode, 0)
@@ -501,25 +582,37 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
 """
         self.assertEqual(workflow.count(supported_install), 1)
         self.assertNotIn("--force", supported_install)
-        self.assertRegex(workflow, r"(?m)^  package:\n(?:.*\n)*?    needs: \[unit, doctor\]$")
-        self.assertLess(workflow.index("needs: [unit, doctor]"), workflow.index("Upload release artifacts"))
+        gateway = workflow.split("  gateway-patch:", 1)[1].split("  package:", 1)[0]
+        self.assertIn(
+            "uv sync --frozen --project hermes --python 3.11 --extra dev",
+            gateway,
+        )
+        self.assertIn(
+            "uv run --frozen --project hermes --extra dev pytest -q",
+            gateway,
+        )
+        self.assertNotIn("--with pytest", gateway)
+        self.assertRegex(workflow, r"(?m)^  package:\n(?:.*\n)*?    needs: \[unit, doctor, gateway-patch\]$")
+        self.assertLess(workflow.index("needs: [unit, doctor, gateway-patch]"), workflow.index("Upload release artifacts"))
 
-    def test_package_upload_contains_only_archive_and_checksum(self) -> None:
+    def test_package_upload_contains_basic_archive_and_separate_patch(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
         upload = workflow.split("- name: Upload release artifacts", 1)[1]
         self.assertIn("python -B scripts/build_release.py --output-dir dist", workflow)
         self.assertIn(
-            "python -B scripts/verify_release.py dist/hermes-t3-control-1.2.3.tar.gz.sha256",
+            "python -B scripts/verify_release.py dist/hermes-t3-control-1.3.0.tar.gz.sha256",
             workflow,
         )
         paths = re.findall(r"(?m)^            (dist/\S+)$", upload)
         self.assertEqual(
             paths,
             [
-                "dist/hermes-t3-control-1.2.3.tar.gz",
-                "dist/hermes-t3-control-1.2.3.tar.gz.sha256",
+                "dist/hermes-t3-control-1.3.0.tar.gz",
+                "dist/hermes-t3-control-1.3.0.tar.gz.sha256",
+                "dist/hermes-gateway-continuation-1.3.0.patch",
+                "dist/hermes-gateway-continuation-1.3.0.patch.sha256",
             ],
         )
 
@@ -585,7 +678,7 @@ class LiveSmokeContractTests(unittest.TestCase):
         self.assertNotIn(disposable_token, stdout.getvalue())
         self.assertNotIn(sensitive_message, stdout.getvalue())
 
-    def test_missing_isolation_or_solarsim_target_makes_no_client(self) -> None:
+    def test_missing_isolation_or_production_target_makes_no_client(self) -> None:
         smoke = _load_smoke_module()
         disposable_token = secrets.token_hex(24)
         base_environment = {
@@ -598,7 +691,7 @@ class LiveSmokeContractTests(unittest.TestCase):
             {"T3_SMOKE_ISOLATED": "0"},
             {
                 "T3_SMOKE_ISOLATED": "1",
-                "T3_SMOKE_THREAD_ID": "SolarSim-production-thread",
+                "T3_SMOKE_THREAD_ID": "production-application-thread",
             },
         ):
             environment = dict(base_environment)

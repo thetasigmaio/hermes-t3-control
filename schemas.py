@@ -89,23 +89,33 @@ T3_THREAD_READ_SCHEMA = _schema(
 
 T3_THREAD_CREATE_SCHEMA = _schema(
     "t3_thread_create",
-    "Create one T3-native thread, optionally start its first turn after verified readback, and warn when full-access allows trusted provider work to mutate without approval.",
+    "Create one T3-native thread using explicit selection or configured create-only defaults, optionally start its first turn after verified readback, and warn when full-access allows trusted provider work to mutate without approval.",
     {
         "project_id": dict(_ID),
         "title": {"type": "string", "minLength": 1, "maxLength": 512},
         "instance_id": {
             **_ID,
-            "description": "instance_id and model must be supplied together.",
+            "description": (
+                "instance_id requires model; an alias canonicalizes only with the exact "
+                "configured instance, while another complete pair remains literal."
+            ),
         },
         "model": {
             **_ID,
-            "description": "instance_id and model must be supplied together.",
+            "description": (
+                "Without instance_id, model must exactly match the configured canonical "
+                "model or a configured case-insensitive alias. An alias also canonicalizes "
+                "with the exact configured instance; other complete pairs remain literal."
+            ),
         },
         "model_options": {
             "type": "array",
             "items": _MODEL_OPTION,
             "maxItems": 64,
-            "description": "model_options requires instance_id and model.",
+            "description": (
+                "Explicit options replace resolved create options exactly, including an "
+                "empty array; they require an explicit pair or configured create default."
+            ),
         },
         "runtime_mode": dict(_RUNTIME_MODE),
         "interaction_mode": dict(_INTERACTION_MODE),

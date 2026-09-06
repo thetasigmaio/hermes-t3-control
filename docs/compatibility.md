@@ -6,13 +6,21 @@ Support here means a disposable end-to-end provider completion or an exact platf
 
 | Provider | Status | Evidence |
 |---|---|---|
-| Codex | Supported | Published and active-profile disposable E2E on `codex_20x`, `gpt-5.6-sol`, Ultra, and full-access. |
+| Codex | Supported | Published and disposable-instance E2E with explicit model, effort, and access settings. |
 | OpenCode | Not yet supported | The inspected OpenCode instance was disabled and not installed. No authenticated disposable provider completion was available. |
 | Claude, Grok, Cursor, other T3 providers | Not yet supported | No isolated authenticated completion gate was available in the audited T3 environment. |
 
 Historical thread model selections for OpenCode or Grok are not support evidence. They prove only that T3 persisted those selections at some earlier time.
 
+The verified server contract is T3 `0.0.34-nightly.20260820.1141`. Later authentication fixtures match the content-hashed `0.0.37` shape, but this does not establish compatibility with every intermediate or future build. Route, endpoint, and capability mismatches fail closed.
+
 The Codex live gate covered list/filter, exact read, create, idle send, explicit busy queue/reject, bounded wait, mode change, strict Plan to Build provenance, approval response, interrupt, stop, resume, exact message identity, and provider completion. T3 did not expose a synthesizable live user-input request during that run; the typed user-input branch remains contract-tested but not live-provider demonstrated.
+
+## Continuation observer compatibility
+
+The eleven public tools retain their stock-Hermes compatibility when the observer stays at its default disabled setting. The optional observer requires Python `websockets` 15 and the separately published host patch for exact clean upstream commit `63279301bcbdc185c1b07b98a9312eb0c862f26d`. Stock Hermes 0.20.4, 0.20.5, 0.21.0, and current main do not provide its native APIs. See [Experimental continuation](experimental-continuation.md).
+
+The supported T3 boundary is the authenticated, replayable `orchestration.subscribeThread` RPC with a durable numeric sequence cursor and completion marker. A fresh subscription omits `afterSequence` and stores the returned current snapshot only as its baseline; replay gaps may also yield a snapshot. Assistant message and ready events trigger a bounded authenticated exact read, and completion requires a real completed latest turn plus an idle/ready session with no active turn. Every candidate needs a valid source timestamp at or after binding creation. Lightweight polling without the event stream is not the supported continuation path.
 
 ## Tool/provider boundary
 
@@ -20,7 +28,7 @@ The Codex live gate covered list/filter, exact read, create, idle send, explicit
 |---|---|
 | `t3_threads` | Provider-neutral T3 shell projection. |
 | `t3_thread_read` | Provider-neutral exact T3 projection; provider-specific material appears as data. |
-| `t3_thread_create` | Generic model selection, but the named instance/model must exist and start successfully in T3. |
+| `t3_thread_create` | Generic model selection with optional configured create-only pair, aliases, and effort; the resolved instance/model must exist and start successfully in T3. |
 | `t3_thread_send` | Generic turn dispatch; start/queue and completion semantics depend on the provider adapter. |
 | `t3_thread_set_mode` | Persisted by T3; whether a provider honors a mode is provider-specific. |
 | `t3_thread_implement_plan` | Provenance is generic to T3 orchestration; producing a compatible stored proposed plan is provider-specific. |
@@ -30,11 +38,11 @@ The Codex live gate covered list/filter, exact read, create, idle send, explicit
 | `t3_thread_respond` | The canonical request/response envelope is generic; native mapping and behavior are provider-specific. |
 | `t3_thread_settle` | Native manual UI-equivalent T3 mutation, gated by advertised server capability and verified through native readback; distinct from provider turn-liveness. |
 
-The code preserves arbitrary T3 `modelSelection` values and contains no Codex allowlist. That is necessary for portability, but it is not sufficient to claim another provider works.
+The code preserves arbitrary explicit T3 `modelSelection` values and contains no Codex allowlist. Configured aliases resolve model-only shorthand, or the same alias paired with the exact configured instance, to one configured canonical pair. A different explicit instance or an unrelated model remains literal. That is necessary for portability, but it is not sufficient to claim another provider works.
 
 ## Same-thread instance switching
 
-The compatibility claim is deliberately narrow: `codex` and `codex_20x` are compatible for same-driver Codex continuation based on evidence that they use the shared Codex home with an account-specific authentication overlay. This does not establish cross-driver continuation compatibility. Other providers and instance pairs remain unproven and must pass the provider acceptance gate below.
+The compatibility claim is deliberately narrow: two independently authenticated instances of the same Codex driver passed same-driver continuation acceptance. This does not establish cross-driver continuation compatibility. Other providers and instance pairs remain unproven and must pass the provider acceptance gate below.
 
 The orchestration HTTP surface has no provider catalog, so preflight cannot authoritatively prove that a target exists, uses the same driver, or can continue the thread. T3's projected `thread.turn.start` failure is authoritative for a missing target, different driver, or incompatible continuation. These cases are reported as non-retryable `unsupported_model_switch`; projected quota or usage-limit failures are separately sanitized as `provider_limit_exhausted`.
 
@@ -70,4 +78,4 @@ Native Windows or macOS support requires all of the following on a real runner a
 4. One disposable real-provider create/send/wait completion plus exact readback and duplicate prevention.
 5. Deterministic release verification or an explicitly documented build-host boundary when POSIX publishing primitives are unavailable.
 
-This is the acceptance brief for the separate v1.3 portability wave. v1.2.1 does not claim native Windows/macOS or non-Codex provider support.
+This remains the acceptance brief for a future portability wave. No released version claims native Windows/macOS or non-Codex provider support.

@@ -2,6 +2,8 @@
 
 Hermes T3 Control registers eleven synchronous tools in the `t3_control` toolset. Every handler rejects unknown fields, keeps output bounded, and returns JSON with `ok`. Errors also include a stable code, retryability, ambiguity, and safe recovery metadata.
 
+The optional `hermes t3-continuation` operator CLI is not an LLM tool and does not change this eleven-tool surface. It manages exact durable bindings and acknowledgements for the native gateway observer described in [Operations and recovery](operations.md#allowlisted-same-session-continuation).
+
 ## Eleven tools
 
 | Tool | Purpose and important defaults |
@@ -126,7 +128,9 @@ Thread settlement is distinct from turn-liveness `settled`: the liveness value m
 
 ### Create
 
-Create is explicit and is never a fallback from send. Omit `instance_id` and `model` together to use the project's model default. If either is supplied, both are required. Optional branch/worktree values are T3 metadata; the plugin does not create or inspect a checkout.
+Create is explicit and is never a fallback from send. When `default_instance_id` and `default_model` are configured, omitting both call fields uses that pair before the project's model default. A model-only call may use the exact configured canonical model or an entry from `default_model_aliases`; aliases are trimmed and matched case-insensitively. An alias paired with the exact configured instance also resolves to the canonical configured model. The same alias paired with another instance stays literal, as does an unrelated model paired with the configured instance, so those explicit choices are never rerouted. Without a configured pair, omission keeps the legacy project-default behavior, while model-only calls remain invalid. An instance without a model is always invalid.
+
+When the resolved pair matches the configured pair and `model_options` is omitted, `default_reasoning_effort` is sent as the `reasoningEffort` option. Explicit `model_options` replaces the resolved options exactly, including `[]`. Other model pairs never inherit this configured effort. These settings affect creation only; sends and existing threads retain their stored selections. Invalid or partial plugin defaults fail before authentication or any T3 request. Optional branch/worktree values are T3 metadata; the plugin does not create or inspect a checkout.
 
 Example for `t3_thread_create`:
 

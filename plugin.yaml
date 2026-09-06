@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "api_version": 1,
   "name": "hermes-t3-control",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "description": "Control T3 work from Hermes with bounded tools and operation-scoped local authentication; core thread lifecycle verified end-to-end with Codex.",
   "author": "Jakub Sladek",
   "license": "MIT",
@@ -22,7 +22,9 @@
     "t3_thread_respond",
     "t3_thread_settle"
   ],
-  "python_dependencies": [],
+  "python_dependencies": [
+    "websockets>=15,<16"
+  ],
   "config_schema": {
     "auth_mode": {
       "type": "string",
@@ -44,6 +46,59 @@
       "required": false,
       "default": "approval-required",
       "description": "Default runtime mode for newly created threads when the tool call does not supply one."
+    },
+    "default_instance_id": {
+      "type": "string",
+      "required": false,
+      "description": "Optional T3 instance for new-thread defaults. Configure together with default_model; applies only to t3_thread_create."
+    },
+    "default_model": {
+      "type": "string",
+      "required": false,
+      "description": "Optional canonical model for new-thread defaults. Configure together with default_instance_id; applies only to t3_thread_create."
+    },
+    "default_reasoning_effort": {
+      "type": "string",
+      "required": false,
+      "description": "Optional reasoningEffort value added when t3_thread_create resolves the configured model pair and the call omits model_options."
+    },
+    "default_model_aliases": {
+      "type": "array",
+      "required": false,
+      "items": {
+        "type": "string"
+      },
+      "description": "Optional exact case-insensitive shorthand names for t3_thread_create. Aliases resolve with an omitted instance or the exact configured instance; another explicit instance remains literal."
+    },
+    "continuation_enabled": {
+      "type": "boolean",
+      "required": false,
+      "default": false,
+      "description": "Opt in to the default-profile T3 continuation worker. Requires explicit gateway injection permission and at least one operator-created binding."
+    },
+    "continuation_profile": {
+      "type": "string",
+      "required": false,
+      "default": "default",
+      "description": "Exact Hermes profile allowed to own the continuation worker; only default is supported."
+    },
+    "continuation_max_queue_rows": {
+      "type": "integer",
+      "required": false,
+      "default": 128,
+      "description": "Bounded durable queue rows per binding (1-1024)."
+    },
+    "continuation_max_reconnects": {
+      "type": "integer",
+      "required": false,
+      "default": 12,
+      "description": "Bounded consecutive T3 stream reconnect attempts (1-64)."
+    },
+    "continuation_receipt_timeout_seconds": {
+      "type": "number",
+      "required": false,
+      "default": 900,
+      "description": "Bounded wait for the host's terminal internal-event receipt (30-1800 seconds)."
     }
   }
 }

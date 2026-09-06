@@ -35,6 +35,7 @@ REQUEST_TIMEOUT_SECONDS = 10.0
 MUTATION_TIMEOUT_SECONDS = 30.0
 MUTATION_POLL_SECONDS = 15.0
 MAX_DISPATCH_ATTEMPTS = 3
+MAX_WEBSOCKET_TICKET_TTL_SECONDS = 10 * 60
 READ_CHUNK_BYTES = 64 * 1024
 ERROR_VALUE_CHARS = 512
 
@@ -58,6 +59,7 @@ _RFC3339_RE = re.compile(
 )
 _DETAIL_PREFIX = "/api/orchestration/threads/"
 _ENVIRONMENT_DESCRIPTOR_PATH = "/.well-known/t3/environment"
+_WEBSOCKET_TICKET_PATH = "/api/auth/websocket-ticket"
 _PROBE_MARKER = "configured-environment-probe-marker"
 _KNOWN_SERVER_FIELDS = ("code", "reason", "requiredScope", "traceId")
 
@@ -781,6 +783,32 @@ class T3Client:
         value = self._request_json("GET", _ENVIRONMENT_DESCRIPTOR_PATH)
         return validate_environment_descriptor(value)
 
+    def issue_websocket_ticket(self) -> dict[str, str]:
+        """Issue one short-lived ticket through the pinned authenticated transport."""
+        value = self._request_json("POST", _WEBSOCKET_TICKET_PATH)
+        if not isinstance(value, dict):
+            raise ResponseSchemaError("WebSocket ticket response must be an object.")
+        ticket = value.get("ticket")
+        expires_at = value.get("expiresAt")
+        if (
+            not isinstance(ticket, str)
+            or not ticket
+            or len(ticket) > 4096
+            or _CONTROL_RE.search(ticket)
+            or not isinstance(expires_at, str)
+            or not expires_at
+            or len(expires_at) > 128
+            or _CONTROL_RE.search(expires_at)
+        ):
+            raise ResponseSchemaError("WebSocket ticket response is invalid.")
+        _timestamp(value, "expiresAt", "WebSocket ticket response")
+        parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        remaining = (parsed_expiry - datetime.now(parsed_expiry.tzinfo)).total_seconds()
+        if not 0 < remaining <= MAX_WEBSOCKET_TICKET_TTL_SECONDS:
+            raise ResponseSchemaError("WebSocket ticket expiry is invalid.")
+        _reject_active_token(ticket, self.token, "WebSocket ticket")
+        return {"ticket": ticket, "expiresAt": expires_at}
+
     def get_thread(
         self,
         thread_id: Any,
@@ -1357,6 +1385,8 @@ class T3Client:
         if method == "GET" and path == "/api/orchestration/shell":
             return
         if method == "POST" and path == "/api/orchestration/dispatch":
+            return
+        if method == "POST" and path == _WEBSOCKET_TICKET_PATH:
             return
         if method == "GET" and path.startswith(_DETAIL_PREFIX):
             split = urlsplit(path)

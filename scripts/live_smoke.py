@@ -37,7 +37,7 @@ def _required_environment() -> tuple[str, str, str]:
             "Required live-smoke environment is incomplete: " + ", ".join(missing)
         )
     thread_id = os.environ[THREAD_ENV]
-    if "solarsim" in thread_id.casefold():
+    if "production" in thread_id.casefold():
         raise SmokeConfigurationError("The designated thread is not eligible for this smoke gate.")
     return thread_id, os.environ[BASE_URL_ENV], os.environ[TOKEN_ENV]
 

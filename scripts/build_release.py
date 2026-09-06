@@ -19,6 +19,8 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_ROOT = "hermes-t3-control"
+OPTIONAL_PATCH_SOURCE = "patches/hermes-gateway-continuation-63279301.patch"
+OPTIONAL_PATCH_ROOT = "hermes-gateway-continuation"
 RELEASE_FILES = (
     "CHANGELOG.md",
     "LICENSE",
@@ -27,9 +29,14 @@ RELEASE_FILES = (
     "after-install.md",
     "auth.py",
     "client.py",
+    "continuation.py",
+    "continuation_cli.py",
+    "continuation_state.py",
+    "continuation_transport.py",
     "docs/community-index-entry.json",
     "docs/community-index.md",
     "docs/compatibility.md",
+    "docs/experimental-continuation.md",
     "docs/operations.md",
     "docs/security.md",
     "docs/tools.md",
@@ -567,7 +574,7 @@ def _publish_artifacts(
     return resolved_output_dir
 
 
-def build_release(output_dir: Path) -> tuple[Path, Path]:
+def build_release(output_dir: Path) -> tuple[Path, Path, Path, Path]:
     inputs = _release_inputs()
     version = _manifest_version(dict(inputs)["plugin.yaml"])
     archive_name = f"{ARCHIVE_ROOT}-{version}.tar.gz"
@@ -575,14 +582,26 @@ def build_release(output_dir: Path) -> tuple[Path, Path]:
     archive_bytes = _gzip_bytes(_tar_bytes(inputs))
     digest = hashlib.sha256(archive_bytes).hexdigest()
     checksum_bytes = f"{digest}  {archive_name}\n".encode("ascii")
+    patch_name = f"{OPTIONAL_PATCH_ROOT}-{version}.patch"
+    patch_checksum_name = f"{patch_name}.sha256"
+    patch_bytes = _read_release_input(OPTIONAL_PATCH_SOURCE)
+    patch_digest = hashlib.sha256(patch_bytes).hexdigest()
+    patch_checksum_bytes = f"{patch_digest}  {patch_name}\n".encode("ascii")
     resolved_output_dir = _publish_artifacts(
         output_dir,
         (
             (archive_name, archive_bytes),
             (checksum_name, checksum_bytes),
+            (patch_name, patch_bytes),
+            (patch_checksum_name, patch_checksum_bytes),
         ),
     )
-    return resolved_output_dir / archive_name, resolved_output_dir / checksum_name
+    return (
+        resolved_output_dir / archive_name,
+        resolved_output_dir / checksum_name,
+        resolved_output_dir / patch_name,
+        resolved_output_dir / patch_checksum_name,
+    )
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -591,7 +610,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("dist"),
-        help="Directory that receives the archive and detached checksum.",
+        help="Directory that receives the archive, optional patch, and checksums.",
     )
     return parser.parse_args(argv)
 
@@ -599,12 +618,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        archive_path, checksum_path = build_release(args.output_dir)
+        archive_path, checksum_path, patch_path, patch_checksum_path = build_release(
+            args.output_dir
+        )
     except ReleaseBuildError as exc:
         print(f"Release build failed: {exc}", file=sys.stderr)
         return 1
     print(f"Built {archive_path.name}")
     print(f"Wrote {checksum_path.name}")
+    print(f"Built {patch_path.name}")
+    print(f"Wrote {patch_checksum_path.name}")
     return 0
 
 

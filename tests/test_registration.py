@@ -27,7 +27,17 @@ EXPECTED_TOOLS = (
     "t3_thread_settle",
 )
 
-RUNTIME_FILES = ("__init__.py", "auth.py", "schemas.py", "tools.py", "client.py")
+RUNTIME_FILES = (
+    "__init__.py",
+    "auth.py",
+    "schemas.py",
+    "tools.py",
+    "client.py",
+    "continuation.py",
+    "continuation_cli.py",
+    "continuation_state.py",
+    "continuation_transport.py",
+)
 FORBIDDEN_IMPORT_ROOTS = frozenset(
     {
         "pathlib",
@@ -197,10 +207,17 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
         for alias in node.names:
             binding = alias.asname or alias.name.split(".", 1)[0]
             self.aliases[binding] = alias.name if alias.asname else binding
-            if _module_matches(alias.name, FORBIDDEN_IMPORT_ROOTS) and not (
+            allowed = (
                 self.filename == "auth.py"
                 and alias.name in {"pathlib", "subprocess"}
-            ):
+            ) or (
+                self.filename == "continuation_state.py"
+                and alias.name in {"pathlib", "sqlite3"}
+            ) or (
+                self.filename == "continuation_transport.py"
+                and alias.name == "websockets"
+            )
+            if _module_matches(alias.name, FORBIDDEN_IMPORT_ROOTS) and not allowed:
                 self._record(node, f"forbidden import {alias.name}")
             if alias.name == "http.client" and self.filename != "client.py":
                 self._record(node, "HTTP transport outside client.py")
@@ -212,8 +229,15 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
             _module_matches(module, FORBIDDEN_IMPORT_ROOTS)
             or module in {"os", "socket"}
         ) and not (
-            self.filename == "auth.py"
-            and module in {"pathlib", "subprocess"}
+            (self.filename == "auth.py" and module in {"pathlib", "subprocess"})
+            or (
+                self.filename == "continuation_state.py"
+                and module in {"pathlib", "sqlite3", "os"}
+            )
+            or (
+                self.filename == "continuation_transport.py"
+                and module in {"socket", "websockets"}
+            )
         ):
             self._record(node, f"forbidden direct import from {module}")
         if module == "http.client" and self.filename != "client.py":
@@ -277,10 +301,11 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
         name = self._resolve(_dotted_name(node.func))
         final_name = name.rsplit(".", 1)[-1] if name else ""
         if (name == "open" or final_name in FILE_CALLS) and not (
-            self.filename == "auth.py" and name == "os.open"
+            (self.filename == "auth.py" and name == "os.open")
+            or self.filename == "continuation_state.py"
         ):
             self._record(node, "direct file access")
-        if name and name.startswith("socket."):
+        if name and name.startswith("socket.") and self.filename != "continuation_transport.py":
             self._record(node, "direct socket construction")
         if name and (
             name == "os.environ"
@@ -289,7 +314,10 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
             and name.startswith("os.")
         ):
             self._record(node, "direct environment or process access")
-        if name and any(name.startswith(prefix) for prefix in ALTERNATE_NETWORK_PREFIXES):
+        if name and any(name.startswith(prefix) for prefix in ALTERNATE_NETWORK_PREFIXES) and not (
+            self.filename == "continuation_transport.py"
+            and name.startswith(("websocket.", "websockets."))
+        ):
             self._record(node, "alternate network client")
         if name and name.startswith("http.client."):
             allowed = self.filename == "client.py" and final_name in {
@@ -368,7 +396,7 @@ class RegistrationTests(unittest.TestCase):
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual(manifest["api_version"], 1)
-        self.assertEqual(manifest["version"], "1.2.3")
+        self.assertEqual(manifest["version"], "1.3.0")
         self.assertEqual(
             manifest["description"],
             "Control T3 work from Hermes with bounded tools and operation-scoped local authentication; core thread lifecycle verified end-to-end with Codex.",
@@ -378,10 +406,24 @@ class RegistrationTests(unittest.TestCase):
             manifest["homepage"], "https://github.com/thetasigmaio/hermes-t3-control"
         )
         self.assertEqual(tuple(manifest["provides_tools"]), EXPECTED_TOOLS)
-        self.assertEqual(manifest["python_dependencies"], [])
+        self.assertEqual(manifest["python_dependencies"], ["websockets>=15,<16"])
         self.assertEqual(
             set(manifest["config_schema"]),
-            {"auth_mode", "base_url", "t3_base_dir", "default_runtime_mode"},
+            {
+                "auth_mode",
+                "base_url",
+                "t3_base_dir",
+                "default_runtime_mode",
+                "default_instance_id",
+                "default_model",
+                "default_reasoning_effort",
+                "default_model_aliases",
+                "continuation_enabled",
+                "continuation_profile",
+                "continuation_max_queue_rows",
+                "continuation_max_reconnects",
+                "continuation_receipt_timeout_seconds",
+            },
         )
         self.assertEqual(
             manifest["config_schema"]["default_runtime_mode"]["default"],
@@ -390,6 +432,11 @@ class RegistrationTests(unittest.TestCase):
         auth_description = manifest["config_schema"]["auth_mode"]["description"]
         self.assertIn("valid profile token selects external-token", auth_description)
         self.assertIn("invalid token configuration fails closed", auth_description)
+        aliases = manifest["config_schema"]["default_model_aliases"]
+        self.assertEqual(aliases["type"], "array")
+        self.assertEqual(aliases["items"], {"type": "string"})
+        self.assertIn("exact configured instance", aliases["description"])
+        self.assertIn("another explicit instance remains literal", aliases["description"])
         self.assertEqual(manifest.get("requires_env", []), [])
         plugin = load_plugin()
         self.assertEqual(tuple(plugin.TOOL_NAMES), EXPECTED_TOOLS)
@@ -453,6 +500,25 @@ class RegistrationTests(unittest.TestCase):
             runtime_source_violations(intentional_client, "client.py"), []
         )
         self.assertEqual(runtime_source_violations(intentional_resolver, "auth.py"), [])
+        intentional_state = (
+            "import sqlite3\nfrom pathlib import Path\n"
+            "sqlite3.connect(Path('state.db'))\nPath('key').read_bytes()\n"
+        )
+        intentional_stream = (
+            "import socket\nimport websockets\n"
+            "socket.socket()\nwebsockets.connect('ws://127.0.0.1')\n"
+        )
+        self.assertEqual(
+            runtime_source_violations(intentional_state, "continuation_state.py"), []
+        )
+        self.assertEqual(
+            runtime_source_violations(
+                intentional_stream, "continuation_transport.py"
+            ),
+            [],
+        )
+        self.assertTrue(runtime_source_violations(intentional_state, "tools.py"))
+        self.assertTrue(runtime_source_violations(intentional_stream, "client.py"))
         self.assertEqual(runtime_source_violations(inert_text, "tools.py"), [])
 
     def test_runtime_source_policy_rejects_disposable_secret_literal_sentinels(self) -> None:

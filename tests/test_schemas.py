@@ -149,10 +149,11 @@ class AgentFacingSchemaTests(unittest.TestCase):
 
     def test_cross_field_runtime_invariants_are_documented_in_the_public_schema(self) -> None:
         create = self.properties("t3_thread_create")
-        self.assertIn("supplied together", create["instance_id"]["description"])
-        self.assertIn("supplied together", create["model"]["description"])
+        self.assertIn("requires model", create["instance_id"]["description"])
+        self.assertIn("configured canonical model", create["model"]["description"])
+        self.assertIn("case-insensitive alias", create["model"]["description"])
         self.assertIn(
-            "requires instance_id and model",
+            "including an empty array",
             create["model_options"]["description"],
         )
         send = self.properties("t3_thread_send")

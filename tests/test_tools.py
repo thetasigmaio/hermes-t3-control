@@ -30,10 +30,18 @@ class FakeContext:
         *,
         default_runtime_mode: object = None,
         auth_mode: object = "external-token",
+        default_instance_id: object = None,
+        default_model: object = None,
+        default_reasoning_effort: object = None,
+        default_model_aliases: object = None,
     ) -> None:
         self.base_url = base_url
         self.default_runtime_mode = default_runtime_mode
         self.auth_mode = auth_mode
+        self.default_instance_id = default_instance_id
+        self.default_model = default_model
+        self.default_reasoning_effort = default_reasoning_effort
+        self.default_model_aliases = default_model_aliases
 
     def get_config(self, key: str, default: object = None) -> object:
         if key == "base_url":
@@ -42,6 +50,14 @@ class FakeContext:
             return self.default_runtime_mode
         if key == "auth_mode":
             return self.auth_mode
+        if key == "default_instance_id":
+            return self.default_instance_id
+        if key == "default_model":
+            return self.default_model
+        if key == "default_reasoning_effort":
+            return self.default_reasoning_effort
+        if key == "default_model_aliases":
+            return self.default_model_aliases
         return default
 
 
@@ -1516,7 +1532,7 @@ class AgentFacingSendToolTests(unittest.TestCase):
 
 class ModelSwitchSendToolTests(unittest.TestCase):
     SOURCE_SELECTION = {
-        "instanceId": "codex_20x",
+        "instanceId": "codex-secondary",
         "model": "gpt-current",
         "options": [
             {"id": "reasoning_effort", "value": "high"},
@@ -1541,10 +1557,10 @@ class ModelSwitchSendToolTests(unittest.TestCase):
     ) -> dict:
         resolved_session = copy.deepcopy(
             current_session
-            or session(status="ready", provider_instance_id="codex_20x")
+            or session(status="ready", provider_instance_id="codex-secondary")
         )
         if "providerInstanceId" in resolved_session:
-            resolved_session["providerInstanceId"] = "codex_20x"
+            resolved_session["providerInstanceId"] = "codex-secondary"
         detail = detail_snapshot(
             sequence=sequence,
             turn=latest_turn(turn_id="turn-old", state="completed"),
@@ -1697,7 +1713,7 @@ class ModelSwitchSendToolTests(unittest.TestCase):
 
         same_pair, same_commands, _ = self._successful_switch(
             args={
-                "instance_id": "codex_20x",
+                "instance_id": "codex-secondary",
                 "model": "gpt-current",
                 "model_options": [],
             }
@@ -1724,7 +1740,7 @@ class ModelSwitchSendToolTests(unittest.TestCase):
                 current_session=session(
                     status="running",
                     active_turn_id="turn-new",
-                    provider_instance_id="codex_20x",
+                    provider_instance_id="codex-secondary",
                 ),
             )
             after["thread"]["modelSelection"] = copy.deepcopy(
@@ -1733,9 +1749,9 @@ class ModelSwitchSendToolTests(unittest.TestCase):
             return Response(value=after)
 
         for extra in (
-            {"instance_id": "codex_20x", "model": "gpt-current"},
+            {"instance_id": "codex-secondary", "model": "gpt-current"},
             {
-                "instance_id": "codex_20x",
+                "instance_id": "codex-secondary",
                 "model": "gpt-current",
                 "model_options": copy.deepcopy(
                     self.SOURCE_SELECTION["options"]
@@ -4262,6 +4278,17 @@ class AgentFacingSettleToolTests(unittest.TestCase):
 
 
 class MutationToolTests(unittest.TestCase):
+    @staticmethod
+    def configured_create_context(base_url: str, **overrides: object) -> FakeContext:
+        values: dict[str, object] = {
+            "default_instance_id": "codex-secondary",
+            "default_model": "test-model-large",
+            "default_reasoning_effort": "ultra",
+            "default_model_aliases": ["large"],
+        }
+        values.update(overrides)
+        return FakeContext(base_url, **values)
+
     def test_create_uses_project_default_and_exact_native_payload(self) -> None:
         commands: list[dict] = []
 
@@ -4305,6 +4332,304 @@ class MutationToolTests(unittest.TestCase):
         self.assertNotIn("bootstrap", command)
         self.assertEqual(uuid.UUID(command["commandId"]).version, 4)
         self.assertEqual(uuid.UUID(command["threadId"]).version, 4)
+
+    def test_create_configured_default_reaches_create_and_initial_turn(self) -> None:
+        commands: list[dict] = []
+
+        def created_readback(request: dict) -> Response:
+            command = commands[0]
+            detail = detail_snapshot(sequence=1, thread_id=command["threadId"])
+            detail["thread"].update(
+                {
+                    "projectId": command["projectId"],
+                    "title": command["title"],
+                    "modelSelection": copy.deepcopy(command["modelSelection"]),
+                    "runtimeMode": command["runtimeMode"],
+                    "interactionMode": command["interactionMode"],
+                    "branch": command["branch"],
+                    "worktreePath": command["worktreePath"],
+                }
+            )
+            return Response(value=detail)
+
+        def turn_readback(request: dict) -> Response:
+            create_command, turn_command = commands
+            detail = detail_snapshot(
+                sequence=2,
+                thread_id=create_command["threadId"],
+                messages=[
+                    message(
+                        message_id=turn_command["message"]["messageId"],
+                        text=turn_command["message"]["text"],
+                    )
+                ],
+            )
+            detail["thread"].update(
+                {
+                    "projectId": create_command["projectId"],
+                    "title": create_command["title"],
+                    "modelSelection": copy.deepcopy(create_command["modelSelection"]),
+                    "runtimeMode": create_command["runtimeMode"],
+                    "interactionMode": create_command["interactionMode"],
+                    "branch": create_command["branch"],
+                    "worktreePath": create_command["worktreePath"],
+                }
+            )
+            return Response(value=detail)
+
+        with LoopbackServer(
+            [
+                Response(value=shell_snapshot()),
+                captured_dispatch(commands),
+                created_readback,
+                captured_dispatch(commands),
+                turn_readback,
+            ]
+        ) as server:
+            result = invoke(
+                server,
+                tools.t3_thread_create,
+                {
+                    "project_id": "project-1",
+                    "title": "Configured model",
+                    "initial_message": "Start",
+                },
+                context=self.configured_create_context(server.base_url),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [command["type"] for command in commands],
+            ["thread.create", "thread.turn.start"],
+        )
+        expected_selection = {
+            "instanceId": "codex-secondary",
+            "model": "test-model-large",
+            "options": [{"id": "reasoningEffort", "value": "ultra"}],
+        }
+        self.assertEqual(commands[0]["modelSelection"], expected_selection)
+        self.assertEqual(commands[1]["modelSelection"], expected_selection)
+
+        commands = []
+        with LoopbackServer(
+            [
+                Response(value=shell_snapshot()),
+                captured_dispatch(commands),
+                created_readback,
+                captured_dispatch(commands),
+                turn_readback,
+            ]
+        ) as server:
+            alias_result = invoke(
+                server,
+                tools.t3_thread_create,
+                {
+                    "project_id": "project-1",
+                    "title": "Configured model alias",
+                    "instance_id": "codex-secondary",
+                    "model": "  LaRgE  ",
+                    "initial_message": "Start alias",
+                },
+                context=self.configured_create_context(server.base_url),
+            )
+
+        self.assertTrue(alias_result["ok"])
+        self.assertEqual(
+            [command["type"] for command in commands],
+            ["thread.create", "thread.turn.start"],
+        )
+        self.assertEqual(commands[0]["modelSelection"], expected_selection)
+        self.assertEqual(commands[1]["modelSelection"], expected_selection)
+
+    def test_create_model_only_canonical_and_alias_resolve_exact_configured_pair(self) -> None:
+        for supplied_model in ("test-model-large", "  LaRgE  "):
+            with self.subTest(model=supplied_model):
+                commands: list[dict] = []
+
+                def readback(request: dict) -> Response:
+                    command = commands[0]
+                    detail = detail_snapshot(sequence=1, thread_id=command["threadId"])
+                    detail["thread"].update(
+                        {
+                            "projectId": command["projectId"],
+                            "title": command["title"],
+                            "modelSelection": copy.deepcopy(command["modelSelection"]),
+                            "runtimeMode": command["runtimeMode"],
+                            "interactionMode": command["interactionMode"],
+                        }
+                    )
+                    return Response(value=detail)
+
+                with LoopbackServer(
+                    [
+                        Response(value=shell_snapshot()),
+                        captured_dispatch(commands),
+                        readback,
+                    ]
+                ) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_thread_create,
+                        {
+                            "project_id": "project-1",
+                            "title": "Configured shorthand",
+                            "model": supplied_model,
+                        },
+                        context=self.configured_create_context(server.base_url),
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(
+                    commands[0]["modelSelection"],
+                    {
+                        "instanceId": "codex-secondary",
+                        "model": "test-model-large",
+                        "options": [
+                            {"id": "reasoningEffort", "value": "ultra"}
+                        ],
+                    },
+                )
+
+    def test_create_explicit_options_override_config_and_other_pair_stays_literal(self) -> None:
+        cases = (
+            (
+                {
+                    "project_id": "project-1",
+                    "title": "Explicit effort",
+                    "instance_id": "codex-secondary",
+                    "model": " LaRgE ",
+                    "model_options": [
+                        {"id": "reasoningEffort", "value": "xhigh"},
+                        {"id": "web_search", "value": False},
+                    ],
+                },
+                {
+                    "instanceId": "codex-secondary",
+                    "model": "test-model-large",
+                    "options": [
+                        {"id": "reasoningEffort", "value": "xhigh"},
+                        {"id": "web_search", "value": False},
+                    ],
+                },
+            ),
+            (
+                {
+                    "project_id": "project-1",
+                    "title": "Explicit empty options",
+                    "instance_id": "codex-secondary",
+                    "model": "LARGE",
+                    "model_options": [],
+                },
+                {
+                    "instanceId": "codex-secondary",
+                    "model": "test-model-large",
+                    "options": [],
+                },
+            ),
+            (
+                {
+                    "project_id": "project-1",
+                    "title": "Literal other pair",
+                    "instance_id": "other",
+                    "model": "large",
+                },
+                {"instanceId": "other", "model": "large"},
+            ),
+            (
+                {
+                    "project_id": "project-1",
+                    "title": "Literal unrelated model",
+                    "instance_id": "codex-secondary",
+                    "model": "gpt-other",
+                },
+                {"instanceId": "codex-secondary", "model": "gpt-other"},
+            ),
+        )
+        for args, expected_selection in cases:
+            with self.subTest(title=args["title"]):
+                commands: list[dict] = []
+
+                def readback(request: dict) -> Response:
+                    command = commands[0]
+                    detail = detail_snapshot(sequence=1, thread_id=command["threadId"])
+                    detail["thread"].update(
+                        {
+                            "projectId": command["projectId"],
+                            "title": command["title"],
+                            "modelSelection": copy.deepcopy(command["modelSelection"]),
+                            "runtimeMode": command["runtimeMode"],
+                            "interactionMode": command["interactionMode"],
+                        }
+                    )
+                    return Response(value=detail)
+
+                with LoopbackServer(
+                    [
+                        Response(value=shell_snapshot()),
+                        captured_dispatch(commands),
+                        readback,
+                    ]
+                ) as server:
+                    result = invoke(
+                        server,
+                        tools.t3_thread_create,
+                        args,
+                        context=self.configured_create_context(server.base_url),
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(commands[0]["modelSelection"], expected_selection)
+
+    def test_create_invalid_or_incomplete_model_defaults_fail_before_http(self) -> None:
+        invalid_overrides = (
+            {"default_model": None},
+            {
+                "default_instance_id": None,
+                "default_model": None,
+                "default_reasoning_effort": "ultra",
+                "default_model_aliases": None,
+            },
+            {"default_model_aliases": ["large", " LARGE "]},
+            {"default_model_aliases": "large"},
+        )
+        with LoopbackServer([]) as server:
+            for overrides in invalid_overrides:
+                with self.subTest(overrides=overrides):
+                    result = invoke(
+                        server,
+                        tools.t3_thread_create,
+                        {"project_id": "project-1", "title": "Invalid config"},
+                        context=self.configured_create_context(
+                            server.base_url, **overrides
+                        ),
+                    )
+                    self.assertEqual(result["error_code"], "configuration_error")
+            self.assertEqual(server.requests, [])
+
+    def test_create_incomplete_or_unknown_shorthand_stays_invalid_before_http(self) -> None:
+        invalid_args = (
+            {
+                "project_id": "project-1",
+                "title": "Instance only",
+                "instance_id": "codex-secondary",
+            },
+            {
+                "project_id": "project-1",
+                "title": "Unknown model",
+                "model": "gpt-other",
+            },
+        )
+        with LoopbackServer([]) as server:
+            for args in invalid_args:
+                with self.subTest(title=args["title"]):
+                    result = invoke(
+                        server,
+                        tools.t3_thread_create,
+                        args,
+                        context=self.configured_create_context(server.base_url),
+                    )
+                    self.assertEqual(result["error_code"], "invalid_input")
+            self.assertEqual(server.requests, [])
 
     def test_create_explicit_model_pair_and_missing_default_conflict(self) -> None:
         commands: list[dict] = []
