@@ -21,6 +21,8 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_ROOT = "hermes-t3-control"
 OPTIONAL_PATCH_SOURCE = "patches/hermes-gateway-continuation-63279301.patch"
 OPTIONAL_PATCH_ROOT = "hermes-gateway-continuation"
+INSTALLER_SOURCE = "scripts/install-signed.sh"
+INSTALLER_NAME = "install-t3.sh"
 RELEASE_FILES = (
     "CHANGELOG.md",
     "LICENSE",
@@ -574,7 +576,7 @@ def _publish_artifacts(
     return resolved_output_dir
 
 
-def build_release(output_dir: Path) -> tuple[Path, Path, Path, Path]:
+def build_release(output_dir: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
     inputs = _release_inputs()
     version = _manifest_version(dict(inputs)["plugin.yaml"])
     archive_name = f"{ARCHIVE_ROOT}-{version}.tar.gz"
@@ -587,6 +589,12 @@ def build_release(output_dir: Path) -> tuple[Path, Path, Path, Path]:
     patch_bytes = _read_release_input(OPTIONAL_PATCH_SOURCE)
     patch_digest = hashlib.sha256(patch_bytes).hexdigest()
     patch_checksum_bytes = f"{patch_digest}  {patch_name}\n".encode("ascii")
+    installer_bytes = _read_release_input(INSTALLER_SOURCE)
+    installer_checksum_name = f"{INSTALLER_NAME}.sha256"
+    installer_digest = hashlib.sha256(installer_bytes).hexdigest()
+    installer_checksum_bytes = (
+        f"{installer_digest}  {INSTALLER_NAME}\n".encode("ascii")
+    )
     resolved_output_dir = _publish_artifacts(
         output_dir,
         (
@@ -594,6 +602,8 @@ def build_release(output_dir: Path) -> tuple[Path, Path, Path, Path]:
             (checksum_name, checksum_bytes),
             (patch_name, patch_bytes),
             (patch_checksum_name, patch_checksum_bytes),
+            (INSTALLER_NAME, installer_bytes),
+            (installer_checksum_name, installer_checksum_bytes),
         ),
     )
     return (
@@ -601,6 +611,8 @@ def build_release(output_dir: Path) -> tuple[Path, Path, Path, Path]:
         resolved_output_dir / checksum_name,
         resolved_output_dir / patch_name,
         resolved_output_dir / patch_checksum_name,
+        resolved_output_dir / INSTALLER_NAME,
+        resolved_output_dir / installer_checksum_name,
     )
 
 
@@ -610,7 +622,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("dist"),
-        help="Directory that receives the archive, optional patch, and checksums.",
+        help="Directory that receives the archive, installer, optional patch, and checksums.",
     )
     return parser.parse_args(argv)
 
@@ -618,9 +630,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        archive_path, checksum_path, patch_path, patch_checksum_path = build_release(
-            args.output_dir
-        )
+        (
+            archive_path,
+            checksum_path,
+            patch_path,
+            patch_checksum_path,
+            installer_path,
+            installer_checksum_path,
+        ) = build_release(args.output_dir)
     except ReleaseBuildError as exc:
         print(f"Release build failed: {exc}", file=sys.stderr)
         return 1
@@ -628,6 +645,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {checksum_path.name}")
     print(f"Built {patch_path.name}")
     print(f"Wrote {patch_checksum_path.name}")
+    print(f"Built {installer_path.name}")
+    print(f"Wrote {installer_checksum_path.name}")
     return 0
 
 

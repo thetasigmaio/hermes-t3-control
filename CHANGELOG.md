@@ -2,6 +2,13 @@
 
 All notable changes to Hermes T3 Control are documented in this file.
 
+## [1.3.1] - 2026-09-06
+
+### Changed
+
+- Replaced the clone-and-hash onboarding wrapper with a downloadable, readable installer that retains signed-tag verification, profile confirmation, disabled validation, and explicit safe enablement.
+- Published the installer and its detached checksum as deterministic release assets.
+
 ## [1.3.0] - 2026-09-06
 
 ### Added
@@ -113,6 +120,7 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Rejects active-token reflection in request targets or mutation data before any HTTP request.
 - Publishes release artifacts through owner-private, inode-bound no-follow staging and rejects unsafe directories, links, or special files.
 
+[1.3.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.3.1
 [1.3.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.3.0
 [1.2.3]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.3
 [1.2.2]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.2

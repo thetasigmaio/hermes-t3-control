@@ -45,12 +45,15 @@ ARCHIVE_FILES = {
     "schemas.py",
     "tools.py",
 }
-ARCHIVE_NAME = "hermes-t3-control-1.3.0.tar.gz"
+ARCHIVE_NAME = "hermes-t3-control-1.3.1.tar.gz"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
-PATCH_NAME = "hermes-gateway-continuation-1.3.0.patch"
+PATCH_NAME = "hermes-gateway-continuation-1.3.1.patch"
 PATCH_CHECKSUM_NAME = f"{PATCH_NAME}.sha256"
 PATCH_SOURCE = ROOT / "patches" / "hermes-gateway-continuation-63279301.patch"
-SIGNED_MANIFEST = ROOT / "release" / "v1.3.0.sha256"
+INSTALLER_NAME = "install-t3.sh"
+INSTALLER_CHECKSUM_NAME = f"{INSTALLER_NAME}.sha256"
+INSTALLER_SOURCE = ROOT / "scripts" / "install-signed.sh"
+SIGNED_MANIFEST = ROOT / "release" / "v1.3.1.sha256"
 UPSTREAM_PATCH_LICENSE = """MIT License
 
 Copyright (c) 2025 Nous Research
@@ -78,6 +81,8 @@ RELEASE_ARTIFACT_NAMES = (
     CHECKSUM_NAME,
     PATCH_NAME,
     PATCH_CHECKSUM_NAME,
+    INSTALLER_NAME,
+    INSTALLER_CHECKSUM_NAME,
 )
 ACTION_PINS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -132,14 +137,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
-        self.assertEqual(manifest["version"], "1.3.0")
+        self.assertEqual(manifest["version"], "1.3.1")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"],
             "https://github.com/thetasigmaio/hermes-t3-control",
         )
-        self.assertIn("## [1.3.0] - 2026-09-06", changelog)
-        self.assertIn("1.3.0", readme)
+        self.assertIn("## [1.3.1] - 2026-09-06", changelog)
+        self.assertIn("v1.3.1/install-t3.sh", readme)
         self.assertIn("first non-thread-mutating prompt", changelog)
         self.assertIn("MIT", readme)
         self.assertTrue(license_text.startswith("MIT License\n"))
@@ -170,15 +175,27 @@ class ReleaseMetadataTests(unittest.TestCase):
 class DeterministicArtifactTests(unittest.TestCase):
     def _build(
         self, directory: pathlib.Path
-    ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
+    ) -> tuple[
+        pathlib.Path,
+        pathlib.Path,
+        pathlib.Path,
+        pathlib.Path,
+        pathlib.Path,
+        pathlib.Path,
+    ]:
         result = _run(str(BUILD_SCRIPT), "--output-dir", str(directory))
         self.assertEqual(result.returncode, 0, result.stderr)
         archive = directory / ARCHIVE_NAME
         checksum = directory / CHECKSUM_NAME
         patch = directory / PATCH_NAME
         patch_checksum = directory / PATCH_CHECKSUM_NAME
-        self.assertEqual(set(directory.iterdir()), {archive, checksum, patch, patch_checksum})
-        return archive, checksum, patch, patch_checksum
+        installer = directory / INSTALLER_NAME
+        installer_checksum = directory / INSTALLER_CHECKSUM_NAME
+        self.assertEqual(
+            set(directory.iterdir()),
+            {archive, checksum, patch, patch_checksum, installer, installer_checksum},
+        )
+        return archive, checksum, patch, patch_checksum, installer, installer_checksum
 
     def _assert_rejected_without_residue(
         self, directory: pathlib.Path, artifact: pathlib.Path
@@ -355,14 +372,34 @@ class DeterministicArtifactTests(unittest.TestCase):
     def test_builds_are_byte_identical_and_checksum_is_portable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = pathlib.Path(temporary)
-            first_archive, first_checksum, first_patch, first_patch_checksum = self._build(base / "first")
-            second_archive, second_checksum, second_patch, second_patch_checksum = self._build(base / "second")
+            (
+                first_archive,
+                first_checksum,
+                first_patch,
+                first_patch_checksum,
+                first_installer,
+                first_installer_checksum,
+            ) = self._build(base / "first")
+            (
+                second_archive,
+                second_checksum,
+                second_patch,
+                second_patch_checksum,
+                second_installer,
+                second_installer_checksum,
+            ) = self._build(base / "second")
 
             self.assertEqual(first_archive.read_bytes(), second_archive.read_bytes())
             self.assertEqual(first_checksum.read_bytes(), second_checksum.read_bytes())
             self.assertEqual(first_patch.read_bytes(), second_patch.read_bytes())
             self.assertEqual(first_patch_checksum.read_bytes(), second_patch_checksum.read_bytes())
+            self.assertEqual(first_installer.read_bytes(), second_installer.read_bytes())
+            self.assertEqual(
+                first_installer_checksum.read_bytes(),
+                second_installer_checksum.read_bytes(),
+            )
             self.assertEqual(first_patch.read_bytes(), PATCH_SOURCE.read_bytes())
+            self.assertEqual(first_installer.read_bytes(), INSTALLER_SOURCE.read_bytes())
             self.assertIsNone(SECRET_LITERAL_RE.search(first_patch.read_bytes()))
             for private_pattern in (
                 rb"codex_[0-9]+x",
@@ -377,9 +414,22 @@ class DeterministicArtifactTests(unittest.TestCase):
             )
             patch_verified = _run(str(VERIFY_SCRIPT), str(first_patch_checksum))
             self.assertEqual(patch_verified.returncode, 0, patch_verified.stderr)
+            installer_digest = hashlib.sha256(first_installer.read_bytes()).hexdigest()
+            self.assertEqual(
+                first_installer_checksum.read_text(encoding="ascii"),
+                f"{installer_digest}  {first_installer.name}\n",
+            )
+            installer_verified = _run(
+                str(VERIFY_SCRIPT), str(first_installer_checksum)
+            )
+            self.assertEqual(
+                installer_verified.returncode, 0, installer_verified.stderr
+            )
             self.assertEqual(
                 SIGNED_MANIFEST.read_bytes(),
-                first_checksum.read_bytes() + first_patch_checksum.read_bytes(),
+                first_checksum.read_bytes()
+                + first_patch_checksum.read_bytes()
+                + first_installer_checksum.read_bytes(),
             )
             self.assertEqual(first_archive.read_bytes()[4:8], b"\x00\x00\x00\x00")
             digest = hashlib.sha256(first_archive.read_bytes()).hexdigest()
@@ -393,7 +443,9 @@ class DeterministicArtifactTests(unittest.TestCase):
 
     def test_archive_has_one_safe_allowlisted_root_and_fixed_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            archive, _, _, _ = self._build(pathlib.Path(temporary) / "release")
+            archive, _, _, _, _, _ = self._build(
+                pathlib.Path(temporary) / "release"
+            )
             with tarfile.open(archive, mode="r:gz") as package:
                 members = package.getmembers()
                 names = [member.name for member in members]
@@ -506,7 +558,7 @@ class DeterministicArtifactTests(unittest.TestCase):
     def test_verifier_fails_closed_on_tampering_and_unsafe_checksum_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
-            archive, checksum, _, _ = self._build(directory)
+            archive, checksum, _, _, _, _ = self._build(directory)
             archive.write_bytes(archive.read_bytes() + b"tampered")
             mismatch = _run(str(VERIFY_SCRIPT), str(checksum))
             self.assertNotEqual(mismatch.returncode, 0)
@@ -602,17 +654,19 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         upload = workflow.split("- name: Upload release artifacts", 1)[1]
         self.assertIn("python -B scripts/build_release.py --output-dir dist", workflow)
         self.assertIn(
-            "python -B scripts/verify_release.py dist/hermes-t3-control-1.3.0.tar.gz.sha256",
+            "python -B scripts/verify_release.py dist/hermes-t3-control-1.3.1.tar.gz.sha256",
             workflow,
         )
         paths = re.findall(r"(?m)^            (dist/\S+)$", upload)
         self.assertEqual(
             paths,
             [
-                "dist/hermes-t3-control-1.3.0.tar.gz",
-                "dist/hermes-t3-control-1.3.0.tar.gz.sha256",
-                "dist/hermes-gateway-continuation-1.3.0.patch",
-                "dist/hermes-gateway-continuation-1.3.0.patch.sha256",
+                "dist/hermes-t3-control-1.3.1.tar.gz",
+                "dist/hermes-t3-control-1.3.1.tar.gz.sha256",
+                "dist/hermes-gateway-continuation-1.3.1.patch",
+                "dist/hermes-gateway-continuation-1.3.1.patch.sha256",
+                "dist/install-t3.sh",
+                "dist/install-t3.sh.sha256",
             ],
         )
 

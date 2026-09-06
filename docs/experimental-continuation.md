@@ -29,32 +29,34 @@ The detached checksum detects corruption but is not an authenticity proof by its
   safe_git -C "$RELEASE_DIR/repo" init -q
   safe_git -C "$RELEASE_DIR/repo" -c protocol.file.allow=never fetch -q \
     --no-tags https://github.com/thetasigmaio/hermes-t3-control.git \
-    'refs/tags/v1.3.0:refs/tags/v1.3.0'
+    'refs/tags/v1.3.1:refs/tags/v1.3.1'
+  test "$(safe_git -C "$RELEASE_DIR/repo" cat-file -t refs/tags/v1.3.1)" = tag
+  test "$(safe_git -C "$RELEASE_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.3.1)" = v1.3.1
   TAG_VERIFY="$(safe_git -C "$RELEASE_DIR/repo" -c gpg.format=ssh \
-    -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.3.0 2>&1 || true)"
+    -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.3.1 2>&1 || true)"
   if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
     printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
     exit 1
   fi
-  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.3.0^{}')"
+  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.3.1^{commit}')"
   printf '%s\n' "$RELEASE_REF" | grep -Eq '^[0-9a-f]{40}$'
   safe_git -C "$RELEASE_DIR/repo" checkout -q --detach "$RELEASE_REF"
   safe_git -C "$RELEASE_DIR/repo" show \
-    "$RELEASE_REF:release/v1.3.0.sha256" > "$RELEASE_DIR/authenticated.sha256"
+    "$RELEASE_REF:release/v1.3.1.sha256" > "$RELEASE_DIR/authenticated.sha256"
   curl --fail --silent --show-error --location --proto '=https' \
-    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.3.0.patch" \
-    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.3.0/hermes-gateway-continuation-1.3.0.patch
+    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.3.1.patch" \
+    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.3.1/hermes-gateway-continuation-1.3.1.patch
   curl --fail --silent --show-error --location --proto '=https' \
-    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.3.0.patch.sha256" \
-    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.3.0/hermes-gateway-continuation-1.3.0.patch.sha256
-  grep '  hermes-gateway-continuation-1.3.0.patch$' \
+    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.3.1.patch.sha256" \
+    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.3.1/hermes-gateway-continuation-1.3.1.patch.sha256
+  grep '  hermes-gateway-continuation-1.3.1.patch$' \
     "$RELEASE_DIR/authenticated.sha256" > "$RELEASE_DIR/expected.sha256"
-  cmp -- "$RELEASE_DIR/expected.sha256" "$RELEASE_DIR/hermes-gateway-continuation-1.3.0.patch.sha256"
+  cmp -- "$RELEASE_DIR/expected.sha256" "$RELEASE_DIR/hermes-gateway-continuation-1.3.1.patch.sha256"
   (cd "$RELEASE_DIR" && sha256sum -c expected.sha256)
   safe_git -C "$RELEASE_DIR/repo" show \
     "$RELEASE_REF:patches/hermes-gateway-continuation-63279301.patch" \
-    | cmp - "$RELEASE_DIR/hermes-gateway-continuation-1.3.0.patch"
-  cp "$RELEASE_DIR/hermes-gateway-continuation-1.3.0.patch" ./hermes-gateway-continuation-1.3.0.patch
+    | cmp - "$RELEASE_DIR/hermes-gateway-continuation-1.3.1.patch"
+  cp "$RELEASE_DIR/hermes-gateway-continuation-1.3.1.patch" ./hermes-gateway-continuation-1.3.1.patch
 )
 ```
 
@@ -70,8 +72,8 @@ cd hermes-continuation
 git checkout --detach 63279301bcbdc185c1b07b98a9312eb0c862f26d
 test "$(git rev-parse HEAD)" = 63279301bcbdc185c1b07b98a9312eb0c862f26d
 test -z "$(git status --porcelain)"
-git apply --check ../hermes-gateway-continuation-1.3.0.patch
-git apply ../hermes-gateway-continuation-1.3.0.patch
+git apply --check ../hermes-gateway-continuation-1.3.1.patch
+git apply ../hermes-gateway-continuation-1.3.1.patch
 git diff --check
 uv sync --frozen --python 3.11 --extra dev
 uv run --frozen --extra dev pytest -q \
@@ -137,8 +139,8 @@ Upgrading from older live code still requires a coordinated reload or restart of
 Stop the owning Hermes process. From the same patched checkout, require the patch to reverse cleanly, reverse it, and confirm the exact upstream state:
 
 ```bash
-git apply --reverse --check ../hermes-gateway-continuation-1.3.0.patch
-git apply --reverse ../hermes-gateway-continuation-1.3.0.patch
+git apply --reverse --check ../hermes-gateway-continuation-1.3.1.patch
+git apply --reverse ../hermes-gateway-continuation-1.3.1.patch
 git diff --check
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = 63279301bcbdc185c1b07b98a9312eb0c862f26d
