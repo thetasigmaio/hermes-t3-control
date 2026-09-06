@@ -135,18 +135,22 @@ jobs:
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
         run: |
-          python -B scripts/verify_release.py dist/hermes-t3-control-1.3.0.tar.gz.sha256
-          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.3.0.patch.sha256
-          grep '  hermes-t3-control-1.3.0.tar.gz$' release/v1.3.0.sha256 | cmp - dist/hermes-t3-control-1.3.0.tar.gz.sha256
-          grep '  hermes-gateway-continuation-1.3.0.patch$' release/v1.3.0.sha256 | cmp - dist/hermes-gateway-continuation-1.3.0.patch.sha256
+          python -B scripts/verify_release.py dist/hermes-t3-control-1.3.1.tar.gz.sha256
+          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.3.1.patch.sha256
+          python -B scripts/verify_release.py dist/install-t3.sh.sha256
+          grep '  hermes-t3-control-1.3.1.tar.gz$' release/v1.3.1.sha256 | cmp - dist/hermes-t3-control-1.3.1.tar.gz.sha256
+          grep '  hermes-gateway-continuation-1.3.1.patch$' release/v1.3.1.sha256 | cmp - dist/hermes-gateway-continuation-1.3.1.patch.sha256
+          grep '  install-t3.sh$' release/v1.3.1.sha256 | cmp - dist/install-t3.sh.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.3.0
+          name: hermes-t3-control-1.3.1
           path: |
-            dist/hermes-t3-control-1.3.0.tar.gz
-            dist/hermes-t3-control-1.3.0.tar.gz.sha256
-            dist/hermes-gateway-continuation-1.3.0.patch
-            dist/hermes-gateway-continuation-1.3.0.patch.sha256
+            dist/hermes-t3-control-1.3.1.tar.gz
+            dist/hermes-t3-control-1.3.1.tar.gz.sha256
+            dist/hermes-gateway-continuation-1.3.1.patch
+            dist/hermes-gateway-continuation-1.3.1.patch.sha256
+            dist/install-t3.sh
+            dist/install-t3.sh.sha256
           if-no-files-found: error
           retention-days: 14
