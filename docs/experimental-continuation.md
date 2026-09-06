@@ -73,8 +73,8 @@ test -z "$(git status --porcelain)"
 git apply --check ../hermes-gateway-continuation-1.3.0.patch
 git apply ../hermes-gateway-continuation-1.3.0.patch
 git diff --check
-uv sync --frozen --python 3.11
-uv run --frozen pytest -q \
+uv sync --frozen --python 3.11 --extra dev
+uv run --frozen --extra dev pytest -q \
   tests/agent/test_codex_responses_adapter.py \
   tests/agent/test_turn_context.py \
   tests/gateway/test_active_turn_recovery.py \

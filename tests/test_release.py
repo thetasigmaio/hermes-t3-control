@@ -51,6 +51,28 @@ PATCH_NAME = "hermes-gateway-continuation-1.3.0.patch"
 PATCH_CHECKSUM_NAME = f"{PATCH_NAME}.sha256"
 PATCH_SOURCE = ROOT / "patches" / "hermes-gateway-continuation-63279301.patch"
 SIGNED_MANIFEST = ROOT / "release" / "v1.3.0.sha256"
+UPSTREAM_PATCH_LICENSE = """MIT License
+
+Copyright (c) 2025 Nous Research
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
 RELEASE_ARTIFACT_NAMES = (
     ARCHIVE_NAME,
     CHECKSUM_NAME,
@@ -187,6 +209,10 @@ class DeterministicArtifactTests(unittest.TestCase):
             re.findall(r'expected_route\.topic_id == "([^"]+)"', fixture),
             ["42"],
         )
+
+    def test_standalone_patch_retains_exact_upstream_mit_notice(self) -> None:
+        patch = PATCH_SOURCE.read_text(encoding="utf-8")
+        self.assertTrue(patch.startswith(f"{UPSTREAM_PATCH_LICENSE}\ndiff --git "))
 
     def test_release_inputs_reject_a_symlinked_parent_directory(self) -> None:
         build = _load_build_module()
@@ -556,6 +582,16 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
 """
         self.assertEqual(workflow.count(supported_install), 1)
         self.assertNotIn("--force", supported_install)
+        gateway = workflow.split("  gateway-patch:", 1)[1].split("  package:", 1)[0]
+        self.assertIn(
+            "uv sync --frozen --project hermes --python 3.11 --extra dev",
+            gateway,
+        )
+        self.assertIn(
+            "uv run --frozen --project hermes --extra dev pytest -q",
+            gateway,
+        )
+        self.assertNotIn("--with pytest", gateway)
         self.assertRegex(workflow, r"(?m)^  package:\n(?:.*\n)*?    needs: \[unit, doctor, gateway-patch\]$")
         self.assertLess(workflow.index("needs: [unit, doctor, gateway-patch]"), workflow.index("Upload release artifacts"))
 
