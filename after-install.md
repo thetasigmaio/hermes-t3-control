@@ -21,3 +21,5 @@ For Desktop or `hermes serve`, run `hermes serve --status`, then fully relaunch 
 > Call only `t3_threads` with `{}`; do not call mutation tools.
 
 Full setup and recovery are in the bundled `README.md` and `docs/operations.md`.
+
+The same-session continuation observer remains disabled unless an operator creates an exact local binding and explicitly enables `continuation_enabled`. Stock Hermes lacks the required native gateway APIs. The separately published experimental patch applies only to clean upstream commit `63279301bcbdc185c1b07b98a9312eb0c862f26d`; see `docs/experimental-continuation.md`. The eleven basic tools remain available without it.

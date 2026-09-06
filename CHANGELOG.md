@@ -2,6 +2,24 @@
 
 All notable changes to Hermes T3 Control are documented in this file.
 
+## [1.3.0] - 2026-09-06
+
+### Added
+
+- Added optional create-only instance, model, reasoning-effort, and alias defaults while preserving explicit model pairs and every existing-thread operation.
+- Added an off-by-default same-session continuation observer with an authenticated local ledger, exact source and route bindings, bounded replay, and fail-closed delivery.
+- Added a separate experimental Hermes gateway patch pinned to clean upstream commit `63279301bcbdc185c1b07b98a9312eb0c862f26d`; stock Hermes remains sufficient for the eleven basic tools.
+
+### Changed
+
+- Reworked public onboarding around a short signer-verified install, a safe first read, stock compatibility, upgrades, removal, and focused advanced guides.
+- Exhausted, fully acknowledged continuation bindings can be renewed explicitly with preserved source and destination authority, new task/scope/budget fields, retained lineage, and cross-generation deduplication.
+
+### Security
+
+- The experimental host patch is manual, exact-base-only, and distributed separately from the basic plugin archive with authenticated checksums and focused host tests.
+- Public release sources and fixtures use synthetic routes and contain no workstation paths, account aliases, credentials, or live binding identifiers.
+
 ## [1.2.3] - 2026-08-30
 
 ### Fixed
@@ -95,6 +113,7 @@ All notable changes to Hermes T3 Control are documented in this file.
 - Rejects active-token reflection in request targets or mutation data before any HTTP request.
 - Publishes release artifacts through owner-private, inode-bound no-follow staging and rejects unsafe directories, links, or special files.
 
+[1.3.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.3.0
 [1.2.3]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.3
 [1.2.2]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.2
 [1.2.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.1

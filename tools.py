@@ -316,6 +316,92 @@ def _configured_runtime_mode(ctx: Any) -> str:
     return value
 
 
+def _configured_create_model(ctx: Any) -> dict[str, Any] | None:
+    keys = (
+        "default_instance_id",
+        "default_model",
+        "default_reasoning_effort",
+        "default_model_aliases",
+    )
+    try:
+        values = {key: ctx.get_config(key, None) for key in keys}
+    except Exception as exc:
+        raise ConfigurationError(
+            "The plugin thread-create model defaults are unavailable."
+        ) from exc
+
+    instance_id = values["default_instance_id"]
+    model = values["default_model"]
+    reasoning_effort = values["default_reasoning_effort"]
+    raw_aliases = values["default_model_aliases"]
+    if all(value is None for value in values.values()):
+        return None
+    if (instance_id is None) != (model is None):
+        raise ConfigurationError(
+            "The plugin default_instance_id and default_model settings must be configured together."
+        )
+    if instance_id is None:
+        raise ConfigurationError(
+            "The plugin default reasoning effort and model aliases require a configured default model pair."
+        )
+
+    try:
+        normalized_instance = normalize_string(
+            instance_id, "default_instance_id", max_chars=MAX_IDENTIFIER_CHARS
+        )
+        normalized_model = normalize_string(
+            model, "default_model", max_chars=MAX_IDENTIFIER_CHARS
+        )
+    except T3ClientError as exc:
+        raise ConfigurationError(
+            "The plugin thread-create default model pair is invalid."
+        ) from exc
+
+    normalized_effort = None
+    if reasoning_effort is not None:
+        try:
+            normalized_effort = normalize_string(
+                reasoning_effort,
+                "default_reasoning_effort",
+                max_chars=MAX_MODEL_OPTION_CHARS,
+            )
+        except T3ClientError as exc:
+            raise ConfigurationError(
+                "The plugin default_reasoning_effort setting is invalid."
+            ) from exc
+
+    if raw_aliases is None:
+        raw_aliases = []
+    if not isinstance(raw_aliases, list) or len(raw_aliases) > MAX_MODEL_OPTIONS:
+        raise ConfigurationError(
+            "The plugin default_model_aliases setting must be an array of at most 64 strings."
+        )
+    aliases: set[str] = set()
+    for raw_alias in raw_aliases:
+        try:
+            alias = normalize_string(
+                raw_alias, "default_model_aliases", max_chars=MAX_IDENTIFIER_CHARS
+            ).casefold()
+        except T3ClientError as exc:
+            raise ConfigurationError(
+                "The plugin default_model_aliases setting contains an invalid alias."
+            ) from exc
+        if alias in aliases:
+            raise ConfigurationError(
+                "The plugin default_model_aliases setting contains duplicate aliases."
+            )
+        aliases.add(alias)
+
+    return {
+        "selection": {
+            "instanceId": normalized_instance,
+            "model": normalized_model,
+        },
+        "reasoning_effort": normalized_effort,
+        "aliases": frozenset(aliases),
+    }
+
+
 def _normalize_model_options(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         _invalid("model_options must be an array.")
@@ -1673,24 +1759,62 @@ def t3_thread_create(ctx: Any, raw_args: Any) -> dict[str, Any]:
     )
     project_id = normalize_string(args["project_id"], "project_id", max_chars=MAX_IDENTIFIER_CHARS)
     title = normalize_string(args["title"], "title", max_chars=MAX_TITLE_CHARS)
+    configured_model = _configured_create_model(ctx)
     has_instance = "instance_id" in args
     has_model = "model" in args
-    if has_instance != has_model:
-        _invalid("instance_id and model must be supplied together.")
-    if "model_options" in args and not has_instance:
-        _invalid("model_options requires an explicit instance_id and model pair.")
-    explicit_selection: dict[str, Any] | None = None
+    if has_instance and not has_model:
+        _invalid("instance_id requires model.")
+    resolved_selection: dict[str, Any] | None = None
     if has_instance:
-        explicit_selection = {
-            "instanceId": normalize_string(
-                args["instance_id"], "instance_id", max_chars=MAX_IDENTIFIER_CHARS
-            ),
-            "model": normalize_string(args["model"], "model", max_chars=MAX_IDENTIFIER_CHARS),
-        }
+        supplied_instance = normalize_string(
+            args["instance_id"], "instance_id", max_chars=MAX_IDENTIFIER_CHARS
+        )
+        supplied_model = normalize_string(
+            args["model"], "model", max_chars=MAX_IDENTIFIER_CHARS
+        )
+        configured_selection = (
+            configured_model["selection"] if configured_model is not None else None
+        )
+        if (
+            configured_selection is not None
+            and supplied_instance == configured_selection["instanceId"]
+            and supplied_model.casefold() in configured_model["aliases"]
+        ):
+            resolved_selection = copy.deepcopy(configured_selection)
+        else:
+            resolved_selection = {
+                "instanceId": supplied_instance,
+                "model": supplied_model,
+            }
+    elif has_model:
+        supplied_model = normalize_string(
+            args["model"], "model", max_chars=MAX_IDENTIFIER_CHARS
+        )
+        configured_selection = (
+            configured_model["selection"] if configured_model is not None else None
+        )
+        if configured_selection is None or not (
+            supplied_model == configured_selection["model"]
+            or supplied_model.casefold() in configured_model["aliases"]
+        ):
+            _invalid(
+                "model without instance_id must exactly match the configured default model or one of its aliases."
+            )
+        resolved_selection = copy.deepcopy(configured_selection)
+    elif configured_model is not None:
+        resolved_selection = copy.deepcopy(configured_model["selection"])
     explicit_options = (
         _normalize_model_options(args["model_options"])
         if "model_options" in args
         else None
+    )
+    if "model_options" in args and resolved_selection is None:
+        _invalid(
+            "model_options requires an explicit model pair or configured thread-create model default."
+        )
+    uses_configured_model = (
+        configured_model is not None
+        and resolved_selection == configured_model["selection"]
     )
     explicit_runtime_mode = (
         _enum(args["runtime_mode"], "runtime_mode", RUNTIME_MODES)
@@ -1726,9 +1850,9 @@ def t3_thread_create(ctx: Any, raw_args: Any) -> dict[str, Any]:
         "project_id": project_id,
         "title": title,
         "instance_id": (
-            explicit_selection["instanceId"] if explicit_selection is not None else None
+            resolved_selection["instanceId"] if resolved_selection is not None else None
         ),
-        "model": explicit_selection["model"] if explicit_selection is not None else None,
+        "model": resolved_selection["model"] if resolved_selection is not None else None,
         "model_options": explicit_options,
         "runtime_mode": runtime_mode,
         "interaction_mode": interaction_mode,
@@ -1743,20 +1867,31 @@ def t3_thread_create(ctx: Any, raw_args: Any) -> dict[str, Any]:
         if project is None:
             raise ConflictError("The requested project does not exist in the current T3 shell.")
         default_selection = project.get("defaultModelSelection")
-        if explicit_selection is None:
+        if resolved_selection is None:
             if default_selection is None:
                 raise ConflictError(
                     "The project has no default model selection; supply instance_id and model."
                 )
             model_selection = copy.deepcopy(default_selection)
+        elif uses_configured_model:
+            model_selection = copy.deepcopy(resolved_selection)
+            if explicit_options is not None:
+                model_selection["options"] = explicit_options
+            elif configured_model["reasoning_effort"] is not None:
+                model_selection["options"] = [
+                    {
+                        "id": "reasoningEffort",
+                        "value": configured_model["reasoning_effort"],
+                    }
+                ]
         else:
             same_as_default = (
                 isinstance(default_selection, dict)
-                and explicit_selection["instanceId"] == default_selection["instanceId"]
-                and explicit_selection["model"] == default_selection["model"]
+                and resolved_selection["instanceId"] == default_selection["instanceId"]
+                and resolved_selection["model"] == default_selection["model"]
             )
             model_selection = (
-                copy.deepcopy(default_selection) if same_as_default else copy.deepcopy(explicit_selection)
+                copy.deepcopy(default_selection) if same_as_default else copy.deepcopy(resolved_selection)
             )
             if explicit_options is not None:
                 model_selection["options"] = explicit_options

@@ -1,0 +1,1148 @@
+"""Durable, profile-local state for allowlisted T3 continuation bindings."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+import threading
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator, Mapping
+
+
+SCHEMA_VERSION = 2
+MAX_IDENTIFIER_CHARS = 512
+MAX_SESSION_KEY_CHARS = 512
+MAX_SESSION_ID_CHARS = 256
+MAX_EVENT_BYTES = 32 * 1024
+MAX_RECEIPT_BYTES = 8 * 1024
+MAX_QUEUE_ROWS = 128
+AUTHORITY_FIELDS = (
+    "binding_id",
+    "profile_name",
+    "t3_thread_id",
+    "t3_owner_id",
+    "t3_environment_id",
+    "hermes_session_key",
+    "hermes_session_id",
+    "platform",
+    "user_id",
+    "chat_id",
+    "topic_id",
+    "sunsama_task_id",
+    "source_identity",
+    "followup_scope",
+    "max_continuations",
+)
+RENEWAL_SOURCE_FIELDS = (
+    "profile_name",
+    "t3_thread_id",
+    "t3_owner_id",
+    "t3_environment_id",
+)
+RENEWAL_DESTINATION_FIELDS = (
+    "hermes_session_key",
+    "hermes_session_id",
+    "platform",
+    "user_id",
+    "chat_id",
+    "topic_id",
+)
+V1_BINDING_COLUMNS = (
+    "binding_id",
+    "profile_name",
+    "t3_thread_id",
+    "t3_owner_id",
+    "t3_environment_id",
+    "hermes_session_key",
+    "hermes_session_id",
+    "platform",
+    "user_id",
+    "chat_id",
+    "topic_id",
+    "sunsama_task_id",
+    "source_identity",
+    "followup_scope",
+    "max_continuations",
+    "state",
+    "cursor_sequence",
+    "created_at",
+    "updated_at",
+)
+BINDING_COLUMNS = V1_BINDING_COLUMNS + ("binding_schema_version",)
+EVENT_COLUMNS = (
+    "binding_id",
+    "source_sequence",
+    "source_event_id",
+    "source_turn_id",
+    "event_kind",
+    "occurred_at",
+    "envelope_json",
+    "envelope_mac",
+    "status",
+    "attempts",
+    "busy_attempts",
+    "receipt_json",
+    "last_error_code",
+    "created_at",
+    "updated_at",
+)
+
+
+class ContinuationStateError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _clean(value: Any, name: str, *, maximum: int = MAX_IDENTIFIER_CHARS) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ValueError(f"{name} is missing or invalid")
+    return value
+
+
+def _clean_optional(value: Any, name: str, *, maximum: int = MAX_IDENTIFIER_CHARS) -> str:
+    if value is None or value == "":
+        return ""
+    return _clean(value, name, maximum=maximum)
+
+
+def _canonical(value: Mapping[str, Any]) -> bytes:
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("continuation value is not JSON serializable") from exc
+    return encoded
+
+
+@dataclass(frozen=True)
+class Binding:
+    binding_id: str
+    profile_name: str
+    t3_thread_id: str
+    t3_owner_id: str
+    t3_environment_id: str
+    hermes_session_key: str
+    hermes_session_id: str
+    platform: str
+    user_id: str
+    chat_id: str
+    topic_id: str
+    sunsama_task_id: str
+    source_identity: str
+    followup_scope: str
+    max_continuations: int
+    state: str
+    cursor_sequence: int
+    created_at: str
+    updated_at: str
+    binding_schema_version: int
+
+    def __post_init__(self) -> None:
+        if self.binding_schema_version != SCHEMA_VERSION:
+            raise ContinuationStateError("binding schema discriminator is invalid")
+
+
+class ContinuationStore:
+    """Small SQLite ledger with atomic cursor/event insertion."""
+
+    def __init__(self, data_dir: str | Path, *, max_queue_rows: int = MAX_QUEUE_ROWS):
+        if isinstance(max_queue_rows, bool) or not 1 <= int(max_queue_rows) <= 1024:
+            raise ValueError("max_queue_rows must be between 1 and 1024")
+        self.data_dir = Path(data_dir)
+        self.db_path = self.data_dir / "continuation.sqlite3"
+        self.key_path = self.data_dir / "continuation.hmac"
+        self.max_queue_rows = int(max_queue_rows)
+        self._lock = threading.RLock()
+
+    def initialize(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.data_dir, 0o700)
+        try:
+            with self._connect() as db:
+                self._initialize_connection(db)
+        except ContinuationStateError:
+            raise
+        except sqlite3.Error as exc:
+            raise ContinuationStateError(
+                "continuation state database operation failed"
+            ) from exc
+        os.chmod(self.db_path, 0o600)
+        self._key()
+
+    def _initialize_connection(self, db: sqlite3.Connection) -> None:
+        objects = {
+            row["name"]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if not objects:
+            self._create_schema_v2(db)
+        elif "meta" not in objects:
+            raise ContinuationStateError("continuation schema metadata is missing")
+        else:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            if row is None:
+                raise ContinuationStateError("continuation schema version is missing")
+            try:
+                version = int(row["value"])
+            except (TypeError, ValueError) as exc:
+                raise ContinuationStateError(
+                    "continuation schema version is invalid"
+                ) from exc
+            if version == 1:
+                self._migrate_v1_to_v2(db)
+            elif version == SCHEMA_VERSION:
+                self._validate_schema_v2(db)
+            elif version > SCHEMA_VERSION:
+                raise ContinuationStateError(
+                    "continuation schema is newer than this plugin"
+                )
+            else:
+                raise ContinuationStateError("continuation schema version is unsupported")
+
+    @staticmethod
+    def _create_bindings_table(db: sqlite3.Connection, name: str = "bindings") -> None:
+        if name not in {"bindings", "bindings_v2"}:
+            raise ValueError("unsupported bindings table name")
+        db.execute(
+            f"""CREATE TABLE {name} (
+                binding_id TEXT PRIMARY KEY,
+                profile_name TEXT NOT NULL,
+                t3_thread_id TEXT NOT NULL,
+                t3_owner_id TEXT NOT NULL,
+                t3_environment_id TEXT NOT NULL,
+                hermes_session_key TEXT NOT NULL,
+                hermes_session_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                sunsama_task_id TEXT NOT NULL,
+                source_identity TEXT NOT NULL,
+                followup_scope TEXT NOT NULL,
+                max_continuations INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('active','paused','stopped','cancelled')),
+                cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK(cursor_sequence >= 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                binding_schema_version INTEGER NOT NULL CHECK(binding_schema_version = 2)
+            )"""
+        )
+
+    @staticmethod
+    def _create_events_table(db: sqlite3.Connection) -> None:
+        db.execute(
+            """CREATE TABLE events (
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                source_sequence INTEGER NOT NULL CHECK(source_sequence >= 0),
+                source_event_id TEXT NOT NULL,
+                source_turn_id TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                envelope_json TEXT NOT NULL,
+                envelope_mac TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN
+                    ('queued','dispatching','completed','acknowledged','cancelled','blocked','uncertain')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                busy_attempts INTEGER NOT NULL DEFAULT 0 CHECK(busy_attempts >= 0),
+                receipt_json TEXT,
+                last_error_code TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(binding_id, source_sequence),
+                UNIQUE(binding_id, source_event_id),
+                UNIQUE(binding_id, event_kind, source_turn_id)
+            )"""
+        )
+
+    @staticmethod
+    def _create_v2_additions(db: sqlite3.Connection) -> None:
+        db.execute(
+            """CREATE TABLE binding_lineage (
+                predecessor_binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),
+                successor_binding_id TEXT NOT NULL UNIQUE REFERENCES bindings(binding_id),
+                renewed_at TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE UNIQUE INDEX bindings_live_thread_idx
+            ON bindings(t3_thread_id) WHERE state IN ('active','paused')"""
+        )
+        db.execute(
+            "CREATE INDEX events_dispatch_idx ON events(status, updated_at, source_sequence)"
+        )
+
+    def _create_schema_v2(self, db: sqlite3.Connection) -> None:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            self._create_bindings_table(db)
+            self._create_events_table(db)
+            self._create_v2_additions(db)
+            db.execute(
+                "INSERT INTO meta(key,value) VALUES('schema_version',?)",
+                (str(SCHEMA_VERSION),),
+            )
+            if db.execute("PRAGMA foreign_key_check").fetchall():
+                raise ContinuationStateError("continuation schema foreign keys are invalid")
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _table_columns(db: sqlite3.Connection, name: str) -> tuple[str, ...]:
+        return tuple(row["name"] for row in db.execute(f"PRAGMA table_info({name})"))
+
+    @staticmethod
+    def _index_columns(db: sqlite3.Connection, name: str) -> tuple[str, ...]:
+        return tuple(row["name"] for row in db.execute(f"PRAGMA index_info({name})"))
+
+    def _unique_index_columns(
+        self, db: sqlite3.Connection, table: str
+    ) -> set[tuple[str, ...]]:
+        return {
+            self._index_columns(db, row["name"])
+            for row in db.execute(f"PRAGMA index_list({table})")
+            if row["unique"]
+        }
+
+    def _validate_schema_v1(self, db: sqlite3.Connection) -> None:
+        tables = {
+            row["name"]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if tables != {"meta", "bindings", "events"}:
+            raise ContinuationStateError("continuation schema v1 is not canonical")
+        if self._table_columns(db, "bindings") != V1_BINDING_COLUMNS:
+            raise ContinuationStateError("continuation bindings schema v1 is not canonical")
+        if self._table_columns(db, "events") != EVENT_COLUMNS:
+            raise ContinuationStateError("continuation events schema v1 is not canonical")
+        if self._unique_index_columns(db, "bindings") != {
+            ("binding_id",),
+            ("t3_thread_id",),
+        } or self._unique_index_columns(db, "events") != {
+            ("binding_id", "source_sequence"),
+            ("binding_id", "source_event_id"),
+            ("binding_id", "event_kind", "source_turn_id"),
+        }:
+            raise ContinuationStateError("continuation schema v1 indexes are not canonical")
+        if self._index_columns(db, "events_dispatch_idx") != (
+            "status",
+            "updated_at",
+            "source_sequence",
+        ):
+            raise ContinuationStateError("continuation schema v1 indexes are not canonical")
+        foreign_keys = db.execute("PRAGMA foreign_key_list(events)").fetchall()
+        if len(foreign_keys) != 1 or any(
+            (
+                foreign_keys[0]["table"] != "bindings",
+                foreign_keys[0]["from"] != "binding_id",
+                foreign_keys[0]["to"] != "binding_id",
+            )
+        ):
+            raise ContinuationStateError("continuation schema v1 foreign key is not canonical")
+        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ContinuationStateError("continuation database integrity check failed")
+        if db.execute("PRAGMA foreign_key_check").fetchall():
+            raise ContinuationStateError("continuation database has invalid foreign keys")
+
+    def _validate_schema_v2(self, db: sqlite3.Connection) -> None:
+        tables = {
+            row["name"]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if tables != {"meta", "bindings", "events", "binding_lineage"}:
+            raise ContinuationStateError("continuation schema v2 is not canonical")
+        if self._table_columns(db, "bindings") != BINDING_COLUMNS:
+            raise ContinuationStateError("continuation bindings schema v2 is not canonical")
+        discriminator = next(
+            (
+                row
+                for row in db.execute("PRAGMA table_info(bindings)")
+                if row["name"] == "binding_schema_version"
+            ),
+            None,
+        )
+        bindings_sql_row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='bindings'"
+        ).fetchone()
+        bindings_sql = (
+            ""
+            if bindings_sql_row is None
+            else "".join(bindings_sql_row["sql"].lower().split())
+        )
+        if (
+            discriminator is None
+            or discriminator["type"].upper() != "INTEGER"
+            or not discriminator["notnull"]
+            or discriminator["dflt_value"] is not None
+            or "binding_schema_versionintegernotnullcheck(binding_schema_version=2)"
+            not in bindings_sql
+        ):
+            raise ContinuationStateError(
+                "continuation binding discriminator v2 is not canonical"
+            )
+        if self._table_columns(db, "events") != EVENT_COLUMNS:
+            raise ContinuationStateError("continuation events schema v2 is not canonical")
+        if self._table_columns(db, "binding_lineage") != (
+            "predecessor_binding_id",
+            "successor_binding_id",
+            "renewed_at",
+        ):
+            raise ContinuationStateError("continuation lineage schema v2 is not canonical")
+        binding_indexes = {
+            row["name"]: row for row in db.execute("PRAGMA index_list(bindings)")
+        }
+        live_index = binding_indexes.get("bindings_live_thread_idx")
+        live_sql_row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='bindings_live_thread_idx'"
+        ).fetchone()
+        live_sql = "" if live_sql_row is None else "".join(live_sql_row["sql"].lower().split())
+        if (
+            live_index is None
+            or not live_index["unique"]
+            or not live_index["partial"]
+            or self._index_columns(db, "bindings_live_thread_idx") != ("t3_thread_id",)
+            or "wherestatein('active','paused')" not in live_sql
+        ):
+            raise ContinuationStateError("continuation schema v2 indexes are not canonical")
+        if self._unique_index_columns(db, "binding_lineage") != {
+            ("predecessor_binding_id",),
+            ("successor_binding_id",),
+        }:
+            raise ContinuationStateError("continuation lineage indexes v2 are not canonical")
+        if self._index_columns(db, "events_dispatch_idx") != (
+            "status",
+            "updated_at",
+            "source_sequence",
+        ):
+            raise ContinuationStateError("continuation schema v2 indexes are not canonical")
+        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ContinuationStateError("continuation database integrity check failed")
+        if db.execute("PRAGMA foreign_key_check").fetchall():
+            raise ContinuationStateError("continuation database has invalid foreign keys")
+        event_foreign_keys = {
+            (row["from"], row["table"], row["to"])
+            for row in db.execute("PRAGMA foreign_key_list(events)")
+        }
+        lineage_foreign_keys = {
+            (row["from"], row["table"], row["to"])
+            for row in db.execute("PRAGMA foreign_key_list(binding_lineage)")
+        }
+        if event_foreign_keys != {("binding_id", "bindings", "binding_id")} or lineage_foreign_keys != {
+            ("predecessor_binding_id", "bindings", "binding_id"),
+            ("successor_binding_id", "bindings", "binding_id"),
+        }:
+            raise ContinuationStateError("continuation schema v2 foreign keys are not canonical")
+        version = db.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        if version is None or version["value"] != str(SCHEMA_VERSION):
+            raise ContinuationStateError("continuation schema v2 version is not canonical")
+
+    def _migrate_v1_to_v2(self, db: sqlite3.Connection) -> None:
+        self._validate_schema_v1(db)
+        db.execute("PRAGMA foreign_keys=OFF")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+            raise ContinuationStateError("continuation migration could not suspend foreign keys")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            self._create_bindings_table(db, "bindings_v2")
+            old_columns = ",".join(V1_BINDING_COLUMNS)
+            new_columns = ",".join(BINDING_COLUMNS)
+            db.execute(
+                f"INSERT INTO bindings_v2({new_columns}) "
+                f"SELECT {old_columns},? FROM bindings",
+                (SCHEMA_VERSION,),
+            )
+            db.execute("DROP TABLE bindings")
+            db.execute("ALTER TABLE bindings_v2 RENAME TO bindings")
+            db.execute(
+                """CREATE TABLE binding_lineage (
+                    predecessor_binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),
+                    successor_binding_id TEXT NOT NULL UNIQUE REFERENCES bindings(binding_id),
+                    renewed_at TEXT NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE UNIQUE INDEX bindings_live_thread_idx
+                ON bindings(t3_thread_id) WHERE state IN ('active','paused')"""
+            )
+            changed = db.execute(
+                "UPDATE meta SET value=? WHERE key='schema_version'",
+                (str(SCHEMA_VERSION),),
+            ).rowcount
+            if changed != 1:
+                raise ContinuationStateError(
+                    "continuation migration could not record schema version"
+                )
+            if db.execute("PRAGMA foreign_key_check").fetchall():
+                raise ContinuationStateError(
+                    "continuation migration produced invalid foreign keys"
+                )
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
+        self._validate_schema_v2(db)
+
+    @contextmanager
+    def _connect(self, *, nonblocking: bool = False) -> Iterator[sqlite3.Connection]:
+        db = sqlite3.connect(
+            self.db_path,
+            timeout=0.0 if nonblocking else 5.0,
+            isolation_level=None,
+        )
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute(f"PRAGMA busy_timeout={0 if nonblocking else 5000}")
+            db.execute("PRAGMA synchronous=FULL")
+            yield db
+        finally:
+            db.close()
+
+    def _key(self) -> bytes:
+        try:
+            value = self.key_path.read_bytes()
+        except FileNotFoundError:
+            value = secrets.token_bytes(32)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            descriptor = os.open(self.key_path, flags, 0o600)
+            try:
+                os.write(descriptor, value)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        if len(value) != 32:
+            raise ContinuationStateError("continuation authentication key is invalid")
+        os.chmod(self.key_path, 0o600)
+        return value
+
+    def sign(self, envelope: Mapping[str, Any]) -> str:
+        return hmac.new(self._key(), _canonical(envelope), hashlib.sha256).hexdigest()
+
+    def verify(self, envelope: Mapping[str, Any], signature: str) -> bool:
+        return isinstance(signature, str) and hmac.compare_digest(
+            self.sign(envelope), signature
+        )
+
+    def _event_authority_matches(
+        self,
+        binding_row: sqlite3.Row,
+        event_row: sqlite3.Row,
+        *,
+        expected_binding: Binding | None = None,
+        expected_mac: str | None = None,
+    ) -> bool:
+        try:
+            envelope = json.loads(event_row["envelope_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(envelope, dict):
+            return False
+        signature = event_row["envelope_mac"]
+        if expected_mac is not None and signature != expected_mac:
+            return False
+        if not self.verify(envelope, signature):
+            return False
+        if expected_binding is not None and any(
+            binding_row[field] != getattr(expected_binding, field)
+            for field in AUTHORITY_FIELDS
+        ):
+            return False
+        if any(envelope.get(field) != binding_row[field] for field in AUTHORITY_FIELDS):
+            return False
+        return (
+            envelope.get("source_sequence") == event_row["source_sequence"]
+            and envelope.get("source_event_id") == event_row["source_event_id"]
+            and envelope.get("source_turn_id") == event_row["source_turn_id"]
+            and envelope.get("event_kind") == event_row["event_kind"]
+        )
+
+    def dispatch_is_eligible(
+        self,
+        expected_binding: Binding,
+        source_sequence: int,
+        expected_mac: str,
+    ) -> bool:
+        """Reopen durable state for the host's pre-admission authorization check."""
+        try:
+            with self._connect(nonblocking=True) as db:
+                binding_row = db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?",
+                    (expected_binding.binding_id,),
+                ).fetchone()
+                event_row = db.execute(
+                    "SELECT * FROM events WHERE binding_id=? AND source_sequence=?",
+                    (expected_binding.binding_id, source_sequence),
+                ).fetchone()
+                return bool(
+                    binding_row is not None
+                    and event_row is not None
+                    and binding_row["state"] == "active"
+                    and event_row["status"] == "dispatching"
+                    and self._event_authority_matches(
+                        binding_row,
+                        event_row,
+                        expected_binding=expected_binding,
+                        expected_mac=expected_mac,
+                    )
+                )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _normalize_binding_values(values: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = {
+            "binding_id": _clean(values.get("binding_id"), "binding_id"),
+            "profile_name": _clean(values.get("profile_name"), "profile_name"),
+            "t3_thread_id": _clean(values.get("t3_thread_id"), "t3_thread_id"),
+            "t3_owner_id": _clean(values.get("t3_owner_id"), "t3_owner_id"),
+            "t3_environment_id": _clean(
+                values.get("t3_environment_id"), "t3_environment_id"
+            ),
+            "hermes_session_key": _clean(
+                values.get("hermes_session_key"),
+                "hermes_session_key",
+                maximum=MAX_SESSION_KEY_CHARS,
+            ),
+            "hermes_session_id": _clean(
+                values.get("hermes_session_id"),
+                "hermes_session_id",
+                maximum=MAX_SESSION_ID_CHARS,
+            ),
+            "platform": _clean(values.get("platform"), "platform"),
+            "user_id": _clean(values.get("user_id"), "user_id"),
+            "chat_id": _clean(values.get("chat_id"), "chat_id"),
+            "topic_id": _clean_optional(values.get("topic_id"), "topic_id"),
+            "sunsama_task_id": _clean(
+                values.get("sunsama_task_id"), "sunsama_task_id"
+            ),
+            "source_identity": _clean(
+                values.get("source_identity"), "source_identity"
+            ),
+            "followup_scope": _clean(
+                values.get("followup_scope", "none"), "followup_scope"
+            ),
+        }
+        max_continuations = values.get("max_continuations", 1)
+        if (
+            isinstance(max_continuations, bool)
+            or not isinstance(max_continuations, int)
+            or not 1 <= max_continuations <= 16
+        ):
+            raise ValueError("max_continuations must be between 1 and 16")
+        normalized["max_continuations"] = max_continuations
+        return normalized
+
+    @staticmethod
+    def _insert_binding(
+        db: sqlite3.Connection, values: Mapping[str, Any], now: str
+    ) -> None:
+        db.execute(
+            """INSERT INTO bindings(
+                binding_id,profile_name,t3_thread_id,t3_owner_id,t3_environment_id,
+                hermes_session_key,hermes_session_id,platform,user_id,chat_id,topic_id,
+                sunsama_task_id,source_identity,followup_scope,max_continuations,state,
+                cursor_sequence,created_at,updated_at,binding_schema_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',0,?,?,?)""",
+            tuple(values[field] for field in AUTHORITY_FIELDS)
+            + (now, now, SCHEMA_VERSION),
+        )
+
+    def bind(self, **values: Any) -> Binding:
+        normalized = self._normalize_binding_values(values)
+        binding_id = normalized["binding_id"]
+        now = utc_now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?", (binding_id,)
+                ).fetchone()
+                if existing is not None:
+                    if any(
+                        existing[field] != normalized[field]
+                        for field in AUTHORITY_FIELDS
+                        if field != "binding_id"
+                    ):
+                        raise ContinuationStateError(
+                            "binding exists with different authority; use a new id"
+                        )
+                    # Binding is idempotent, but it is not a resume operation. A
+                    # stopped, cancelled, or paused mission requires the explicit
+                    # operator state transition before it can observe new work.
+                    db.execute(
+                        "UPDATE bindings SET updated_at=? WHERE binding_id=?",
+                        (now, binding_id),
+                    )
+                else:
+                    history = db.execute(
+                        "SELECT 1 FROM bindings WHERE t3_thread_id=? LIMIT 1",
+                        (normalized["t3_thread_id"],),
+                    ).fetchone()
+                    if history is not None:
+                        raise ContinuationStateError(
+                            "thread has binding history; use explicit renewal"
+                        )
+                    self._insert_binding(db, normalized, now)
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        return self.get_binding(binding_id)
+
+    def renew(self, replaces_binding_id: str, **values: Any) -> Binding:
+        predecessor_id = _clean(replaces_binding_id, "replaces_binding_id")
+        normalized = self._normalize_binding_values(values)
+        successor_id = normalized["binding_id"]
+        if predecessor_id == successor_id:
+            raise ContinuationStateError("renewal requires a new binding id")
+        now = utc_now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                predecessor = db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?", (predecessor_id,)
+                ).fetchone()
+                if predecessor is None:
+                    raise ContinuationStateError("predecessor binding was not found")
+                lineage = db.execute(
+                    "SELECT successor_binding_id FROM binding_lineage "
+                    "WHERE predecessor_binding_id=?",
+                    (predecessor_id,),
+                ).fetchone()
+                successor = db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?", (successor_id,)
+                ).fetchone()
+                if lineage is not None:
+                    if (
+                        lineage["successor_binding_id"] == successor_id
+                        and successor is not None
+                        and all(
+                            successor[field] == normalized[field]
+                            for field in AUTHORITY_FIELDS
+                        )
+                    ):
+                        db.execute("ROLLBACK")
+                        return Binding(**dict(successor))
+                    raise ContinuationStateError(
+                        "predecessor binding already has a successor"
+                    )
+                if successor is not None:
+                    raise ContinuationStateError("successor binding id already exists")
+                if any(
+                    predecessor[field] != normalized[field]
+                    for field in RENEWAL_SOURCE_FIELDS + RENEWAL_DESTINATION_FIELDS
+                ):
+                    raise ContinuationStateError(
+                        "renewal source and Hermes destination must match predecessor"
+                    )
+                if predecessor["state"] not in {"active", "stopped"}:
+                    raise ContinuationStateError(
+                        "predecessor must be active or stopped for renewal"
+                    )
+                events = db.execute(
+                    "SELECT status,receipt_json FROM events WHERE binding_id=?",
+                    (predecessor_id,),
+                ).fetchall()
+                if len(events) != predecessor["max_continuations"]:
+                    raise ContinuationStateError(
+                        "predecessor continuation budget is not exhausted"
+                    )
+                for event in events:
+                    try:
+                        receipt = json.loads(event["receipt_json"])
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise ContinuationStateError(
+                            "predecessor events require completed receipts"
+                        ) from exc
+                    if (
+                        event["status"] != "acknowledged"
+                        or not isinstance(receipt, dict)
+                        or receipt.get("status") != "completed"
+                    ):
+                        raise ContinuationStateError(
+                            "predecessor events must be acknowledged and completed"
+                        )
+                db.execute(
+                    "UPDATE bindings SET state='stopped',updated_at=? WHERE binding_id=?",
+                    (now, predecessor_id),
+                )
+                self._insert_binding(db, normalized, now)
+                db.execute(
+                    """INSERT INTO binding_lineage(
+                        predecessor_binding_id,successor_binding_id,renewed_at
+                    ) VALUES(?,?,?)""",
+                    (predecessor_id, successor_id, now),
+                )
+                db.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise ContinuationStateError(
+                    "renewal conflicted with current binding state"
+                ) from exc
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        return self.get_binding(successor_id)
+
+    def get_binding(self, binding_id: str) -> Binding:
+        binding_id = _clean(binding_id, "binding_id")
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bindings WHERE binding_id=?", (binding_id,)
+            ).fetchone()
+        if row is None:
+            raise ContinuationStateError("binding was not found")
+        return Binding(**dict(row))
+
+    def active_bindings(self, profile_name: str) -> list[Binding]:
+        profile_name = _clean(profile_name, "profile_name")
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM bindings WHERE profile_name=? AND state='active' ORDER BY binding_id",
+                (profile_name,),
+            ).fetchall()
+        return [Binding(**dict(row)) for row in rows]
+
+    def set_binding_state(self, binding_id: str, state: str) -> Binding:
+        if state not in {"active", "paused", "stopped", "cancelled"}:
+            raise ValueError("unsupported binding state")
+        binding_id = _clean(binding_id, "binding_id")
+        now = utc_now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if state in {"active", "paused"}:
+                    superseded = db.execute(
+                        "SELECT 1 FROM binding_lineage WHERE predecessor_binding_id=?",
+                        (binding_id,),
+                    ).fetchone()
+                    if superseded is not None:
+                        raise ContinuationStateError(
+                            "superseded binding cannot be resumed or paused"
+                        )
+                changed = db.execute(
+                    "UPDATE bindings SET state=?,updated_at=? WHERE binding_id=?",
+                    (state, now, binding_id),
+                ).rowcount
+                if not changed:
+                    raise ContinuationStateError("binding was not found")
+                if state != "active":
+                    db.execute(
+                        "UPDATE events SET status='cancelled',updated_at=? "
+                        "WHERE binding_id=? AND status IN ('queued','dispatching')",
+                        (now, binding_id),
+                    )
+                db.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise ContinuationStateError(
+                    "thread already has an active or paused binding"
+                ) from exc
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        return self.get_binding(binding_id)
+
+    def status(self, binding_id: str | None = None) -> dict[str, Any]:
+        with self._connect() as db:
+            if binding_id is None:
+                rows = db.execute("SELECT * FROM bindings ORDER BY binding_id").fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?",
+                    (_clean(binding_id, "binding_id"),),
+                ).fetchall()
+            result = []
+            for row in rows:
+                counts = db.execute(
+                    "SELECT status,COUNT(*) AS count FROM events WHERE binding_id=? GROUP BY status",
+                    (row["binding_id"],),
+                ).fetchall()
+                item = asdict(Binding(**dict(row)))
+                item["events"] = {count["status"]: count["count"] for count in counts}
+                predecessor = db.execute(
+                    "SELECT predecessor_binding_id FROM binding_lineage "
+                    "WHERE successor_binding_id=?",
+                    (row["binding_id"],),
+                ).fetchone()
+                successor = db.execute(
+                    "SELECT successor_binding_id FROM binding_lineage "
+                    "WHERE predecessor_binding_id=?",
+                    (row["binding_id"],),
+                ).fetchone()
+                item["predecessor_binding_id"] = (
+                    predecessor["predecessor_binding_id"] if predecessor else None
+                )
+                item["successor_binding_id"] = (
+                    successor["successor_binding_id"] if successor else None
+                )
+                result.append(item)
+        return {"schema_version": SCHEMA_VERSION, "bindings": result}
+
+    def ingest(
+        self,
+        binding: Binding,
+        *,
+        cursor_sequence: int,
+        event: Mapping[str, Any] | None,
+    ) -> bool:
+        if isinstance(cursor_sequence, bool) or cursor_sequence < 0:
+            raise ValueError("cursor_sequence is invalid")
+        now = utc_now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current = db.execute(
+                    "SELECT state,cursor_sequence,max_continuations,t3_thread_id "
+                    "FROM bindings WHERE binding_id=?",
+                    (binding.binding_id,),
+                ).fetchone()
+                if current is None or current["state"] != "active":
+                    db.execute("ROLLBACK")
+                    return False
+                if cursor_sequence <= current["cursor_sequence"]:
+                    db.execute("ROLLBACK")
+                    return False
+                inserted = False
+                if event is not None:
+                    queued = db.execute(
+                        "SELECT COUNT(*) FROM events WHERE binding_id=? AND status IN ('queued','dispatching')",
+                        (binding.binding_id,),
+                    ).fetchone()[0]
+                    used = db.execute(
+                        "SELECT COUNT(*) FROM events WHERE binding_id=?",
+                        (binding.binding_id,),
+                    ).fetchone()[0]
+                    if queued >= self.max_queue_rows:
+                        raise ContinuationStateError("continuation queue is full")
+                    if used < current["max_continuations"]:
+                        source_event_id = _clean(
+                            event.get("source_event_id"), "source_event_id"
+                        )
+                        source_turn_id = _clean(
+                            event.get("source_turn_id"), "source_turn_id"
+                        )
+                        event_kind = _clean(event.get("event_kind"), "event_kind")
+                        historical_duplicate = db.execute(
+                            """SELECT 1 FROM events e
+                            JOIN bindings historical ON historical.binding_id=e.binding_id
+                            WHERE historical.t3_thread_id=? AND e.binding_id<>?
+                            AND (e.source_event_id=? OR e.source_turn_id=?) LIMIT 1""",
+                            (
+                                current["t3_thread_id"],
+                                binding.binding_id,
+                                source_event_id,
+                                source_turn_id,
+                            ),
+                        ).fetchone()
+                        if historical_duplicate is not None:
+                            db.execute(
+                                "UPDATE bindings SET cursor_sequence=?,updated_at=? "
+                                "WHERE binding_id=?",
+                                (cursor_sequence, now, binding.binding_id),
+                            )
+                            db.execute("COMMIT")
+                            return False
+                        encoded = _canonical(event)
+                        if len(encoded) > MAX_EVENT_BYTES:
+                            raise ContinuationStateError("normalized event exceeds its size budget")
+                        signature = self.sign(event)
+                        try:
+                            changed = db.execute(
+                                """INSERT OR IGNORE INTO events(
+                                    binding_id,source_sequence,source_event_id,source_turn_id,
+                                    event_kind,occurred_at,envelope_json,envelope_mac,status,
+                                    attempts,created_at,updated_at
+                                ) VALUES(?,?,?,?,?,?,?,?, 'queued',0,?,?)""",
+                                (
+                                    binding.binding_id, cursor_sequence,
+                                    source_event_id,
+                                    source_turn_id,
+                                    event_kind,
+                                    _clean(event.get("occurred_at"), "occurred_at"),
+                                    encoded.decode("ascii"), signature, now, now,
+                                ),
+                            ).rowcount
+                            inserted = bool(changed)
+                        except sqlite3.IntegrityError:
+                            inserted = False
+                db.execute(
+                    "UPDATE bindings SET cursor_sequence=?,updated_at=? WHERE binding_id=?",
+                    (cursor_sequence, now, binding.binding_id),
+                )
+                db.execute("COMMIT")
+                return inserted
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+
+    def claim_next(self, binding_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute(
+                    """SELECT e.* FROM events e JOIN bindings b USING(binding_id)
+                    WHERE e.binding_id=? AND e.status='queued' AND b.state='active'
+                    ORDER BY e.source_sequence LIMIT 1""",
+                    (_clean(binding_id, "binding_id"),),
+                ).fetchone()
+                if row is None:
+                    db.execute("ROLLBACK")
+                    return None
+                db.execute(
+                    "UPDATE events SET status='dispatching',attempts=attempts+1,updated_at=? "
+                    "WHERE binding_id=? AND source_sequence=? AND status='queued'",
+                    (now, binding_id, row["source_sequence"]),
+                )
+                db.execute("COMMIT")
+                value = dict(row)
+                value["attempts"] += 1
+                return value
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+
+    def finish(
+        self,
+        binding_id: str,
+        source_sequence: int,
+        status: str,
+        *,
+        receipt: Mapping[str, Any] | None = None,
+        error_code: str | None = None,
+        refund_attempt: bool = False,
+        count_busy: bool = False,
+    ) -> bool:
+        if status not in {
+            "queued", "completed", "acknowledged", "cancelled", "blocked", "uncertain"
+        }:
+            raise ValueError("unsupported event state")
+        receipt_json = None
+        if receipt is not None:
+            encoded = _canonical(receipt)
+            if len(encoded) > MAX_RECEIPT_BYTES:
+                raise ValueError("receipt exceeds its size budget")
+            receipt_json = encoded.decode("ascii")
+        if error_code is not None:
+            error_code = _clean(error_code, "error_code", maximum=128)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                changed = db.execute(
+                    """UPDATE events SET status=?,receipt_json=?,last_error_code=?,
+                    attempts=CASE WHEN ? AND attempts > 0 THEN attempts - 1 ELSE attempts END,
+                    busy_attempts=busy_attempts+?,
+                    updated_at=?
+                    WHERE binding_id=? AND source_sequence=? AND status='dispatching'""",
+                    (
+                        status, receipt_json, error_code, bool(refund_attempt),
+                        int(bool(count_busy)),
+                        utc_now(), _clean(binding_id, "binding_id"), source_sequence,
+                    ),
+                ).rowcount
+                if not changed and status == "completed":
+                    # An operator can acknowledge while the host-owned Future is
+                    # still running. Preserve that stronger terminal outcome while
+                    # retaining the eventual host receipt for audit.
+                    db.execute(
+                        """UPDATE events SET receipt_json=COALESCE(?,receipt_json),
+                        last_error_code=NULL,updated_at=?
+                        WHERE binding_id=? AND source_sequence=? AND status='acknowledged'""",
+                        (receipt_json, utc_now(), binding_id, source_sequence),
+                    )
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return bool(changed)
+
+    def recover_dispatching(self) -> int:
+        """Fail closed after a crash because delivery may already have occurred."""
+        with self._connect() as db:
+            result = db.execute(
+                "UPDATE events SET status='uncertain',last_error_code='process_restart',updated_at=? "
+                "WHERE status='dispatching'",
+                (utc_now(),),
+            )
+        return result.rowcount
+
+    def acknowledge(self, binding_id: str, source_event_id: str) -> None:
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                normalized_binding_id = _clean(binding_id, "binding_id")
+                normalized_event_id = _clean(source_event_id, "source_event_id")
+                binding_row = db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?",
+                    (normalized_binding_id,),
+                ).fetchone()
+                event_row = db.execute(
+                    "SELECT * FROM events WHERE binding_id=? AND source_event_id=?",
+                    (
+                        normalized_binding_id,
+                        normalized_event_id,
+                    ),
+                ).fetchone()
+                if (
+                    binding_row is None
+                    or event_row is None
+                    or binding_row["state"] != "active"
+                    or event_row["status"] not in {
+                    "dispatching", "completed", "acknowledged"
+                    }
+                    or not self._event_authority_matches(binding_row, event_row)
+                ):
+                    raise ContinuationStateError(
+                        "active authorized running or completed event was not found"
+                    )
+                if event_row["status"] != "acknowledged":
+                    db.execute(
+                        "UPDATE events SET status='acknowledged',updated_at=? "
+                        "WHERE binding_id=? AND source_event_id=?",
+                        (utc_now(), normalized_binding_id, normalized_event_id),
+                    )
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise

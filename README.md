@@ -1,108 +1,106 @@
-# Hermes T3 Control 1.2.3
+# Hermes T3 Control 1.3.0
 
-Control T3 work from Hermes without copying tokens or hunting for thread UUIDs. The plugin lets an agent find the right thread, see its latest result, running status, pending questions, and stored plan, continue it safely, and wait for the outcome. The core thread lifecycle is verified end-to-end with Codex.
+Control T3 threads from Hermes with eleven bounded tools. Find a thread, inspect its current state, continue it, answer a pending request, or wait for completion without copying credentials or guessing thread IDs.
 
-The simple mental model is:
+The basic tool set works on stock supported Hermes. An optional same-session continuation observer is experimental and requires the separate, exact-base host patch described below.
 
-1. Find with `t3_threads`.
-2. Inspect with `t3_thread_read`.
-3. Continue or control that exact thread.
-4. Monitor with `t3_thread_wait`.
+## Quick example
 
-Eleven focused tools cover discovery, creation, continuation, modes, Plan to Build, interrupt, stop, wait, typed responses, and explicit thread settlement. Outputs stay bounded, mutations fail closed on ambiguous selectors, and no mutation creates a replacement thread implicitly.
+Find one thread:
 
-## Compatibility
+```json
+{"project":"demo-app","title_query":"release check","require_one":true,"limit":10}
+```
 
-Provider support is based on real completion evidence, not just a generic-looking schema.
+Pass that object to `t3_threads`, then read the returned ID with:
 
-| Provider | Status | Evidence |
-|---|---|---|
-| Codex | Supported | Core lifecycle passed disposable live create, read, send, wait, Plan to Build, approval, interrupt, stop, and resume on `codex_20x`; typed user input is contract-tested but was not synthesizable live. |
-| OpenCode | Not yet supported | The available instance was disabled and not installed; no authenticated disposable completion gate was possible. |
-| Other T3 providers | Not yet supported | Common reads and dispatch are provider-neutral, but provider-specific lifecycle behavior has not passed live acceptance. |
+```json
+{"thread_id":"exact-thread-id","view":"material","turn_limit":20}
+```
 
-| OS/runtime | Status | Evidence |
-|---|---|---|
-| Linux | Supported with limits | Python and supported-install CI run on Ubuntu; local authentication needs `/proc` and `pidfd`. |
-| WSL2 | Supported | Full published-release and active-profile live E2E. |
-| Native Windows | Not supported yet | Linux-only local authentication; external-token mode is not native-Windows E2E verified. |
-| macOS | Not supported yet | Linux-only local authentication; external-token mode is not macOS E2E verified. |
+Use the second object with `t3_thread_read`. Reads are bounded. Mutations require an exact target and fail closed when identity or state is ambiguous.
 
-See [Compatibility evidence](docs/compatibility.md) for the exact provider boundaries and missing acceptance gates.
+## Verified quick start
 
-## Quick start
-
-Prerequisites: T3 is running, Hermes 0.20.4 or 0.20.5 is available, and Git supports SSH signature verification. The block prints the active Hermes profile for confirmation, verifies the v1.2.3 tag against the pinned release-signing key, installs that exact commit disabled with the scanner on, runs Doctor, and enables without tool override.
+Prerequisites: T3 is running, a supported Hermes version is installed, and Git can verify SSH signatures. This wrapper shows the active Hermes profile, verifies the signed `v1.3.0` tag against the pinned release signer, installs the exact commit with scanning enabled and the plugin disabled, runs Doctor, then enables without tool override.
 
 ```bash
 ( git clone --depth 1 https://github.com/thetasigmaio/hermes-t3-control &&
 cd ./hermes-t3-control &&
 SCRIPT=scripts/install-signed.sh && exec 3<"$SCRIPT" && test -f /dev/fd/3 &&
-HASH=9400d055d46fda4dc1862752980e065f1bac49d12d13294c8fb06ed6c852c939 &&
+HASH=b8f8ed3d56e9611f43091fa9d394c98957d3fd2986d85de668faaf66cb8156e8 &&
 printf '%s  /dev/fd/3\n' "$HASH" | sha256sum -c - && bash /dev/fd/3 )
 ```
 
-Doctor runs while disabled and must report `registrations: 11 tool(s), 0 hook(s)`. This path does not use `--force`.
+Doctor must report `registrations: 11 tool(s), 0 hook(s)`. The installer does not use `--force`, change authentication settings, or restart a process.
 
-Restart only the process that owns your Hermes session. For a managed messaging gateway:
+Restart only the process that owns your Hermes session. For a managed gateway:
 
 ```bash
 hermes gateway restart
 hermes gateway status
 ```
 
-For Hermes Desktop or `hermes serve`, inspect the owner first:
-
-```bash
-hermes serve --status
-```
-
-Then fully stop and relaunch that same Desktop/backend through its supported lifecycle; do not restart an unrelated messaging gateway. Ordinary Linux/WSL2 use needs no plugin settings. When no profile-scoped T3 token is configured, automatic local authentication discovers the matching live T3 CLI, leases an in-memory session for one operation, and revokes it. A valid profile token selects explicit external-token behavior; invalid token configuration fails closed. New threads default to `approval-required`.
-
-## First safe check
-
-Start a fresh Hermes process or session, then use this literal non-thread-mutating operator prompt:
+For Hermes Desktop or `hermes serve`, run `hermes serve --status`, then fully relaunch that same owner. In a fresh session, start with this read-only prompt:
 
 > Call only `t3_threads` with `{}`; do not call mutation tools.
 
-You should receive a bounded project/thread summary. If the tools are absent, the owning Hermes process has not rebuilt its catalog; see [Troubleshooting](docs/operations.md#troubleshooting).
+Ordinary local Linux/WSL2 use needs no copied token or plugin settings. New threads default to `approval-required`. Optional create-only settings can select a default instance, model, reasoning effort, and exact aliases; they never rewrite existing threads.
 
-## Everyday workflow
+## Compatibility
 
-Find exactly one thread by a human selector:
+| Component | Status |
+|---|---|
+| Hermes 0.20.4 (`e624e9f`) | Verified support for all eleven basic tools. |
+| Hermes 0.20.5 (`fcbd107`) | Verified support for all eleven basic tools. |
+| Hermes 0.21.0 / `v2026.8.31` (`29112bef`) | Verified support for all eleven basic tools. |
+| Python 3.11-3.13 | Unit-tested. |
+| T3 server contract | Verified against `0.0.34-nightly.20260820.1141`; later authentication fixtures match the hashed `0.0.37` shape, but other builds remain unverified. |
+| T3 on Linux/WSL2 | Local authentication requires `/proc` and `pidfd`; endpoint and capability mismatches fail closed. |
+| Native Windows and macOS | Not supported; external-token mode has no native end-to-end acceptance. |
+| Codex | Core lifecycle supported. Other provider lifecycles need their own acceptance gate. |
 
-`t3_threads {"project":"demo-app","title_query":"release check","require_one":true,"limit":10}`
+The eleven basic tools need neither the experimental host patch nor a Sunsama account. See [Compatibility evidence](docs/compatibility.md) for precise provider and runtime limits.
 
-Read its current material state:
+## Experimental same-session continuation
 
-`t3_thread_read {"thread_id":"id-from-t3_threads","view":"material","turn_limit":20}`
+The observer is off by default. Stock Hermes 0.20.4, 0.20.5, 0.21.0, and current main do not expose the native gateway APIs it requires. The separately published patch applies only to clean upstream Hermes commit `63279301bcbdc185c1b07b98a9312eb0c862f26d` and is never installed automatically.
 
-Continue the same thread only when immediate start or queuing is acceptable:
+The experimental binding stores an operator-supplied task reference; it does not contact Sunsama. Its local `status` output contains private routing metadata and must not be pasted into issues or public logs. Follow the exact signature, base, test, restart, and rollback procedure in [Experimental continuation](docs/experimental-continuation.md).
 
-`t3_thread_send {"thread_id":"exact-thread-id","message":"Continue the assigned goal and report material progress.","busy_policy":"queue"}`
+## Upgrade and uninstall
 
-Then wait without dumping a full snapshot:
+Upgrade through the same signed-tag flow. Disable and remove the old copy first, install the exact new commit with `--no-enable`, run Doctor, then enable it. Full commands are in [Operations and recovery](docs/operations.md#update).
 
-`t3_thread_wait {"thread_id":"exact-thread-id","until":"terminal","timeout_seconds":30}`
+To remove the plugin from the active profile:
 
-After work is complete, explicitly apply the same settlement as the T3 UI when the server advertises that capability:
+```bash
+hermes plugins disable hermes-t3-control
+hermes plugins remove hermes-t3-control
+hermes config unset plugins.entries.hermes-t3-control
+```
 
-`t3_thread_settle {"thread_id":"exact-thread-id"}`
+## Troubleshooting
 
-Settlement conflicts with starting/running work, pending approval or user input, and a recent queued turn. An already-settled thread succeeds. T3 clears pin and snooze itself; the thread remains available and is not stopped, deleted, or archived. This is distinct from turn-liveness `settled`, and there is no public unsettle tool.
+- **No tools:** run `hermes plugins show hermes-t3-control` and `hermes plugins doctor hermes-t3-control --ci`, then restart the actual owner.
+- **No T3 connection:** start the matching local T3 environment. Local discovery accepts numeric loopback only.
+- **Zero or multiple matches:** narrow the project, workspace, or title selector. Never guess a thread ID.
+- **Accepted but not projected:** exact-read the returned command/message identity before retrying. A duplicate mutation can create duplicate work.
+- **Experimental observer unavailable:** keep it disabled on stock Hermes or remove the manual patch using its documented rollback.
 
-Zero or multiple matches require a narrower selector. A send never creates a replacement thread. If a mutation returns `accepted_pending_projection`, do not send it again; read back the exact command/message identity as described in [Operations and recovery](docs/operations.md#accepted-but-not-yet-projected).
+## Security
 
-`full-access` lets the selected provider execute commands and modify or delete files without approval. Use it only for a trusted provider and checkout.
+Local authentication leases one short-lived in-memory T3 session per operation and revokes it on every exit path. That temporary `local-cli` credential does not enter arguments, files, settings, logs, or tool results. External-token mode uses the profile-scoped secret environment described in the security guide. Transport is numeric-loopback-only, proxy-free, redirect-free, process-pinned, size-bounded, and restricted to the documented routes.
 
-For creation, Plan to Build, approvals/user input, mode changes, settlement, and all eleven tools, see the [Tool reference](docs/tools.md).
+The experimental observer adds a short-lived WebSocket ticket and an owner-only local ledger. It injects only validated identifiers and state classifications into an exact allowlisted Hermes session; provider output remains untrusted. See the [Security model](docs/security.md).
 
-## More detail
+## Advanced guides
 
-- [Tool reference](docs/tools.md) — all eleven tools, limits, and workflows.
-- [Compatibility evidence](docs/compatibility.md) — provider and OS claims plus acceptance gates.
-- [Security model](docs/security.md) — credential lifecycle, transport bounds, and race boundaries.
-- [Operations and recovery](docs/operations.md) — restart, update, rollback, troubleshooting, and release verification.
-- [Community index status](docs/community-index.md) — prepared metadata and the current upstream blocker.
+- [Tool reference](docs/tools.md)
+- [Compatibility evidence](docs/compatibility.md)
+- [Operations and recovery](docs/operations.md)
+- [Experimental continuation](docs/experimental-continuation.md)
+- [Security model](docs/security.md)
+- [Community index status](docs/community-index.md)
 
-Compatibility baseline: Hermes 0.20.4/0.20.5, Python 3.11-3.13, manifest version 1, and T3 server contract `0.0.34-nightly.20260820.1141`. Released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).

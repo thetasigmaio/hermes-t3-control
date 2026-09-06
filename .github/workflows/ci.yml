@@ -41,6 +41,8 @@ jobs:
             hermes-commit: e624e9fde561e1add9388384012b295fde669ade
           - hermes-version: "0.20.5"
             hermes-commit: fcbd1076a93841fa88855acce810e342a5b78101
+          - hermes-version: "0.21.0"
+            hermes-commit: 29112bef099274229cadff79cdff7bf7b99c4b77
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -71,9 +73,54 @@ jobs:
           PYTHONWARNINGS: "error"
         run: uv run --frozen --project .ci/hermes-agent python -B -m unittest -v tests.test_supported_install
 
+  gateway-patch:
+    name: Experimental gateway patch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: plugin
+          persist-credentials: false
+      - name: Check out exact Hermes base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 63279301bcbdc185c1b07b98a9312eb0c862f26d
+          path: hermes
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.12.0"
+          enable-cache: false
+      - name: Apply exact-base patch
+        run: |
+          test "$(git -C hermes rev-parse HEAD)" = "63279301bcbdc185c1b07b98a9312eb0c862f26d"
+          test -z "$(git -C hermes status --porcelain)"
+          git -C hermes apply --check "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-63279301.patch"
+          git -C hermes apply "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-63279301.patch"
+          git -C hermes diff --check
+      - name: Sync frozen Hermes dependency graph
+        run: uv sync --frozen --project hermes --python 3.11
+      - name: Run affected host tests
+        run: |
+          uv run --frozen --project hermes pytest -q \
+            hermes/tests/agent/test_codex_responses_adapter.py \
+            hermes/tests/agent/test_turn_context.py \
+            hermes/tests/gateway/test_active_turn_recovery.py \
+            hermes/tests/gateway/test_conversation_scope_funnel.py \
+            hermes/tests/gateway/test_plugin_message_injection.py \
+            hermes/tests/gateway/test_restart_resume_pending.py \
+            hermes/tests/hermes_cli/test_plugin_message_injection.py
+
   package:
     name: Deterministic release package
-    needs: [unit, doctor]
+    needs: [unit, doctor, gateway-patch]
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -87,13 +134,19 @@ jobs:
       - name: Build deterministic archive
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
-        run: python -B scripts/verify_release.py dist/hermes-t3-control-1.2.3.tar.gz.sha256
+        run: |
+          python -B scripts/verify_release.py dist/hermes-t3-control-1.3.0.tar.gz.sha256
+          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.3.0.patch.sha256
+          grep '  hermes-t3-control-1.3.0.tar.gz$' release/v1.3.0.sha256 | cmp - dist/hermes-t3-control-1.3.0.tar.gz.sha256
+          grep '  hermes-gateway-continuation-1.3.0.patch$' release/v1.3.0.sha256 | cmp - dist/hermes-gateway-continuation-1.3.0.patch.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.2.3
+          name: hermes-t3-control-1.3.0
           path: |
-            dist/hermes-t3-control-1.2.3.tar.gz
-            dist/hermes-t3-control-1.2.3.tar.gz.sha256
+            dist/hermes-t3-control-1.3.0.tar.gz
+            dist/hermes-t3-control-1.3.0.tar.gz.sha256
+            dist/hermes-gateway-continuation-1.3.0.patch
+            dist/hermes-gateway-continuation-1.3.0.patch.sha256
           if-no-files-found: error
           retention-days: 14

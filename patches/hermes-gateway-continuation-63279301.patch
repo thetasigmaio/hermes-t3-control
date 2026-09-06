@@ -1,0 +1,3976 @@
+diff --git a/agent/codex_responses_adapter.py b/agent/codex_responses_adapter.py
+--- a/agent/codex_responses_adapter.py
++++ b/agent/codex_responses_adapter.py
+@@ -565,10 +565,12 @@
+         if role == "system":
+             continue
+ 
+-        if role in {"user", "assistant"}:
++        if role in {"user", "assistant", "developer"}:
+             content = msg.get("content", "")
+             if isinstance(content, list):
+-                content_parts = _chat_content_to_responses_parts(content, role=role)
++                content_parts = _chat_content_to_responses_parts(
++                    content, role="user" if role == "developer" else role
++                )
+                 text_type = "output_text" if role == "assistant" else "input_text"
+                 content_text = "".join(
+                     p.get("text", "") for p in content_parts if p.get("type") == text_type
+@@ -760,7 +762,7 @@
+                         item_sources.append(msg)
+                 continue
+ 
+-            # Non-assistant (user) role: emit multimodal parts when present,
++            # Non-assistant input role: emit multimodal parts when present,
+             # otherwise fall back to the text payload.
+             if content_parts:
+                 items.append({"role": role, "content": content_parts})
+@@ -1144,7 +1146,7 @@
+             continue
+ 
+         role = item.get("role")
+-        if role in {"user", "assistant"}:
++        if role in {"user", "assistant", "developer"}:
+             content = item.get("content", "")
+             if content is None:
+                 content = ""
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2036,6 +2036,7 @@
+     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+     persist_user_platform_id: Optional[str] = None,
+     moa_config: Optional[dict[str, Any]] = None,
++    gateway_system_event: Optional[Any] = None,
+ ) -> Dict[str, Any]:
+     """
+     Run a complete conversation with tool calling until completion.
+@@ -2069,7 +2070,7 @@
+     Returns:
+         Dict: Complete conversation result with final response and message history
+     """
+-    if moa_config is None:
++    if moa_config is None and gateway_system_event is None:
+         try:
+             from hermes_cli.moa_config import decode_moa_turn
+ 
+@@ -2119,6 +2120,7 @@
+             persist_user_display_kind=persist_user_display_kind,
+             persist_user_display_metadata=persist_user_display_metadata,
+             persist_user_platform_id=persist_user_platform_id,
++            gateway_system_event=gateway_system_event,
+             restore_or_build_system_prompt=_restore_or_build_system_prompt,
+             install_safe_stdio=_install_safe_stdio,
+             sanitize_surrogates=_sanitize_surrogates,
+@@ -2730,13 +2732,14 @@
+             if 0 <= current_turn_user_idx < len(messages)
+             else None
+         )
+-        api_messages = _apply_context_engine_selection(
+-            agent,
+-            api_messages,
+-            messages,
+-            _sel_incoming,
+-            logger=request_logger,
+-        )
++        if gateway_system_event is None:
++            api_messages = _apply_context_engine_selection(
++                agent,
++                api_messages,
++                messages,
++                _sel_incoming,
++                logger=request_logger,
++            )
+ 
+         # Safety net: strip orphaned tool results / add stubs for missing
+         # results before sending to the API.  Runs unconditionally — not
+@@ -7374,7 +7377,9 @@
+             # this turn's real user ask (restore path), and the anchor must
+             # land on that restored row, not on -1 / a pre-restore index.
+             current_turn_user_idx = reanchor_current_turn_user_idx(
+-                messages, user_message
++                messages,
++                user_message,
++                role="developer" if gateway_system_event is not None else "user",
+             )
+             agent._persist_user_message_idx = current_turn_user_idx
+             continue
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -335,7 +335,9 @@
+         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
+ 
+ 
+-def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
++def reanchor_current_turn_user_idx(
++    messages: List[Any], user_message: Any, *, role: str = "user"
++) -> int:
+     """Locate this turn's user message after compaction rebuilt ``messages``.
+ 
+     Compression replaces list entries with fresh copies (and may append a
+@@ -356,7 +358,7 @@
+     fallback = -1
+     for i in range(len(messages) - 1, -1, -1):
+         msg = messages[i]
+-        if not (isinstance(msg, dict) and msg.get("role") == "user"):
++        if not (isinstance(msg, dict) and msg.get("role") == role):
+             continue
+         # Typed synthetic current events still need their physical persistence
+         # anchor when their raw content is unchanged.  They are not eligible
+@@ -580,6 +582,7 @@
+     persist_user_timestamp: Optional[float] = None,
+     persist_user_platform_id: Optional[str] = None,
+     *,
++    gateway_system_event: Optional[Any] = None,
+     persist_user_display_kind: Optional[str] = None,
+     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+     restore_or_build_system_prompt,
+@@ -765,7 +768,12 @@
+     agent._run_budget_wrapup_injected = False
+ 
+     # Log conversation turn start for debugging/observability.
+-    _preview_text = summarize_user_message_for_log(user_message)
++    _preview_text = (
++        f"<gateway-system-event kind={gateway_system_event.event_kind} "
++        f"id={gateway_system_event.event_id}>"
++        if gateway_system_event is not None
++        else summarize_user_message_for_log(user_message)
++    )
+     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
+     _msg_preview = _msg_preview.replace("\n", " ")
+     logger.info(
+@@ -783,11 +791,19 @@
+     # this turn; a stale handoff from a failed prior turn must not replace a
+     # later, different user input. Voice turns compare against their explicit
+     # clean persistence override rather than the API-only prefixed payload.
+-    pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
++    pending_cli_message = (
++        None
++        if gateway_system_event is not None
++        else getattr(agent, "_pending_cli_user_message", None)
++    )
+     expected_persist_content = (
+         persist_user_message if persist_user_message is not None else user_message
+     )
+-    if (
++    if gateway_system_event is not None:
++        from gateway.internal_events import gateway_system_event_message
++
++        user_msg = gateway_system_event_message(gateway_system_event, user_message)
++    elif (
+         isinstance(pending_cli_message, dict)
+         and pending_cli_message.get("content") == expected_persist_content
+     ):
+@@ -805,7 +821,10 @@
+             agent._pending_cli_user_message = None
+     # CLI input is stamped when staged. Gateway input may carry the platform
+     # event time. Preserve either value and cover any legacy unstamped handoff.
+-    stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
++    stamp_message_timestamp(
++        user_msg,
++        timestamp=(None if gateway_system_event is not None else persist_user_timestamp),
++    )
+ 
+     # Hydrate todo store from conversation history.
+     if conversation_history and not agent._todo_store.has_items():
+@@ -832,7 +851,7 @@
+     # forever if the turn crashes — so the raw system note paints as a user
+     # bubble. The model still receives role/content unchanged; the api_messages
+     # build strips both fields from every outgoing copy.
+-    if persist_user_display_kind:
++    if persist_user_display_kind and gateway_system_event is None:
+         user_msg["display_kind"] = persist_user_display_kind
+         if persist_user_display_metadata:
+             user_msg["display_metadata"] = persist_user_display_metadata
+@@ -842,17 +861,18 @@
+     # persist below (the turn-start flush).  Load-bearing for restart
+     # drain-window recovery: a recovery pass dedups via
+     # ``has_platform_message_id`` against this row.
+-    if persist_user_platform_id is not None:
++    if persist_user_platform_id is not None and gateway_system_event is None:
+         user_msg["platform_message_id"] = persist_user_platform_id
+     append_message(messages, user_msg)
+     current_turn_user_idx = len(messages) - 1
+     agent._persist_user_message_idx = current_turn_user_idx
+ 
+     # Track user turns for memory flush and periodic nudge logic.
+-    agent._user_turn_count += 1
++    if gateway_system_event is None:
++        agent._user_turn_count += 1
+     # Copilot x-initiator: the first API call of this user turn is
+     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
+-    agent._is_user_initiated_turn = True
++    agent._is_user_initiated_turn = gateway_system_event is None
+ 
+     # Reset the streaming context scrubber at the top of each turn.
+     scrubber = getattr(agent, "_stream_context_scrubber", None)
+@@ -868,7 +888,8 @@
+ 
+     # Track memory nudge trigger (turn-based, checked here).
+     should_review_memory = False
+-    if (agent._memory_nudge_interval > 0
++    if (gateway_system_event is None
++            and agent._memory_nudge_interval > 0
+             and "memory" in agent.valid_tool_names
+             and agent._memory_store):
+         agent._turns_since_memory += 1
+@@ -880,7 +901,7 @@
+     # and notify the host so it can play hearts. Token-free, never touches the
+     # conversation, and never fatal — a purely optional UI beat.
+     reaction_callback = getattr(agent, "reaction_callback", None)
+-    if reaction_callback is not None:
++    if reaction_callback is not None and gateway_system_event is None:
+         try:
+             from agent.reactions import detect_reaction
+ 
+@@ -890,7 +911,7 @@
+         except Exception:
+             pass
+ 
+-    if not agent.quiet_mode:
++    if not agent.quiet_mode and gateway_system_event is None:
+         _print_preview = summarize_user_message_for_log(user_message)
+         agent._safe_print(
+             f"💬 Starting conversation: '{_print_preview[:60]}"
+@@ -959,7 +980,12 @@
+     # the previous turn finished. The cheap gap pre-check gates the (more
+     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
+     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
+-    if agent.compression_enabled and _idle_after > 0 and messages:
++    if (
++        gateway_system_event is None
++        and agent.compression_enabled
++        and _idle_after > 0
++        and messages
++    ):
+         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+         if _idle_gap >= _idle_after:
+             _compressor = agent.context_compressor
+@@ -1043,7 +1069,9 @@
+                     # just-appended user message is stale — re-anchor it the
+                     # same way the preflight path does below.
+                     current_turn_user_idx = reanchor_current_turn_user_idx(
+-                        messages, user_message
++                        messages,
++                        user_message,
++                        role="developer" if gateway_system_event is not None else "user",
+                     )
+                     agent._persist_user_message_idx = current_turn_user_idx
+ 
+@@ -1056,7 +1084,8 @@
+     agent._turn_received_provider_response = False
+     agent._turn_preflight_display_snapshot = None
+     if (
+-        agent.compression_enabled
++        gateway_system_event is None
++        and agent.compression_enabled
+         and not _review_fork_first_request_pending(agent)
+         and _should_run_preflight_estimate(
+             messages,
+@@ -1460,7 +1489,9 @@
+         # position. Exact-content match first so a todo-snapshot user message
+         # appended after the tail can't steal the anchor.
+         current_turn_user_idx = reanchor_current_turn_user_idx(
+-            messages, user_message
++            messages,
++            user_message,
++            role="developer" if gateway_system_event is not None else "user",
+         )
+         agent._persist_user_message_idx = current_turn_user_idx
+ 
+@@ -1468,18 +1499,22 @@
+     plugin_user_context = ""
+     try:
+         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+-        _pre_results = _invoke_hook(
+-            "pre_llm_call",
+-            session_id=agent.session_id,
+-            task_id=effective_task_id,
+-            turn_id=turn_id,
+-            user_message=original_user_message,
+-            conversation_history=list(messages),
+-            is_first_turn=(not bool(conversation_history)),
+-            model=agent.model,
+-            platform=getattr(agent, "platform", None) or "",
+-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+-            sender_id=getattr(agent, "_user_id", None) or "",
++        _pre_results = (
++            []
++            if gateway_system_event is not None
++            else _invoke_hook(
++                "pre_llm_call",
++                session_id=agent.session_id,
++                task_id=effective_task_id,
++                turn_id=turn_id,
++                user_message=original_user_message,
++                conversation_history=list(messages),
++                is_first_turn=(not bool(conversation_history)),
++                model=agent.model,
++                platform=getattr(agent, "platform", None) or "",
++                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
++                sender_id=getattr(agent, "_user_id", None) or "",
++            )
+         )
+         _ctx_parts: list[str] = []
+         # Spill oversized per-hook context to disk so a runaway plugin
+@@ -1524,7 +1559,11 @@
+     # One-shot: staged by the gateway right before this turn, consumed here.
+     # Multimodal (list) content can't take the string sidecar — append a
+     # durable text part instead of dropping the fact.
+-    _gateway_notes = consume_gateway_turn_context_notes(agent)
++    _gateway_notes = (
++        ""
++        if gateway_system_event is not None
++        else consume_gateway_turn_context_notes(agent)
++    )
+     if _gateway_notes:
+         _gw_turn_content = (
+             messages[current_turn_user_idx].get("content")
+@@ -1566,7 +1605,7 @@
+         agent._interrupt_thread_signal_pending = False
+ 
+     # Notify memory providers of the new turn (BEFORE prefetch_all).
+-    if agent._memory_manager:
++    if agent._memory_manager and gateway_system_event is None:
+         try:
+             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
+             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+@@ -1578,7 +1617,7 @@
+     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
+     # prevent memory-context injection on turns that carry no semantic signal.
+     ext_prefetch_cache = ""
+-    if agent._memory_manager:
++    if agent._memory_manager and gateway_system_event is None:
+         try:
+             _query = original_user_message if isinstance(original_user_message, str) else ""
+             if not is_trivial_prompt(_query):
+@@ -1691,7 +1730,8 @@
+     # turn failed before producing one). Fire-and-forget on a daemon thread,
+     # a no-op once the session has a title, and shared by every surface
+     # because every surface enters the turn through this prologue.
+-    _maybe_title_session_at_turn_start(agent, messages)
++    if gateway_system_event is None:
++        _maybe_title_session_at_turn_start(agent, messages)
+ 
+     return TurnContext(
+         user_message=user_message,
+diff --git a/gateway/internal_events.py b/gateway/internal_events.py
+new file mode 100644
+--- /dev/null
++++ b/gateway/internal_events.py
+@@ -0,0 +1,259 @@
++"""Typed host boundary for plugin-triggered gateway continuation events.
++
++The public plugin API creates these values; gateway code carries them through
++the normal adapter queue and agent turn path.  Keeping the marker typed and
++closed prevents a caller from using the extension as a generic role override.
++"""
++
++from __future__ import annotations
++
++import concurrent.futures
++import inspect
++import re
++import uuid
++from dataclasses import dataclass, field
++from typing import Any, Callable, Final, Mapping, Optional
++
++
++GATEWAY_SYSTEM_EVENT_KINDS: Final[frozenset[str]] = frozenset(
++    {
++        "external_tool_completed",
++        "external_tool_error",
++        "external_tool_pending_decision",
++    }
++)
++
++_MAX_CONTENT_CHARS = 16_384
++_MAX_SESSION_KEY_CHARS = 512
++_MAX_IDENTIFIER_CHARS = 256
++_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:@/+~-]+$")
++_MESSAGE_MARKER_VERSION = 1
++_EXPECTED_ROUTE_FIELDS: Final[frozenset[str]] = frozenset(
++    {"profile_name", "platform", "user_id", "chat_id", "topic_id"}
++)
++
++
++@dataclass(frozen=True)
++class GatewayExpectedRoute:
++    """Immutable identity tuple supplied by an authorized plugin caller."""
++
++    profile_name: str
++    platform: str
++    user_id: str
++    chat_id: str
++    topic_id: str
++
++
++@dataclass(frozen=True)
++class GatewaySystemEvent:
++    """Validated event admitted by the host-owned plugin API."""
++
++    session_key: str
++    expected_session_id: str
++    event_id: str
++    event_kind: str
++    plugin_id: str
++    receipt_id: str
++    expected_route: GatewayExpectedRoute
++    eligibility_check: Callable[[], bool] = field(repr=False, compare=False)
++
++
++def _bounded_identifier(value: Any, *, name: str, max_chars: int) -> str:
++    if not isinstance(value, str):
++        raise ValueError(f"{name} must be a string")
++    value = value.strip()
++    if not value or len(value) > max_chars or not _IDENTIFIER_RE.fullmatch(value):
++        raise ValueError(f"{name} is invalid")
++    return value
++
++
++def _snapshot_expected_route(value: Any) -> GatewayExpectedRoute:
++    if not isinstance(value, Mapping):
++        raise ValueError("expected_route must contain the complete route tuple")
++    try:
++        keys = set(value)
++    except Exception as exc:
++        raise ValueError("expected_route keys are invalid") from exc
++    if keys != _EXPECTED_ROUTE_FIELDS:
++        raise ValueError("expected_route must contain the complete route tuple")
++    normalized: dict[str, str] = {}
++    for name in _EXPECTED_ROUTE_FIELDS:
++        try:
++            raw = value[name]
++        except Exception as exc:
++            raise ValueError(f"expected_route.{name} is unavailable") from exc
++        if not isinstance(raw, str):
++            raise ValueError(f"expected_route.{name} must be a string")
++        raw = raw.strip()
++        if name != "topic_id" and not raw:
++            raise ValueError(f"expected_route.{name} is empty")
++        if len(raw) > _MAX_IDENTIFIER_CHARS:
++            raise ValueError(f"expected_route.{name} exceeds the host limit")
++        normalized[name] = raw
++    return GatewayExpectedRoute(**normalized)
++
++
++def create_gateway_system_event(
++    *,
++    content: Any,
++    session_key: Any,
++    expected_session_id: Any,
++    event_id: Any,
++    event_kind: Any,
++    plugin_id: Any,
++    expected_route: Any,
++    eligibility_check: Any,
++) -> tuple[str, GatewaySystemEvent]:
++    """Validate an external request and return its content plus typed marker."""
++
++    if not isinstance(content, str):
++        raise ValueError("content must be a string")
++    if not content.strip() or len(content) > _MAX_CONTENT_CHARS:
++        raise ValueError("content is empty or exceeds the host limit")
++
++    session_key = _bounded_identifier(
++        session_key, name="session_key", max_chars=_MAX_SESSION_KEY_CHARS
++    )
++    expected_session_id = _bounded_identifier(
++        expected_session_id,
++        name="expected_session_id",
++        max_chars=_MAX_IDENTIFIER_CHARS,
++    )
++    event_id = _bounded_identifier(
++        event_id, name="event_id", max_chars=_MAX_IDENTIFIER_CHARS
++    )
++    plugin_id = _bounded_identifier(
++        plugin_id, name="plugin_id", max_chars=_MAX_IDENTIFIER_CHARS
++    )
++    if not isinstance(event_kind, str) or event_kind not in GATEWAY_SYSTEM_EVENT_KINDS:
++        raise ValueError("event_kind is not supported")
++    route = _snapshot_expected_route(expected_route)
++    if not callable(eligibility_check):
++        raise ValueError("eligibility_check must be callable")
++
++    return content, GatewaySystemEvent(
++        session_key=session_key,
++        expected_session_id=expected_session_id,
++        event_id=event_id,
++        event_kind=event_kind,
++        plugin_id=plugin_id,
++        receipt_id=uuid.uuid4().hex,
++        expected_route=route,
++        eligibility_check=eligibility_check,
++    )
++
++
++def gateway_system_event_is_eligible(event: Any) -> bool:
++    """Run the process-local admission predicate and fail closed.
++
++    The callback is a deliberately synchronous trust boundary.  Awaitables are
++    rejected so gateway admission never performs plugin I/O or leaves work
++    scheduled on an unrelated event loop.
++    """
++
++    if not isinstance(event, GatewaySystemEvent):
++        return False
++    try:
++        result = event.eligibility_check()
++    except Exception:
++        return False
++    if inspect.isawaitable(result):
++        close = getattr(result, "close", None)
++        if callable(close):
++            close()
++        return False
++    return result is True
++
++
++def gateway_system_event_message(
++    event: GatewaySystemEvent,
++    content: Any,
++) -> dict[str, Any]:
++    """Build the append-only developer-role message persisted for this event."""
++
++    if not isinstance(event, GatewaySystemEvent):
++        raise ValueError("gateway system event marker is invalid")
++    if not isinstance(content, str) or not content or len(content) > _MAX_CONTENT_CHARS:
++        raise ValueError("gateway system event content is invalid")
++    return {
++        "role": "developer",
++        "content": content,
++        "display_kind": "internal_notification",
++        "display_metadata": {
++            "schema_version": _MESSAGE_MARKER_VERSION,
++            "event_kind": event.event_kind,
++            "event_id": event.event_id,
++            "plugin_id": event.plugin_id,
++        },
++    }
++
++
++def new_gateway_event_receipt() -> concurrent.futures.Future:
++    """Return the cross-thread Future exposed to a plugin caller."""
++
++    return concurrent.futures.Future()
++
++
++def gateway_event_result(
++    status: str,
++    *,
++    event: Optional[GatewaySystemEvent] = None,
++    receipt_id: Optional[str] = None,
++) -> Mapping[str, Any]:
++    """Create the bounded mapping returned by a terminal receipt."""
++
++    result: dict[str, Any] = {"status": status}
++    resolved_receipt_id = event.receipt_id if event is not None else receipt_id
++    if resolved_receipt_id:
++        result["receipt_id"] = str(resolved_receipt_id)[:_MAX_IDENTIFIER_CHARS]
++    return result
++
++
++def resolve_gateway_event_receipt(
++    receipt: Any,
++    status: str,
++    *,
++    event: Optional[GatewaySystemEvent] = None,
++) -> bool:
++    """Resolve a receipt exactly once; return whether this call won."""
++
++    if not isinstance(receipt, concurrent.futures.Future) or receipt.done():
++        return False
++    try:
++        receipt.set_result(gateway_event_result(status, event=event))
++    except concurrent.futures.InvalidStateError:
++        return False
++    return True
++
++
++def resolve_message_event_receipt(message_event: Any, status: str) -> bool:
++    """Resolve the typed receipt carried by a ``MessageEvent`` if present."""
++
++    event = getattr(message_event, "gateway_system_event", None)
++    receipt = getattr(message_event, "gateway_event_receipt", None)
++    if not isinstance(event, GatewaySystemEvent):
++        return False
++    return resolve_gateway_event_receipt(receipt, status, event=event)
++
++
++def admit_message_event_receipt(message_event: Any) -> bool:
++    """Atomically mark a typed receipt running at actual model admission.
++
++    Queued receipts deliberately remain pending.  A caller cancellation that
++    wins before this boundary prevents the event from executing.
++    """
++
++    event = getattr(message_event, "gateway_system_event", None)
++    receipt = getattr(message_event, "gateway_event_receipt", None)
++    if not isinstance(event, GatewaySystemEvent):
++        return False
++    if not isinstance(receipt, concurrent.futures.Future):
++        return False
++    if receipt.running():
++        return True
++    if receipt.done():
++        return False
++    try:
++        return receipt.set_running_or_notify_cancel()
++    except RuntimeError:
++        return receipt.running()
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2604,6 +2604,12 @@
+     # Proactive plugin events set this to False so untrusted payload text
+     # remains conversational input.
+     allow_gateway_control: bool = True
++
++    # Host-created continuation marker + cross-thread terminal receipt.  These
++    # are populated only by PluginContext.inject_gateway_system_event; normal
++    # platform events leave both fields unset.
++    gateway_system_event: Any = None
++    gateway_event_receipt: Any = None
+     
+     def is_command(self) -> bool:
+         """Check if this is a command message (e.g., /new, /reset)."""
+@@ -6194,7 +6200,11 @@
+             session_key,
+         )
+         self._active_sessions.pop(session_key, None)
+-        self._pending_messages.pop(session_key, None)
++        stale_pending = self._pending_messages.pop(session_key, None)
++        if stale_pending is not None:
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(stale_pending, "cancelled")
+         self._session_tasks.pop(session_key, None)
+         self._discard_text_debounce(session_key)
+         return True
+@@ -6277,7 +6287,11 @@
+                     exc_info=True,
+                 )
+         if discard_pending:
+-            self._pending_messages.pop(session_key, None)
++            discarded = self._pending_messages.pop(session_key, None)
++            if discarded is not None:
++                from gateway.internal_events import resolve_message_event_receipt
++
++                resolve_message_event_receipt(discarded, "cancelled")
+             self._discard_text_debounce(session_key)
+         if release_guard:
+             self._release_session_guard(session_key)
+@@ -6386,6 +6400,9 @@
+         enabling interruption support.
+         """
+         if not self._message_handler:
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "agent_error")
+             return
+ 
+         if event.allow_gateway_control:
+@@ -6398,6 +6415,7 @@
+             getattr(self, "_topic_recovery_fn", None) is not None
+             and event.source.platform == Platform.TELEGRAM
+             and event.source.chat_type == "dm"
++            and getattr(event, "gateway_system_event", None) is None
+         )
+         if needs_topic_recovery:
+             await asyncio.to_thread(self._apply_topic_recovery, event)
+@@ -6417,6 +6435,9 @@
+                 expected_session_key,
+                 session_key,
+             )
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "route_mismatch")
+             return
+ 
+         # On-entry self-heal: if the adapter still has an _active_sessions
+@@ -6592,7 +6613,10 @@
+         # pattern — set the guard synchronously, not inside the task.)
+         # _start_session_processing installs the guard AND the owner-task
+         # mapping atomically so stale-lock detection works.
+-        self._start_session_processing(event, session_key)
++        if not self._start_session_processing(event, session_key):
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "agent_error")
+     
+     @staticmethod
+     def _get_human_delay() -> float:
+@@ -7187,6 +7211,12 @@
+                 event,
+                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+             )
++            from gateway.internal_events import resolve_message_event_receipt
++
++            _gateway_status = getattr(event, "_gateway_event_terminal_status", None)
++            if _gateway_status not in {"agent_error", "cancelled"}:
++                _gateway_status = "completed" if processing_ok else "agent_error"
++            resolve_message_event_receipt(event, _gateway_status)
+ 
+             # The active drain owns debounce state. If a queue-mode timer has
+             # not fired yet, force-flush into _pending_messages here and let
+@@ -7238,9 +7268,15 @@
+             if current_task is None or current_task not in self._expected_cancelled_tasks:
+                 outcome = ProcessingOutcome.FAILURE
+             await self._run_processing_hook("on_processing_complete", event, outcome)
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "cancelled")
+             raise
+         except BaseException as e:
+             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "agent_error")
+             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+             # Send the error to the user so they aren't left with radio silence
+             try:
+@@ -7455,10 +7491,23 @@
+         self._background_tasks.clear()
+         self._expected_cancelled_tasks.clear()
+         self._session_tasks.clear()
++        # Typed internal events cannot be recovered as ordinary user messages.
++        # Resolve them as stopping and exclude them from the legacy text spool.
++        from gateway.internal_events import resolve_message_event_receipt
++
++        for pending_event in list(self._pending_messages.values()):
++            resolve_message_event_receipt(pending_event, "stopping")
+         # Flush pending messages to disk before clearing (#72680).
+         try:
+             from gateway.shutdown_flush import flush_pending_to_file
+-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
++            flush_pending_to_file(
++                {
++                    key: value
++                    for key, value in self._pending_messages.items()
++                    if getattr(value, "gateway_system_event", None) is None
++                },
++                reason="adapter_shutdown",
++            )
+         except Exception:
+             pass
+         self._pending_messages.clear()
+diff --git a/gateway/run.py b/gateway/run.py
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3126,6 +3126,7 @@
+     SessionSource,
+     SessionContext,
+     TranscriptReadError,
++    TYPED_EVENT_RECOVERY_METADATA_KEY,
+     _session_key_namespace,
+     build_session_context,
+     build_session_context_prompt,
+@@ -3133,6 +3134,7 @@
+     build_session_key,
+     is_shared_multi_user_session,
+     neutralize_untrusted_inline_text,
++    rebind_typed_event_recovery_metadata,
+ )
+ from gateway.delivery import (
+     DeliveryRouter,
+@@ -6386,6 +6388,18 @@
+                     self._runner._enforce_agent_cache_cap()
+             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+ 
++        if (
++            ctx.gateway_system_event is not None
++            and getattr(agent, "api_mode", None) != "codex_responses"
++        ):
++            rejected = {
++                "gateway_system_event_error": "unsupported_transport",
++                "failed": True,
++                "completed": False,
++            }
++            ctx.result_holder[0] = rejected
++            return rejected
++
+         # Per-message state — callbacks and reasoning config change every
+         # turn and must not be baked into the cached agent constructor.
+         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
+@@ -6480,8 +6494,12 @@
+         # _handle_message_with_agent (auto-reset note, first-contact
+         # intro, voice-channel change).  Assigned unconditionally so a
+         # reused cached agent never replays a stale note.
+-        agent._gateway_turn_context_notes = "\n\n".join(
+-            self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
++        agent._gateway_turn_context_notes = (
++            ""
++            if ctx.gateway_system_event is not None
++            else "\n\n".join(
++                self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
++            )
+         )
+ 
+         _bg_review_release = threading.Event()
+@@ -6923,7 +6941,11 @@
+ 
+         # Prepend pending model switch note so the model knows about the switch
+         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
+-        _msn = _pending_notes.pop(ctx.session_key, None) if ctx.session_key else None
++        _msn = (
++            _pending_notes.pop(ctx.session_key, None)
++            if ctx.gateway_system_event is None and ctx.session_key
++            else None
++        )
+         if _msn:
+             ctx.message = _msn + "\n\n" + ctx.message
+ 
+@@ -6992,7 +7014,9 @@
+             and _interruption_is_fresh
+         )
+ 
+-        if _is_resume_pending:
++        if ctx.gateway_system_event is not None:
++            pass
++        elif _is_resume_pending:
+             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
+             # The empty-message case is the auto-resume startup turn
+             # synthesized by _schedule_resume_pending_sessions — there is
+@@ -7025,7 +7049,12 @@
+         # clear. Nothing was written to the transcript out-of-band, so
+         # message alternation stays intact.
+         _pending_notes = getattr(self._runner, "_pending_skills_reload_notes", None)
+-        if _pending_notes and ctx.session_key and ctx.session_key in _pending_notes:
++        if (
++            ctx.gateway_system_event is None
++            and _pending_notes
++            and ctx.session_key
++            and ctx.session_key in _pending_notes
++        ):
+             _srn = _pending_notes.pop(ctx.session_key, None)
+             if _srn:
+                 ctx.message = _srn + "\n\n" + ctx.message
+@@ -7065,7 +7094,11 @@
+             # attachment, wrap the user turn as an OpenAI-style multimodal
+             # content list. Consume-and-clear so subsequent turns on the same
+             # runner instance don't re-attach stale images.
+-            _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
++            _native_imgs = (
++                []
++                if ctx.gateway_system_event is not None
++                else self._runner._consume_pending_native_image_paths(ctx.session_key)
++            )
+             if _native_imgs:
+                 try:
+                     from agent.image_routing import build_native_content_parts
+@@ -7092,14 +7125,22 @@
+             else:
+                 _run_message = ctx.message
+ 
+-            _api_run_message = _wrap_current_message_with_observed_context(
+-                _run_message,
+-                observed_group_context,
++            _api_run_message = (
++                _run_message
++                if ctx.gateway_system_event is not None
++                else _wrap_current_message_with_observed_context(
++                    _run_message,
++                    observed_group_context,
++                )
+             )
+             _conversation_kwargs = {
+                 "conversation_history": agent_history,
+                 "task_id": ctx.session_id,
+             }
++            if ctx.gateway_system_event is not None:
++                _conversation_kwargs["gateway_system_event"] = (
++                    ctx.gateway_system_event
++                )
+             if _persist_user_message_override is not None:
+                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
+             elif observed_group_context:
+@@ -7435,6 +7476,10 @@
+             # self-persisted (it didn't — see codex_runtime.py).  Default
+             # True preserves the skip-db behaviour for the standard runtime.
+             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
++            "gateway_system_event_error": (
++                ctx.result_holder[0].get("gateway_system_event_error")
++                if ctx.result_holder[0] else None
++            ),
+         }
+ 
+ 
+@@ -11177,10 +11222,15 @@
+     # still small enough to never threaten memory.
+     _BUSY_QUEUE_MAX_PENDING = 32
+ 
+-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
++    def _queue_or_replace_pending_event(
++        self, session_key: str, event: MessageEvent
++    ) -> bool:
+         adapter = self._adapter_for_source(event.source)
+         if not adapter:
+-            return
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "route_mismatch")
++            return False
+         # #28503 — Previously this called ``merge_pending_message_event``
+         # with the default ``merge_text=False``, which silently OVERWROTE
+         # the single pending slot when consecutive text messages arrived
+@@ -11221,7 +11271,7 @@
+                 event,
+                 merge_text=event.message_type == MessageType.TEXT,
+             )
+-            return
++            return True
+ 
+         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+             logger.warning(
+@@ -11229,9 +11279,13 @@
+                 session_key,
+                 self._BUSY_QUEUE_MAX_PENDING,
+             )
+-            return
++            from gateway.internal_events import resolve_message_event_receipt
++
++            resolve_message_event_receipt(event, "busy")
++            return False
+ 
+         self._enqueue_fifo(session_key, event, adapter)
++        return True
+ 
+     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
+         """Return steerable text for a busy follow-up, transcribing voice first.
+@@ -11271,6 +11325,28 @@
+         return (enriched_text or text).strip()
+ 
+     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
++        system_event = getattr(event, "gateway_system_event", None)
++        if system_event is not None:
++            from gateway.internal_events import resolve_message_event_receipt
++
++            status, _entry, strict_source = (
++                await self._gateway_system_event_target(
++                    system_event, check_eligibility=False
++                )
++            )
++            if status is not None:
++                resolve_message_event_receipt(event, status)
++                return True
++            if session_key != system_event.session_key:
++                resolve_message_event_receipt(event, "route_mismatch")
++                return True
++            event.source = strict_source
++            if self._draining:
++                resolve_message_event_receipt(event, "stopping")
++                return True
++            self._queue_or_replace_pending_event(session_key, event)
++            return True
++
+         # --- Authorization gate (#17775) ---
+         # The cold path (_handle_message) checks _is_user_authorized before
+         # creating a session.  The busy path must enforce the same check;
+@@ -13505,10 +13581,16 @@
+         try:
+             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
++                typed_owned_session_ids = {
++                    candidate.session_id
++                    for candidate in self.session_store._entries.values()  # noqa: SLF001
++                    if TYPED_EVENT_RECOVERY_METADATA_KEY in candidate.metadata
++                }
+                 candidates = [
+                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                     if entry.resume_pending
+                     and not entry.suspended
++                    and entry.session_id not in typed_owned_session_ids
+                     and entry.origin is not None
+                     and entry.resume_reason in self._AUTO_RESUME_REASONS
+                     and (platform is None or entry.origin.platform == platform)
+@@ -14635,6 +14717,12 @@
+         self.delivery_router.adapters = self.adapters
+         self._wire_teams_pipeline_runtime()
+ 
++        # Gateway workers must be registered before the host publishes its
++        # ready edge; unlike agent tools, they cannot wait for a first turn to
++        # trigger lazy plugin discovery.
++        from hermes_cli.plugins import discover_plugins
++
++        discover_plugins()
+         self._running = True
+         self._install_plugin_message_injector()
+         self._update_runtime_status("running")
+@@ -16892,12 +16980,22 @@
+             # parked in overflow at restart time is lost (#99882).
+             try:
+                 from gateway.shutdown_flush import flush_overflow_to_file
++                from gateway.internal_events import resolve_message_event_receipt
++
++                _overflow_for_flush = {}
++                for _k, _v in dict(
++                    getattr(self, "_queued_events", None) or {}
++                ).items():
++                    _legacy_events = []
++                    for _event in list(_v):
++                        if getattr(_event, "gateway_system_event", None) is not None:
++                            resolve_message_event_receipt(_event, "stopping")
++                        else:
++                            _legacy_events.append(_event)
++                    if _legacy_events:
++                        _overflow_for_flush[_k] = _legacy_events
+                 flush_overflow_to_file(
+-                    {
+-                        _k: list(_v)
+-                        for _k, _v in dict(getattr(self, "_queued_events", None) or {}).items()
+-                        if _v
+-                    },
++                    _overflow_for_flush,
+                     reason="shutdown",
+                 )
+             except Exception:
+@@ -19448,6 +19546,17 @@
+                 return await self._dispatch_busy_slash_command(
+                     event, _cmd_def_inner, _quick_key, source,
+                 )
++
++            if getattr(event, "gateway_system_event", None) is not None:
++                if self._draining:
++                    from gateway.internal_events import (
++                        resolve_message_event_receipt,
++                    )
++
++                    resolve_message_event_receipt(event, "stopping")
++                    return None
++                self._queue_or_replace_pending_event(_quick_key, event)
++                return None
+ 
+             if event.message_type == MessageType.PHOTO:
+                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
+@@ -21005,10 +21114,63 @@
+         self,
+         event: "MessageEvent",
+         session_key: str,
++        session_id: Optional[str] = None,
++        *,
++        turn_lease_acquired: bool = False,
+     ) -> bool:
+         """Persist the exact resolved routing key for this running turn."""
++        system_event = getattr(event, "gateway_system_event", None)
++        if system_event is not None:
++            from gateway.internal_events import resolve_message_event_receipt
++
++            # A typed continuation may never degrade past the physical-session
++            # serializer. Its trusted ledger is the only crash-recovery owner.
++            if not turn_lease_acquired or not session_id:
++                resolve_message_event_receipt(event, "agent_error")
++                return False
++            status, current_entry, current_source = (
++                await self._gateway_system_event_target(system_event)
++            )
++            if status is not None:
++                resolve_message_event_receipt(event, status)
++                return False
++            if current_entry.session_id != session_id:
++                resolve_message_event_receipt(event, "session_mismatch")
++                return False
++            try:
++                persisted = (
++                    await self.async_session_store.mark_typed_event_recovery_owner(
++                        session_key,
++                        session_id,
++                        system_event.receipt_id,
++                    )
++                )
++            except Exception as exc:
++                logger.warning(
++                    "Could not persist typed-event recovery owner for %s: %s",
++                    session_key,
++                    exc,
++                )
++                resolve_message_event_receipt(event, "agent_error")
++                return False
++            if not persisted:
++                # A concurrent suspension/recovery flag is a pre-admission
++                # conflict. Re-resolve stronger terminal identities first.
++                status, _entry, _source = await self._gateway_system_event_target(
++                    system_event
++                )
++                resolve_message_event_receipt(event, status or "busy")
++                return False
++            event.source = current_source
++            return True
+         try:
+-            token = await self.async_session_store.mark_turn_active(session_key)
++            token = await self.async_session_store.mark_turn_active(
++                session_key,
++                expected_session_id=session_id,
++                clear_typed_event_recovery=not bool(
++                    getattr(event, "internal", False)
++                ),
++            )
+         except Exception as exc:
+             logger.warning(
+                 "Could not persist active-turn marker for %s: %s",
+@@ -21071,25 +21233,43 @@
+         """Publish this live gateway's plugin message scheduler."""
+         from hermes_cli.plugins import get_plugin_manager
+ 
+-        get_plugin_manager().set_gateway_message_injector(
++        manager = get_plugin_manager()
++        manager.set_gateway_message_injector(
+             self,
+             self._schedule_plugin_message_injection,
+         )
++        manager._start_gateway_tasks(getattr(self, "_gateway_loop", None))
++        manager._emit_core_event("gateway_ready")
+ 
+     def _clear_plugin_message_injector(self) -> None:
+         """Remove this runner's scheduler without clobbering a newer owner."""
+         from hermes_cli.plugins import get_plugin_manager
+ 
+-        get_plugin_manager().clear_gateway_message_injector(self)
++        manager = get_plugin_manager()
++        if not manager.gateway_message_injector_owned_by(self):
++            return
++        manager._emit_core_event("gateway_stopping")
++        manager._stop_gateway_tasks()
++        manager.clear_gateway_message_injector(self)
+ 
+     def _schedule_plugin_message_injection(
+         self,
+         *,
+-        session_key: str,
+         content: str,
+-        plugin_id: str,
+-    ) -> bool:
++        session_key: str | None = None,
++        plugin_id: str | None = None,
++        system_event=None,
++        receipt=None,
++    ):
+         """Schedule a plugin-triggered turn on the live gateway loop."""
++        if system_event is not None:
++            return self._schedule_plugin_system_event(
++                content=content,
++                system_event=system_event,
++                receipt=receipt,
++            )
++        if not session_key or not plugin_id:
++            return False
+         loop = getattr(self, "_gateway_loop", None)
+         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+             return False
+@@ -21149,6 +21329,268 @@
+ 
+         future.add_done_callback(_log_result)
+         return True
++
++    def _schedule_plugin_system_event(self, *, content, system_event, receipt):
++        """Schedule one typed event and return its terminal cross-thread receipt."""
++        from gateway.internal_events import (
++            GatewaySystemEvent,
++            resolve_gateway_event_receipt,
++        )
++
++        if not isinstance(system_event, GatewaySystemEvent):
++            return None
++        if not isinstance(receipt, concurrent.futures.Future):
++            return None
++
++        receipt_cache = getattr(self, "_gateway_system_event_receipts", None)
++        if receipt_cache is None:
++            receipt_cache = OrderedDict()
++            self._gateway_system_event_receipts = receipt_cache
++        dedup_key = (system_event.plugin_id, system_event.event_id)
++        existing = receipt_cache.get(dedup_key)
++        if isinstance(existing, concurrent.futures.Future):
++            receipt_cache.move_to_end(dedup_key)
++            return existing
++
++        # Retain terminal receipts so a same-process retry cannot repeat writes.
++        # Evict only completed oldest entries; pending receipts remain owned by
++        # the live adapter queue.
++        while len(receipt_cache) >= 1024:
++            oldest_key, oldest = next(iter(receipt_cache.items()))
++            if not oldest.done():
++                resolve_gateway_event_receipt(
++                    receipt, "busy", event=system_event
++                )
++                return receipt
++            receipt_cache.pop(oldest_key, None)
++        receipt_cache[dedup_key] = receipt
++
++        loop = getattr(self, "_gateway_loop", None)
++        if (
++            not getattr(self, "_running", False)
++            or getattr(self, "_draining", False)
++            or loop is None
++            or loop.is_closed()
++        ):
++            resolve_gateway_event_receipt(receipt, "stopping", event=system_event)
++            return receipt
++
++        coro = self._dispatch_plugin_system_event(
++            content=content,
++            system_event=system_event,
++            receipt=receipt,
++        )
++        try:
++            current_loop = asyncio.get_running_loop()
++        except RuntimeError:
++            current_loop = None
++        if current_loop is loop:
++            try:
++                dispatch_future = loop.create_task(coro)
++            except Exception:
++                coro.close()
++                resolve_gateway_event_receipt(
++                    receipt, "agent_error", event=system_event
++                )
++                return receipt
++            self._background_tasks.add(dispatch_future)
++            dispatch_future.add_done_callback(self._background_tasks.discard)
++        else:
++            dispatch_future = safe_schedule_threadsafe(
++                coro,
++                loop,
++                logger=logger,
++                log_message="Plugin system event scheduling failed",
++                log_level=logging.WARNING,
++            )
++            if dispatch_future is None:
++                resolve_gateway_event_receipt(
++                    receipt, "agent_error", event=system_event
++                )
++                return receipt
++
++        def _finish_failed_dispatch(completed) -> None:
++            try:
++                completed.result()
++            except (asyncio.CancelledError, concurrent.futures.CancelledError):
++                resolve_gateway_event_receipt(
++                    receipt, "cancelled", event=system_event
++                )
++            except Exception:
++                logger.warning(
++                    "Plugin system event dispatch failed: plugin=%s event=%s",
++                    system_event.plugin_id,
++                    system_event.event_id,
++                    exc_info=True,
++                )
++                resolve_gateway_event_receipt(
++                    receipt, "agent_error", event=system_event
++                )
++
++        dispatch_future.add_done_callback(_finish_failed_dispatch)
++        return receipt
++
++    async def _gateway_system_event_target(
++        self, system_event, *, check_eligibility: bool = True
++    ):
++        """Resolve and revalidate the exact open session for a typed event."""
++        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
++            return "stopping", None, None
++
++        from gateway.internal_events import (
++            GatewaySystemEvent,
++            GatewayExpectedRoute,
++            gateway_system_event_is_eligible,
++        )
++        from hermes_cli.plugins import get_plugin_manager
++
++        if not isinstance(system_event, GatewaySystemEvent):
++            return "agent_error", None, None
++        if check_eligibility and not gateway_system_event_is_eligible(system_event):
++            return "unauthorized", None, None
++        manager = get_plugin_manager()
++        if not manager.gateway_injection_allowed(system_event.plugin_id):
++            return "unauthorized", None, None
++
++        entry = await self.async_session_store.lookup_by_session_key(
++            system_event.session_key
++        )
++        if entry is None or entry.origin is None:
++            return "route_mismatch", None, None
++        if entry.session_id != system_event.expected_session_id:
++            return "session_mismatch", None, None
++        if entry.suspended:
++            return "unauthorized", None, None
++        if entry.resume_pending:
++            return "busy", None, None
++
++        recovery_state = (
++            await self.async_session_store.typed_event_recovery_owner_state(
++                system_event.session_key,
++                system_event.expected_session_id,
++            )
++        )
++        if recovery_state == "conflict":
++            return "busy", None, None
++
++        source = dataclasses.replace(entry.origin)
++        if self._session_key_for_source(source) != system_event.session_key:
++            return "route_mismatch", None, None
++        source_profile = str(getattr(source, "profile", None) or "").strip()
++        if not source_profile:
++            profile_from_key = getattr(
++                self.session_store, "_profile_from_session_key", None
++            )
++            if callable(profile_from_key):
++                source_profile = str(
++                    profile_from_key(system_event.session_key) or ""
++                ).strip()
++        if not source_profile:
++            source_profile = "default"
++        platform = (
++            source.platform.value
++            if hasattr(source.platform, "value")
++            else str(source.platform)
++        )
++        actual_route = GatewayExpectedRoute(
++            profile_name=source_profile,
++            platform=platform,
++            user_id=str(source.user_id or ""),
++            chat_id=str(source.chat_id or ""),
++            topic_id=str(getattr(source, "thread_id", None) or ""),
++        )
++        if actual_route != system_event.expected_route:
++            return "route_mismatch", None, None
++
++        raw_db = getattr(getattr(self, "_session_db", None), "_db", None)
++        if raw_db is None:
++            raw_db = getattr(self, "_session_db", None)
++        get_session = getattr(raw_db, "get_session", None)
++        if not callable(get_session):
++            return "session_mismatch", None, None
++        try:
++            row = await asyncio.to_thread(
++                get_session, system_event.expected_session_id
++            )
++        except Exception:
++            return "session_mismatch", None, None
++        if not isinstance(row, dict) or row.get("ended_at") is not None:
++            return "session_mismatch", None, None
++
++        try:
++            authorized = self._is_user_authorized(
++                source, allow_adapter_delegation=False
++            )
++        except Exception:
++            authorized = False
++        if not authorized:
++            return "unauthorized", None, None
++
++        adapter = self._adapter_for_source(source)
++        if adapter is None:
++            return "route_mismatch", None, None
++        return None, entry, source
++
++    async def _admit_gateway_system_event_turn(self, event, session_entry):
++        """Revalidate a FIFO-released event at the model admission boundary."""
++        from gateway.internal_events import (
++            admit_message_event_receipt,
++            resolve_message_event_receipt,
++        )
++
++        system_event = getattr(event, "gateway_system_event", None)
++        status, current_entry, current_source = (
++            await self._gateway_system_event_target(system_event)
++        )
++        if status is not None:
++            resolve_message_event_receipt(event, status)
++            return None
++        if current_entry.session_id != session_entry.session_id:
++            resolve_message_event_receipt(event, "session_mismatch")
++            return None
++        if not admit_message_event_receipt(event):
++            return None
++        return current_source
++
++    async def _dispatch_plugin_system_event(
++        self, *, content, system_event, receipt
++    ) -> None:
++        """Route a typed event through the existing adapter/session serializer."""
++        from gateway.internal_events import resolve_gateway_event_receipt
++
++        status, entry, source = await self._gateway_system_event_target(system_event)
++        if status is not None:
++            resolve_gateway_event_receipt(receipt, status, event=system_event)
++            return
++        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
++            resolve_gateway_event_receipt(
++                receipt, "stopping", event=system_event
++            )
++            return
++
++        event = MessageEvent(
++            text=content,
++            message_type=MessageType.TEXT,
++            source=source,
++            internal=True,
++            allow_gateway_control=False,
++            metadata={
++                "hermes_plugin_id": system_event.plugin_id,
++                "hermes_plugin_injection": True,
++                "gateway_session_key": system_event.session_key,
++                "gateway_session_id": system_event.expected_session_id,
++                "gateway_session_strict": True,
++            },
++            gateway_system_event=system_event,
++            gateway_event_receipt=receipt,
++        )
++        adapter = self._adapter_for_source(source)
++        if adapter is None:
++            resolve_gateway_event_receipt(
++                receipt, "route_mismatch", event=system_event
++            )
++            return
++        await adapter.handle_message(event)
+ 
+     async def _dispatch_plugin_message_injection(
+         self,
+@@ -21234,8 +21676,14 @@
+     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+         """Inner handler that runs under the _running_agents sentinel guard."""
+         _msg_start_time = time.time()
++        system_event = getattr(event, "gateway_system_event", None)
+         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
++        _msg_preview = (
++            f"<gateway-system-event kind={system_event.event_kind} "
++            f"id={system_event.event_id}>"
++            if system_event is not None
++            else (event.text or "")[:80].replace("\n", " ")
++        )
+         _reply_id = getattr(event, "reply_to_message_id", None)
+         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+         logger.info(
+@@ -21248,7 +21696,13 @@
+         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
+         # last-active topic so a cross-topic Reply or stripped plain reply
+         # doesn't fragment the conversation across sessions.
+-        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
++        recovered = (
++            None
++            if system_event is not None
++            else await asyncio.to_thread(
++                self._recover_telegram_topic_thread_id, source
++            )
++        )
+         if recovered is not None:
+             logger.info(
+                 "telegram topic recovery: chat=%s user=%s %r -> %s",
+@@ -21273,11 +21727,28 @@
+                     expected_session_key,
+                     derived_session_key,
+                 )
++                if system_event is not None:
++                    from gateway.internal_events import resolve_message_event_receipt
++
++                    resolve_message_event_receipt(event, "route_mismatch")
+                 return
+ 
+         strict_session = bool(event_metadata.get("gateway_session_strict"))
+         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
+-        if strict_session:
++        if system_event is not None:
++            from gateway.internal_events import resolve_message_event_receipt
++
++            status, session_entry, strict_source = (
++                await self._gateway_system_event_target(
++                    system_event, check_eligibility=False
++                )
++            )
++            if status is not None:
++                resolve_message_event_receipt(event, status)
++                return
++            source = strict_source
++            event.source = source
++        elif strict_session:
+             session_entry = await self.async_session_store.lookup_by_session_key(
+                 expected_session_key
+             )
+@@ -21312,7 +21783,9 @@
+                 return
+             session_entry = resolved_entry
+         self._cache_session_source(session_key, source)
+-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
++        if not strict_session and await asyncio.to_thread(
++            self._is_telegram_topic_lane, source
++        ):
+             try:
+                 binding = (await self._session_db.get_telegram_topic_binding(
+                     chat_id=str(source.chat_id),
+@@ -21373,7 +21846,11 @@
+         # Capture and immediately consume was_auto_reset so it does not
+         # re-fire on subsequent messages — preventing the cleanup from
+         # wiping model/reasoning overrides set between turns (Closes #48031).
+-        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
++        _was_auto_reset = (
++            getattr(session_entry, "was_auto_reset", False)
++            if system_event is None
++            else False
++        )
+         if _was_auto_reset:
+             # Treat auto-reset as a full conversation boundary — clear every
+             # conversation-scoped per-session dict in one funnel call so the
+@@ -21393,13 +21870,16 @@
+         
+         # Emit session:start for new or auto-reset sessions
+         _is_new_session = (
+-            session_entry.created_at == session_entry.updated_at
+-            or _was_auto_reset
+-            or getattr(session_entry, "is_fresh_reset", False)
++            system_event is None
++            and (
++                session_entry.created_at == session_entry.updated_at
++                or _was_auto_reset
++                or getattr(session_entry, "is_fresh_reset", False)
++            )
+         )
+         # Consume the is_fresh_reset flag immediately so it doesn't leak
+         # onto subsequent messages in the same session (issue #6508).
+-        if getattr(session_entry, "is_fresh_reset", False):
++        if system_event is None and getattr(session_entry, "is_fresh_reset", False):
+             session_entry.is_fresh_reset = False
+         if _is_new_session:
+             await self.hooks.emit("session:start", {
+@@ -21428,8 +21908,31 @@
+         # from every provider-bound payload (see conversation_loop's
+         # api_msg.pop("display_kind")).
+         persist_user_display_kind = (
+-            "internal_notification" if getattr(event, "internal", False) else None
++            "internal_notification"
++            if getattr(event, "internal", False) and system_event is None
++            else None
+         )
++
++        def _inbound_persist_entry(timestamp: float) -> dict:
++            if system_event is not None:
++                from gateway.internal_events import gateway_system_event_message
++
++                entry = gateway_system_event_message(system_event, event.text)
++                entry["timestamp"] = timestamp
++                return entry
++            return {
++                "role": "user",
++                "content": (
++                    persist_user_message
++                    if persist_user_message is not None
++                    else message_text
++                ),
++                "timestamp": (
++                    persist_user_timestamp
++                    if persist_user_timestamp is not None
++                    else timestamp
++                ),
++            }
+         try:
+             _pcfg = _load_gateway_config()
+             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
+@@ -21589,6 +22092,7 @@
+         # _release_turn_lease — granted per (routing key, run generation) so a
+         # stale unwind can't release a newer turn's lease.
+         _lease_registry = getattr(self, "_turn_leases", None)
++        _lease_token = None
+         if _lease_registry is not None:
+             try:
+                 _lease_token = await _lease_registry.acquire(
+@@ -21614,7 +22118,15 @@
+         # explicitly degraded past) the per-session lease.  Marking before the
+         # await above would falsely recover an alias-routed message that never
+         # began processing if the gateway died while it was still waiting.
+-        await self._mark_durable_active_turn(event, session_entry.session_key)
++        durable_marked = await self._mark_durable_active_turn(
++            event,
++            session_entry.session_key,
++            session_entry.session_id,
++            turn_lease_acquired=_lease_token is not None,
++        )
++        if system_event is not None and not durable_marked:
++            self._clear_session_env(_session_env_tokens)
++            return None
+ 
+         # Load conversation history from transcript. An unreadable canonical
+         # store is not an empty conversation: stop before the agent can invent
+@@ -21649,7 +22161,7 @@
+         #    by 30-50% on code/JSON-heavy sessions, but that just
+         #    means hygiene fires a bit early — safe and harmless.
+         # -----------------------------------------------------------------
+-        if history and len(history) >= 4:
++        if system_event is None and history and len(history) >= 4:
+             from agent.model_metadata import (
+                 estimate_messages_tokens_rough,
+                 get_model_context_length_async,
+@@ -22768,7 +23280,13 @@
+                                             _hyg_rotated = False
+                                             _hyg_in_place = False
+                                         else:
++                                            _hyg_prior_sid = session_entry.session_id
+                                             session_entry.session_id = _hyg_new_sid
++                                            rebind_typed_event_recovery_metadata(
++                                                session_entry,
++                                                _hyg_prior_sid,
++                                                _hyg_new_sid,
++                                            )
+                                             # The held turn lease follows the
+                                             # rotation so an alias key resolving
+                                             # the fresh child still serializes
+@@ -23089,7 +23607,11 @@
+         # rebuild + prompt-cache re-key per message.  The system prompt
+         # carries a static pointer line instead (gateway/session.py).
+         # -----------------------------------------------------------------
+-        _vc_note = self._voice_channel_sidecar_note(event, source, session_key)
++        _vc_note = (
++            None
++            if system_event is not None
++            else self._voice_channel_sidecar_note(event, source, session_key)
++        )
+         if _vc_note:
+             turn_sidecar_notes.append(_vc_note)
+ 
+@@ -23105,11 +23627,15 @@
+         # attachments (documents, audio, etc.) are not sent to the vision
+         # tool even when they appear in the same message.
+         # -----------------------------------------------------------------
+-        message_text = await self._prepare_profile_scoped_inbound_message_text(
+-            event=event,
+-            source=source,
+-            history=history,
+-            session_key=session_key,
++        message_text = (
++            event.text
++            if system_event is not None
++            else await self._prepare_profile_scoped_inbound_message_text(
++                event=event,
++                source=source,
++                history=history,
++                session_key=session_key,
++            )
+         )
+         if message_text is None:
+             return
+@@ -23149,12 +23675,16 @@
+                     message_text = _clean_message_text
+         except Exception as _ts_err:
+             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
++        if system_event is not None:
++            message_text = event.text
++            persist_user_message = None
++            persist_user_timestamp = None
+ 
+         # Stage the collected must-deliver notes for this turn's agent run
+         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
+         # early-out above so an aborted turn cannot leak its notes into the
+         # next turn's user message.
+-        if turn_sidecar_notes and session_key:
++        if system_event is None and turn_sidecar_notes and session_key:
+             self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
+ 
+         # Bind this gateway run generation to the adapter's active-session
+@@ -23175,9 +23705,25 @@
+                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
+                 "chat_type": getattr(source, "chat_type", "") or "",
+                 "session_id": session_entry.session_id,
+-                "message": message_text[:500],
++                "message": (
++                    f"<gateway-system-event kind={system_event.event_kind}>"
++                    if system_event is not None
++                    else message_text[:500]
++                ),
+             }
+             await self.hooks.emit("agent:start", hook_ctx)
++
++            if system_event is not None:
++                # This is the final admission boundary after the adapter FIFO.
++                # Re-read route, grant, user authorization and plugin-local
++                # eligibility immediately before any model or tool work.
++                current_source = await self._admit_gateway_system_event_turn(
++                    event, session_entry
++                )
++                if current_source is None:
++                    return None
++                source = current_source
++                event.source = source
+ 
+             # Run the agent. Capture the session id that this run was launched
+             # against so post-run compression publication can be identity-guarded
+@@ -23203,8 +23749,21 @@
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
+                 message_type=event.message_type,
++                gateway_system_event=system_event,
+             )
+             _turn_seconds = time.monotonic() - _turn_started_monotonic
++            if system_event is not None:
++                if agent_result.get("gateway_system_event_error"):
++                    event._gateway_event_terminal_status = "agent_error"
++                    resolve_message_event_receipt(event, "agent_error")
++                    return None
++                if agent_result.get("interrupted"):
++                    event._gateway_event_terminal_status = "cancelled"
++                elif (
++                    agent_result.get("failed")
++                    or agent_result.get("completed") is False
++                ):
++                    event._gateway_event_terminal_status = "agent_error"
+ 
+             # Stop persistent typing indicator now that the agent is done.
+             # Slack AI status is scoped to a thread/workspace, so preserve the
+@@ -23241,6 +23800,9 @@
+                     )
+                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
+                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
++                if system_event is not None:
++                    event._gateway_event_terminal_status = "cancelled"
++                    resolve_message_event_receipt(event, "cancelled")
+                 return None
+ 
+             response = agent_result.get("final_response") or ""
+@@ -23320,7 +23882,13 @@
+             # session_entry so transcript writes below go to the right session.
+             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+                 if session_entry.session_id == _run_start_session_id:
+-                    session_entry.session_id = agent_result["session_id"]
++                    _agent_result_sid = agent_result["session_id"]
++                    session_entry.session_id = _agent_result_sid
++                    rebind_typed_event_recovery_metadata(
++                        session_entry,
++                        _run_start_session_id,
++                        _agent_result_sid,
++                    )
+                     # The held turn lease follows the rotation: the transcript
+                     # persistence below writes to the NEW id, so the
+                     # serialization boundary must move with it or an alias
+@@ -23628,19 +24196,7 @@
+                 # reasoning-only incomplete turns follow the same persistence
+                 # rule so peer-agent channels don't ingest them as completed
+                 # assistant turns. (#7100, #51628)
+-                _user_entry = {
+-                    "role": "user",
+-                    "content": (
+-                        persist_user_message
+-                        if persist_user_message is not None
+-                        else message_text
+-                    ),
+-                    "timestamp": (
+-                        persist_user_timestamp
+-                        if persist_user_timestamp is not None
+-                        else ts
+-                    ),
+-                }
++                _user_entry = _inbound_persist_entry(ts)
+                 if persist_user_display_kind:
+                     _user_entry["display_kind"] = persist_user_display_kind
+                 if event.message_id:
+@@ -23672,19 +24228,7 @@
+ 
+                 # If no new messages found (edge case), fall back to simple user/assistant
+                 if not new_messages:
+-                    _user_entry = {
+-                        "role": "user",
+-                        "content": (
+-                            persist_user_message
+-                            if persist_user_message is not None
+-                            else message_text
+-                        ),
+-                        "timestamp": (
+-                            persist_user_timestamp
+-                            if persist_user_timestamp is not None
+-                            else ts
+-                        ),
+-                    }
++                    _user_entry = _inbound_persist_entry(ts)
+                     if persist_user_display_kind:
+                         _user_entry["display_kind"] = persist_user_display_kind
+                     if event.message_id:
+@@ -23828,6 +24372,9 @@
+             return response
+             
+         except Exception as e:
++            if system_event is not None:
++                event._gateway_event_terminal_status = "agent_error"
++                resolve_message_event_receipt(event, "agent_error")
+             # Stop typing indicator on error too, retaining Slack thread/workspace
+             # routing so a failed turn cannot leave its status visible.
+             try:
+@@ -23862,28 +24409,23 @@
+                     except Exception:
+                         _recent_transcript = []
+                     for _msg in reversed(_recent_transcript[-10:]):
+-                        if _msg.get("role") == "user":
++                        _expected_role = (
++                            "developer" if system_event is not None else "user"
++                        )
++                        if _msg.get("role") == _expected_role:
+                             _expected_user_content = (
+-                                persist_user_message
+-                                if persist_user_message is not None
+-                                else message_text
++                                event.text
++                                if system_event is not None
++                                else (
++                                    persist_user_message
++                                    if persist_user_message is not None
++                                    else message_text
++                                )
+                             )
+                             _already_persisted = (_msg.get("content") == _expected_user_content)
+                             break
+                     if not _already_persisted:
+-                        _user_entry = {
+-                            "role": "user",
+-                            "content": (
+-                                persist_user_message
+-                                if persist_user_message is not None
+-                                else message_text
+-                            ),
+-                            "timestamp": (
+-                                persist_user_timestamp
+-                                if persist_user_timestamp is not None
+-                                else time.time()
+-                            ),
+-                        }
++                        _user_entry = _inbound_persist_entry(time.time())
+                         if 'persist_user_display_kind' in locals() and persist_user_display_kind:
+                             _user_entry["display_kind"] = persist_user_display_kind
+                         if getattr(event, "message_id", None):
+@@ -29775,6 +30317,12 @@
+         # call — no per-attribute pop-list to drift.
+         state = self._peek_session_state(session_key)
+         if state is not None:
++            from gateway.internal_events import resolve_message_event_receipt
++
++            queued_events = state.conversation.queued_events
++            if isinstance(queued_events, list):
++                for queued_event in queued_events:
++                    resolve_message_event_receipt(queued_event, "cancelled")
+             state.conversation.clear()
+         # Legacy plain-dict stores still registered in
+         # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
+@@ -31150,6 +31698,7 @@
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
+         message_type: Optional[str] = None,
++        gateway_system_event=None,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+ 
+@@ -31171,6 +31720,7 @@
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
+                 message_type=message_type,
++                gateway_system_event=gateway_system_event,
+             )
+ 
+         profile_home = self._resolve_profile_home_for_source(source)
+@@ -31185,6 +31735,7 @@
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
+                 message_type=message_type,
++                gateway_system_event=gateway_system_event,
+             )
+ 
+     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
+@@ -31329,6 +31880,7 @@
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
+         message_type: Optional[str] = None,
++        gateway_system_event=None,
+     ) -> Dict[str, Any]:
+         """
+         Run the agent with the given message and context.
+@@ -31343,6 +31895,8 @@
+         Supports interruption via new messages.
+         """
+         # ---- Proxy mode: delegate to remote API server ----
++        if gateway_system_event is not None and self._get_proxy_url():
++            return {"gateway_system_event_error": "unsupported_transport"}
+         if self._get_proxy_url():
+             return await self._run_agent_via_proxy(
+                 message=message,
+@@ -31639,6 +32193,7 @@
+             persist_user_message=persist_user_message,
+             persist_user_timestamp=persist_user_timestamp,
+             persist_user_display_kind=persist_user_display_kind,
++            gateway_system_event=gateway_system_event,
+         )
+         turn_runner = TurnRunner(self, turn_ctx)
+         # Callback invoked by agent on tool lifecycle events — extracted to
+diff --git a/gateway/session.py b/gateway/session.py
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -763,6 +763,30 @@
+ # runner re-resolves credentials via the normal runtime provider resolution.
+ PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+ 
++# Typed gateway continuation turns are durably owned by their trusted plugin
++# ledger.  Keep a small session-bound marker in the existing metadata envelope
++# so generic crash recovery can never recreate one as an authority-free
++# internal turn.  Unknown metadata already round-trips across older binaries.
++TYPED_EVENT_RECOVERY_METADATA_KEY = "_gateway_system_event_recovery_v1"
++_TYPED_EVENT_RECOVERY_VERSION = 1
++
++
++def rebind_typed_event_recovery_metadata(
++    entry: "SessionEntry",
++    expected_session_id: str,
++    target_session_id: str,
++) -> None:
++    """Keep a valid recovery marker bound to a compression continuation."""
++    marker = entry.metadata.get(TYPED_EVENT_RECOVERY_METADATA_KEY)
++    if (
++        isinstance(marker, dict)
++        and marker.get("version") == _TYPED_EVENT_RECOVERY_VERSION
++        and marker.get("session_id") == expected_session_id
++    ):
++        marker = dict(marker)
++        marker["session_id"] = target_session_id
++        entry.metadata[TYPED_EVENT_RECOVERY_METADATA_KEY] = marker
++
+ 
+ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+     """Return a copy of *override* containing only persistable, non-secret keys.
+@@ -2820,6 +2844,11 @@
+             entry.session_id,
+             canonical_session_id,
+         )
++        rebind_typed_event_recovery_metadata(
++            entry,
++            original_session_id,
++            canonical_session_id,
++        )
+         entry.session_id = canonical_session_id
+         return True
+ 
+@@ -3377,7 +3406,108 @@
+                 return True
+         return False
+ 
+-    def mark_turn_active(self, session_key: str) -> Optional[str]:
++    def _typed_event_recovery_state_locked(self, session_id: str) -> str:
++        """Return ``none``, ``owned`` or ``conflict`` for a physical session.
++
++        Presence is fail-closed: malformed data, or a marker naming another
++        physical session, suppresses generic recovery until a real user turn
++        replaces it under the session lease.
++        """
++        found = False
++        for candidate in self._entries.values():
++            if candidate.session_id != session_id:
++                continue
++            if TYPED_EVENT_RECOVERY_METADATA_KEY not in candidate.metadata:
++                continue
++            found = True
++            marker = candidate.metadata.get(TYPED_EVENT_RECOVERY_METADATA_KEY)
++            if not isinstance(marker, dict):
++                return "conflict"
++            if marker.get("version") != _TYPED_EVENT_RECOVERY_VERSION:
++                return "conflict"
++            if marker.get("session_id") != session_id:
++                return "conflict"
++            owner_id = marker.get("owner_id")
++            if not isinstance(owner_id, str) or not owner_id:
++                return "conflict"
++        return "owned" if found else "none"
++
++    def _typed_event_recovery_session_ids_locked(self) -> set[str]:
++        """Return every physical session with a present recovery marker."""
++        return {
++            entry.session_id
++            for entry in self._entries.values()
++            if TYPED_EVENT_RECOVERY_METADATA_KEY in entry.metadata
++        }
++
++    def typed_event_recovery_owner_state(
++        self,
++        session_key: str,
++        expected_session_id: str,
++    ) -> str:
++        """Read the fail-closed typed recovery state for an exact route."""
++        with self._lock:
++            self._ensure_loaded_locked()
++            entry = self._entries.get(session_key)
++            if entry is None or entry.session_id != expected_session_id:
++                return "conflict"
++            return self._typed_event_recovery_state_locked(expected_session_id)
++
++    def mark_typed_event_recovery_owner(
++        self,
++        session_key: str,
++        expected_session_id: str,
++        owner_id: str,
++    ) -> bool:
++        """Persist trusted recovery ownership before a typed turn reads history.
++
++        A later authorized typed event may replace a valid owner after it has
++        acquired the same physical-session lease.  Malformed ownership,
++        suspension, or an older generic resume obligation fails closed.
++        """
++        if not isinstance(owner_id, str) or not owner_id:
++            return False
++        with self._lock:
++            self._ensure_loaded_locked()
++            entry = self._entries.get(session_key)
++            if entry is None or entry.session_id != expected_session_id:
++                return False
++            aliases = [
++                candidate
++                for candidate in self._entries.values()
++                if candidate.session_id == expected_session_id
++            ]
++            if any(candidate.suspended or candidate.resume_pending for candidate in aliases):
++                return False
++            if self._typed_event_recovery_state_locked(expected_session_id) == "conflict":
++                return False
++
++            marker = {
++                "version": _TYPED_EVENT_RECOVERY_VERSION,
++                "session_id": expected_session_id,
++                "owner_id": owner_id,
++            }
++            data, generation = self._snapshot_routing_locked()
++            for candidate in aliases:
++                candidate_data = data[candidate.session_key]
++                metadata = dict(candidate_data.get("metadata") or {})
++                metadata[TYPED_EVENT_RECOVERY_METADATA_KEY] = marker
++                candidate_data["metadata"] = metadata
++
++            # Publish in-memory state only after the complete alias snapshot is
++            # durable.  A failed write cannot leak a marker through a later save.
++            self._persist_routing_data(data, generation)
++            for candidate in aliases:
++                candidate.metadata[TYPED_EVENT_RECOVERY_METADATA_KEY] = dict(marker)
++            return True
++
++    def mark_turn_active(
++        self,
++        session_key: str,
++        *,
++        expected_session_id: Optional[str] = None,
++        clear_typed_event_recovery: bool = False,
++    ) -> Optional[str]:
+         """Persist exact ownership of the agent turn running for *session_key*.
+ 
+         The opaque token is returned to the caller and must be supplied to
+@@ -3389,6 +3519,10 @@
+             self._ensure_loaded_locked()
+             entry = self._entries.get(session_key)
+             if entry is None:
++                return None
++            if expected_session_id is not None and entry.session_id != expected_session_id:
++                return None
++            if clear_typed_event_recovery and expected_session_id is None:
+                 return None
+             now = _now()
+             candidate = entry.to_dict()
+@@ -3399,13 +3533,38 @@
+             # understand the exact marker fields.
+             candidate["updated_at"] = now.isoformat()
+ 
+-            # Persist before publishing the marker in memory.  If the durable
+-            # write raises, a later unrelated save cannot leak an unowned token.
+-            self._save_entry(
+-                session_key,
+-                entry_data=candidate,
+-                lock_held=True,
++            recovery_aliases = (
++                [
++                    alias
++                    for alias in self._entries.values()
++                    if alias.session_id == expected_session_id
++                    and TYPED_EVENT_RECOVERY_METADATA_KEY in alias.metadata
++                ]
++                if clear_typed_event_recovery
++                else []
+             )
++            if recovery_aliases:
++                data, generation = self._snapshot_routing_locked()
++                active_data = data[session_key]
++                active_data["active_turn_token"] = token
++                active_data["active_turn_started_at"] = now.isoformat()
++                active_data["updated_at"] = now.isoformat()
++                for alias in recovery_aliases:
++                    alias_data = data[alias.session_key]
++                    metadata = dict(alias_data.get("metadata") or {})
++                    metadata.pop(TYPED_EVENT_RECOVERY_METADATA_KEY, None)
++                    alias_data["metadata"] = metadata
++                self._persist_routing_data(data, generation)
++                for alias in recovery_aliases:
++                    alias.metadata.pop(TYPED_EVENT_RECOVERY_METADATA_KEY, None)
++            else:
++                # Persist before publishing the marker in memory.  If the durable
++                # write raises, a later unrelated save cannot leak an unowned token.
++                self._save_entry(
++                    session_key,
++                    entry_data=candidate,
++                    lock_held=True,
++                )
+             entry.active_turn_token = token
+             entry.active_turn_started_at = now
+             entry.updated_at = now
+@@ -3458,7 +3617,10 @@
+ 
+         with self._lock:
+             self._ensure_loaded_locked()
++            protected_session_ids = self._typed_event_recovery_session_ids_locked()
+             for entry in self._entries.values():
++                if entry.session_id in protected_session_ids:
++                    continue
+                 if not entry.active_turn_token:
+                     continue
+ 
+@@ -3534,6 +3696,8 @@
+                 # Never override an explicit ``suspended`` — that is a hard
+                 # forced-wipe signal (from /stop or stuck-loop escalation).
+                 if entry.suspended:
++                    return False
++                if entry.session_id in self._typed_event_recovery_session_ids_locked():
+                     return False
+                 entry.resume_pending = True
+                 entry.resume_reason = reason
+@@ -3636,8 +3800,11 @@
+         count = 0
+         with self._lock:
+             self._ensure_loaded_locked()
++            protected_session_ids = self._typed_event_recovery_session_ids_locked()
+             for entry in self._entries.values():
+                 if entry.resume_pending:
++                    continue
++                if entry.session_id in protected_session_ids:
+                     continue
+                 if not entry.suspended and entry.updated_at >= cutoff:
+                     entry.resume_pending = True
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -101,6 +101,7 @@
+     # "internal_notification" for async-delegation/background notifications
+     # (#82888). DB-only presentation metadata; never sent to the provider.
+     persist_user_display_kind: Optional[str] = None
++    gateway_system_event: Any = None
+     user_config: Any = None
+     enabled_toolsets: Any = None
+     disabled_toolsets: Any = None
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -1735,6 +1735,39 @@
+         )
+         return task
+ 
++    def register_gateway_task(
++        self,
++        factory: Callable[[], Any],
++        *,
++        name: Optional[str] = None,
++    ) -> PluginRegistration:
++        """Register an async worker factory owned by the live gateway loop.
++
++        Registration is safe during synchronous plugin discovery.  The host
++        calls the factory after the gateway injector is live and cancels its
++        task before removing that injector during shutdown.
++        """
++        if not callable(factory):
++            raise TypeError("register_gateway_task expects a callable factory")
++        task_name = name or f"plugin:{self.plugin_id}:gateway"
++        if not isinstance(task_name, str) or not task_name.strip():
++            raise ValueError("gateway task name must be a non-empty string")
++        task_name = task_name.strip()[:128]
++        owner_key = self.manifest.key or self.manifest.name
++        key = (owner_key, task_name)
++        if key in self._manager._gateway_task_factories:
++            raise ValueError(f"gateway task {task_name!r} is already registered")
++        self._manager._gateway_task_factories[key] = factory
++
++        def _release() -> None:
++            self._manager._remove_gateway_task_factory(key, factory)
++
++        handle = self._track("gateway_task", task_name, _release)
++        logger.debug(
++            "Plugin %s registered gateway task: %s", self.manifest.name, task_name
++        )
++        return handle
++
+     # -- approval transport registration ------------------------------------
+ 
+     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
+@@ -2113,25 +2146,91 @@
+             )
+             return False
+ 
++    def inject_gateway_system_event(
++        self,
++        content: str,
++        *,
++        session_key: str,
++        expected_session_id: str,
++        event_id: str,
++        event_kind: str,
++        expected_route: Mapping[str, str],
++        eligibility_check: Callable[[], bool],
++    ):
++        """Submit a typed internal event to one exact live gateway session.
++
++        The returned ``concurrent.futures.Future`` resolves only after the
++        gateway turn and platform delivery reach a terminal outcome.  Invalid
++        request shapes return ``None``; authorization and runtime refusals are
++        represented by the Future's bounded result mapping.  ``expected_route``
++        is snapshotted, and ``eligibility_check`` must be a synchronous,
++        process-local predicate that remains true through model admission.
++        """
++        from gateway.internal_events import (
++            create_gateway_system_event,
++            gateway_system_event_is_eligible,
++            new_gateway_event_receipt,
++            resolve_gateway_event_receipt,
++        )
++
++        plugin_id = self.manifest.key or self.manifest.name
++        try:
++            content, system_event = create_gateway_system_event(
++                content=content,
++                session_key=session_key,
++                expected_session_id=expected_session_id,
++                event_id=event_id,
++                event_kind=event_kind,
++                plugin_id=plugin_id,
++                expected_route=expected_route,
++                eligibility_check=eligibility_check,
++            )
++        except ValueError:
++            logger.warning(
++                "inject_gateway_system_event: invalid request from plugin %s",
++                plugin_id,
++            )
++            return None
++
++        receipt = new_gateway_event_receipt()
++        if not self._gateway_injection_allowed():
++            resolve_gateway_event_receipt(
++                receipt, "unauthorized", event=system_event
++            )
++            return receipt
++        if not gateway_system_event_is_eligible(system_event):
++            resolve_gateway_event_receipt(
++                receipt, "unauthorized", event=system_event
++            )
++            return receipt
++        if not self._manager.has_gateway_message_injector:
++            resolve_gateway_event_receipt(receipt, "stopping", event=system_event)
++            return receipt
++
++        try:
++            scheduled = self._manager.inject_gateway_system_event(
++                content=content,
++                system_event=system_event,
++                receipt=receipt,
++            )
++        except Exception:
++            logger.warning(
++                "inject_gateway_system_event: gateway scheduling failed for plugin %s",
++                plugin_id,
++                exc_info=True,
++            )
++            resolve_gateway_event_receipt(receipt, "agent_error", event=system_event)
++            return receipt
++        if scheduled is not receipt:
++            if isinstance(scheduled, type(receipt)):
++                return scheduled
++            resolve_gateway_event_receipt(receipt, "agent_error", event=system_event)
++        return receipt
++
+     def _gateway_injection_allowed(self) -> bool:
+         """Return whether this plugin may trigger gateway session turns."""
+-        try:
+-            cfg = load_config_readonly() or {}
+-        except Exception:
+-            return False
+-
+         plugin_id = self.manifest.key or self.manifest.name
+-        return (
+-            cfg_get(
+-                cfg,
+-                "plugins",
+-                "entries",
+-                plugin_id,
+-                "allow_gateway_injection",
+-                default=False,
+-            )
+-            is True
+-        )
++        return self._manager.gateway_injection_allowed(plugin_id)
+ 
+     # -- CLI command registration --------------------------------------------
+ 
+@@ -3757,6 +3856,9 @@
+         self._discovered: bool = False
+         self._cli_ref = None  # Set by CLI after plugin discovery
+         self._gateway_message_injector: tuple[object, Callable] | None = None
++        self._gateway_task_factories: Dict[tuple[str, str], Callable[[], Any]] = {}
++        self._gateway_tasks: Dict[tuple[str, str], asyncio.Task] = {}
++        self._gateway_task_loop = None
+         # Plugin skill registry: qualified name → metadata dict.
+         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
+         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
+@@ -4202,6 +4304,11 @@
+         """Return whether a live gateway can accept plugin-triggered turns."""
+         return self._gateway_message_injector is not None
+ 
++    def gateway_message_injector_owned_by(self, owner: object) -> bool:
++        """Return whether owner still owns the published gateway."""
++        registered = self._gateway_message_injector
++        return registered is not None and registered[0] is owner
++
+     def set_gateway_message_injector(
+         self,
+         owner: object,
+@@ -4222,6 +4329,100 @@
+         if registered is None:
+             return False
+         return bool(registered[1](**kwargs))
++
++    def inject_gateway_system_event(self, **kwargs: Any):
++        """Submit a typed system event through the live gateway owner."""
++        registered = self._gateway_message_injector
++        if registered is None:
++            return None
++        return registered[1](**kwargs)
++
++    def gateway_injection_allowed(self, plugin_id: str) -> bool:
++        """Read this manager's current profile-scoped gateway grant."""
++        try:
++            with _plugin_home_scope(self.home_path):
++                cfg = load_config_readonly() or {}
++        except Exception:
++            return False
++        return (
++            cfg_get(
++                cfg,
++                "plugins",
++                "entries",
++                plugin_id,
++                "allow_gateway_injection",
++                default=False,
++            )
++            is True
++        )
++
++    def _emit_core_event(self, event: str) -> int:
++        """Emit one closed, payload-free gateway lifecycle event."""
++        if event not in {"gateway_ready", "gateway_stopping"}:
++            raise ValueError("unsupported core plugin event")
++        return self._dispatch_event(f"{HERMES_EVENT_NAMESPACE}:{event}", {})
++
++    def _start_gateway_tasks(self, loop) -> None:
++        """Start every registered gateway worker on the host event loop."""
++        if loop is None or loop.is_closed():
++            return
++        self._gateway_task_loop = loop
++        for key, factory in list(self._gateway_task_factories.items()):
++            current = self._gateway_tasks.get(key)
++            if current is not None and not current.done():
++                continue
++            try:
++                coro = factory()
++                if not asyncio.iscoroutine(coro):
++                    raise TypeError("gateway task factory must return a coroutine")
++                task = loop.create_task(coro, name=key[1])
++            except Exception:
++                logger.warning(
++                    "Plugin gateway task failed to start: plugin=%s task=%s",
++                    key[0],
++                    key[1],
++                    exc_info=True,
++                )
++                continue
++            self._gateway_tasks[key] = task
++
++            def _finished(done, *, task_key=key) -> None:
++                if self._gateway_tasks.get(task_key) is done:
++                    self._gateway_tasks.pop(task_key, None)
++                if done.cancelled():
++                    return
++                try:
++                    done.result()
++                except Exception:
++                    logger.warning(
++                        "Plugin gateway task failed: plugin=%s task=%s",
++                        task_key[0],
++                        task_key[1],
++                        exc_info=True,
++                    )
++
++            task.add_done_callback(_finished)
++
++    def _stop_gateway_tasks(self) -> None:
++        """Cancel all workers owned by the current gateway lifecycle."""
++        for task in list(self._gateway_tasks.values()):
++            if not task.done():
++                task.cancel()
++        self._gateway_tasks.clear()
++        self._gateway_task_loop = None
++
++    def _remove_gateway_task_factory(
++        self,
++        key: tuple[str, str],
++        factory: Callable[[], Any],
++    ) -> None:
++        """Remove one owned worker and cancel its live task, if any."""
++        if self._gateway_task_factories.get(key) is not factory:
++            return
++        self._gateway_task_factories.pop(key, None)
++        task = self._gateway_tasks.pop(key, None)
++        if task is not None and not task.done():
++            task.cancel()
+ 
+     def discover_and_load(self, force: bool = False) -> None:
+         """Scan all plugin sources and load each plugin found.
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -9268,6 +9268,7 @@
+         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+         persist_user_platform_id: Optional[str] = None,
+         moa_config: Optional[dict[str, Any]] = None,
++        gateway_system_event: Optional[Any] = None,
+     ) -> Dict[str, Any]:
+         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+         # A review deliberately shares this agent's session_id for prompt-cache
+@@ -9827,6 +9828,7 @@
+                         persist_user_display_metadata=persist_user_display_metadata,
+                         persist_user_platform_id=persist_user_platform_id,
+                         moa_config=moa_config,
++                        gateway_system_event=gateway_system_event,
+                     )
+                 finally:
+                     # The lease remains held through relay/task finalization, but
+diff --git a/tests/agent/test_codex_responses_adapter.py b/tests/agent/test_codex_responses_adapter.py
+--- a/tests/agent/test_codex_responses_adapter.py
++++ b/tests/agent/test_codex_responses_adapter.py
+@@ -40,13 +40,29 @@
+         "type": "image_url",
+         "image_url": {"url": "https://example.invalid/p.png", "detail": "high"},
+     }]
+-
+     assert _chat_content_to_responses_parts(content, role="user") == [{
+         "type": "input_image",
+         "image_url": "https://example.invalid/p.png",
+         "detail": "high",
+     }]
+ 
++
++def test_developer_event_is_preserved_after_leading_system_message():
++    messages = [
++        {"role": "system", "content": "frozen leading prompt"},
++        {"role": "user", "content": "earlier ask"},
++        {"role": "assistant", "content": "earlier answer"},
++        {"role": "developer", "content": "trusted internal event"},
++    ]
++
++    items = _chat_messages_to_responses_input(messages)
++
++    assert items[-1] == {
++        "role": "developer",
++        "content": "trusted internal event",
++    }
++    assert all(item.get("content") != "frozen leading prompt" for item in items)
++    assert _preflight_codex_input_items(items)[-1] == items[-1]
+ 
+ def test_preflight_rewrites_raw_assistant_images_to_text_markers():
+     raw = [{
+@@ -624,4 +640,4 @@
+                 summary=[SimpleNamespace(text=reasoning_text)],
+             )
+         ],
+-    )
+\ No newline at end of file
++    )
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -138,6 +138,7 @@
+ 
+     def _persist_session(self, *_a, **_k):
+         self._persist_calls += 1
++        self._last_persist_args = _a
+ 
+ 
+ def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
+@@ -214,6 +215,56 @@
+     assert ctx.active_system_prompt == "SYSTEM"
+ 
+ 
++def test_gateway_system_event_appends_developer_row_without_user_side_effects():
++    from gateway.internal_events import create_gateway_system_event
++
++    agent, memory_manager = _agent_with_memory_manager()
++    agent.api_mode = "codex_responses"
++    agent._gateway_turn_context_notes = "must remain pending"
++    content, marker = create_gateway_system_event(
++        content="internal completion body\n",
++        session_key="agent:main:telegram:dm:42",
++        expected_session_id="session-42",
++        event_id="event-42",
++        event_kind="external_tool_completed",
++        plugin_id="notify-plugin",
++        expected_route={
++            "profile_name": "default",
++            "platform": "telegram",
++            "user_id": "42",
++            "chat_id": "42",
++            "topic_id": "",
++        },
++        eligibility_check=lambda: True,
++    )
++
++    with patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook:
++        ctx = _build(
++            agent,
++            user_message=content,
++            gateway_system_event=marker,
++            persist_user_timestamp=123.5,
++            persist_user_platform_id="telegram-message-id",
++        )
++
++    row = ctx.messages[-1]
++    assert row["role"] == "developer"
++    assert row["content"] == content
++    assert row["display_kind"] == "internal_notification"
++    assert row["display_metadata"]["event_id"] == "event-42"
++    assert "platform_message_id" not in row
++    assert isinstance(row["timestamp"], float)
++    assert row["timestamp"] != 123.5
++    assert agent._user_turn_count == 0
++    assert agent._is_user_initiated_turn is False
++    assert agent._persist_calls == 1
++    assert agent._last_persist_args[0][-1] is row
++    invoke_hook.assert_not_called()
++    memory_manager.on_turn_start.assert_not_called()
++    memory_manager.prefetch_all.assert_not_called()
++    assert agent._gateway_turn_context_notes == "must remain pending"
++
++
+ def test_preflight_timeout_stops_turn_before_provider_boundary():
+     """An unchanged oversized payload must not escape turn construction."""
+     agent = _FakeAgent()
+diff --git a/tests/gateway/test_active_turn_recovery.py b/tests/gateway/test_active_turn_recovery.py
+--- a/tests/gateway/test_active_turn_recovery.py
++++ b/tests/gateway/test_active_turn_recovery.py
+@@ -14,8 +14,18 @@
+ import pytest
+ 
+ from gateway.config import GatewayConfig, Platform
++from gateway.internal_events import (
++    create_gateway_system_event,
++    new_gateway_event_receipt,
++)
++from gateway.platforms.base import MessageEvent
+ from gateway.run import GatewayRunner
+-from gateway.session import SessionEntry, SessionSource, SessionStore
++from gateway.session import (
++    TYPED_EVENT_RECOVERY_METADATA_KEY,
++    SessionEntry,
++    SessionSource,
++    SessionStore,
++)
+ 
+ 
+ ACTIVE_TURN_MAX_AGE_SECONDS = 60 * 60
+@@ -416,7 +426,13 @@
+     event = SimpleNamespace()
+ 
+     await runner._mark_durable_active_turn(
+-        cast(Any, event), "resolved-session-key"
++        cast(Any, event), "resolved-session-key", "resolved-session-id"
++    )
++
++    mark_active.assert_awaited_once_with(
++        "resolved-session-key",
++        expected_session_id="resolved-session-id",
++        clear_typed_event_recovery=True,
+     )
+ 
+     assert event._gateway_active_turn_session_key == "resolved-session-key"
+@@ -427,6 +443,229 @@
+     clear_active.assert_awaited_once_with("resolved-session-key", "token-1")
+     assert not hasattr(event, "_gateway_active_turn_session_key")
+     assert not hasattr(event, "_gateway_active_turn_token")
++
++
++def test_typed_event_recovery_owner_survives_crash_and_generic_recovery(tmp_path):
++    store = _make_store(tmp_path)
++    source = _make_source()
++    entry = store.get_or_create_session(source)
++    assert store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt-1"
++    )
++
++    reloaded = _make_store(tmp_path)
++    assert reloaded.typed_event_recovery_owner_state(
++        entry.session_key, entry.session_id
++    ) == "owned"
++    assert reloaded.mark_resume_pending(entry.session_key) is False
++    assert reloaded.suspend_recently_active() == 0
++
++    # Even if an internal turn left a generic active token, the typed owner
++    # suppresses both exact-token and recency restart recovery.
++    assert reloaded.mark_turn_active(entry.session_key) is not None
++    assert reloaded.recover_interrupted_turns() == 0
++    assert reloaded.suspend_recently_active() == 0
++    assert _entry_for(reloaded, source).resume_pending is False
++
++    assert reloaded.discard_active_turn_markers() == 1
++    assert reloaded.clear_resume_pending(entry.session_key) is False
++    assert (
++        TYPED_EVENT_RECOVERY_METADATA_KEY
++        in _entry_for(reloaded, source).metadata
++    )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("receipt_state", ["pending", "running"])
++async def test_native_db_typed_crash_suppression_before_and_after_admission(
++    tmp_path, receipt_state
++):
++    store = _make_db_store(tmp_path)
++    source = _make_source(f"typed-{receipt_state}")
++    entry = store.get_or_create_session(source)
++    content, marker = create_gateway_system_event(
++        content="[T3 continuation] completed",
++        session_key=entry.session_key,
++        expected_session_id=entry.session_id,
++        event_id=f"event-{receipt_state}",
++        event_kind="external_tool_completed",
++        plugin_id="notify-plugin",
++        expected_route={
++            "profile_name": "default",
++            "platform": source.platform.value,
++            "user_id": str(source.user_id),
++            "chat_id": str(source.chat_id),
++            "topic_id": str(source.thread_id),
++        },
++        eligibility_check=lambda: True,
++    )
++    receipt = new_gateway_event_receipt()
++    if receipt_state == "running":
++        assert receipt.set_running_or_notify_cancel()
++    event = MessageEvent(
++        text=content,
++        source=source,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    runner = object.__new__(GatewayRunner)
++    runner.session_store = store
++    runner._gateway_system_event_target = AsyncMock(
++        return_value=(None, entry, source)
++    )
++
++    assert await runner._mark_durable_active_turn(
++        event,
++        entry.session_key,
++        entry.session_id,
++        turn_lease_acquired=True,
++    )
++    _close_store_db(store)
++
++    reloaded = _make_db_store(tmp_path)
++    assert reloaded.typed_event_recovery_owner_state(
++        entry.session_key, entry.session_id
++    ) == "owned"
++    assert reloaded.recover_interrupted_turns() == 0
++    assert reloaded.suspend_recently_active() == 0
++    assert reloaded._entries[entry.session_key].resume_pending is False
++    _close_store_db(reloaded)
++
++
++def test_typed_owner_replaces_sequential_event_and_real_user_clears_aliases(tmp_path):
++    store = _make_store(tmp_path)
++    source = _make_source()
++    entry = store.get_or_create_session(source)
++    alias_key = f"{entry.session_key}:alias"
++    with store._lock:
++        store._entries[alias_key] = SessionEntry.from_dict(
++            {**entry.to_dict(), "session_key": alias_key}
++        )
++        store._save()
++
++    assert store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt-1"
++    )
++    assert store.mark_typed_event_recovery_owner(
++        alias_key, entry.session_id, "receipt-2"
++    )
++    for candidate in store._entries.values():
++        assert candidate.metadata[TYPED_EVENT_RECOVERY_METADATA_KEY]["owner_id"] == (
++            "receipt-2"
++        )
++
++    assert store.mark_turn_active(
++        entry.session_key,
++        expected_session_id="stale-session-id",
++        clear_typed_event_recovery=True,
++    ) is None
++    assert all(
++        TYPED_EVENT_RECOVERY_METADATA_KEY in candidate.metadata
++        for candidate in store._entries.values()
++    )
++
++    token = store.mark_turn_active(
++        entry.session_key,
++        expected_session_id=entry.session_id,
++        clear_typed_event_recovery=True,
++    )
++    assert token is not None
++    assert all(
++        TYPED_EVENT_RECOVERY_METADATA_KEY not in candidate.metadata
++        for candidate in store._entries.values()
++    )
++    assert store.recover_interrupted_turns() == 1
++
++
++def test_typed_owner_follows_compression_session_rotation(tmp_path):
++    store = _make_store(tmp_path)
++    source = _make_source()
++    entry = store.get_or_create_session(source)
++    original_session_id = entry.session_id
++    assert store.mark_typed_event_recovery_owner(
++        entry.session_key, original_session_id, "receipt-compression"
++    )
++
++    advanced = store.advance_compression_session(
++        entry.session_key,
++        original_session_id,
++        "compressed-child",
++    )
++
++    assert advanced is not None
++    assert advanced.session_id == "compressed-child"
++    assert advanced.metadata[TYPED_EVENT_RECOVERY_METADATA_KEY] == {
++        "version": 1,
++        "session_id": "compressed-child",
++        "owner_id": "receipt-compression",
++    }
++    reloaded = _make_store(tmp_path)
++    assert reloaded.typed_event_recovery_owner_state(
++        entry.session_key, "compressed-child"
++    ) == "owned"
++
++
++def test_typed_owner_refuses_resume_suspension_wrong_session_and_malformed(tmp_path):
++    store = _make_store(tmp_path)
++    source = _make_source()
++    entry = store.get_or_create_session(source)
++
++    assert not store.mark_typed_event_recovery_owner(
++        entry.session_key, "wrong-session", "receipt"
++    )
++    with store._lock:
++        store._entries[entry.session_key].resume_pending = True
++    assert not store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt"
++    )
++    with store._lock:
++        current = store._entries[entry.session_key]
++        current.resume_pending = False
++        current.suspended = True
++    assert not store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt"
++    )
++    with store._lock:
++        current.suspended = False
++        current.metadata[TYPED_EVENT_RECOVERY_METADATA_KEY] = {"broken": True}
++    assert store.typed_event_recovery_owner_state(
++        entry.session_key, entry.session_id
++    ) == "conflict"
++    assert not store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt"
++    )
++    assert store.mark_resume_pending(entry.session_key) is False
++
++
++def test_typed_owner_and_real_user_clear_are_failure_atomic(tmp_path):
++    store = _make_store(tmp_path)
++    source = _make_source()
++    entry = store.get_or_create_session(source)
++    real_persist = store._persist_routing_data
++    store._persist_routing_data = MagicMock(side_effect=OSError("disk unavailable"))
++
++    with pytest.raises(OSError, match="disk unavailable"):
++        store.mark_typed_event_recovery_owner(
++            entry.session_key, entry.session_id, "receipt"
++        )
++    assert TYPED_EVENT_RECOVERY_METADATA_KEY not in _entry_for(store, source).metadata
++
++    store._persist_routing_data = real_persist
++    assert store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt"
++    )
++    store._persist_routing_data = MagicMock(side_effect=OSError("disk unavailable"))
++    with pytest.raises(OSError, match="disk unavailable"):
++        store.mark_turn_active(
++            entry.session_key,
++            expected_session_id=entry.session_id,
++            clear_typed_event_recovery=True,
++        )
++    current = _entry_for(store, source)
++    assert TYPED_EVENT_RECOVERY_METADATA_KEY in current.metadata
++    assert current.active_turn_token is None
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/gateway/test_conversation_scope_funnel.py b/tests/gateway/test_conversation_scope_funnel.py
+--- a/tests/gateway/test_conversation_scope_funnel.py
++++ b/tests/gateway/test_conversation_scope_funnel.py
+@@ -9,6 +9,12 @@
+ the boundary security state, in one call.
+ """
+ 
++from types import SimpleNamespace
++
++from gateway.internal_events import (
++    create_gateway_system_event,
++    new_gateway_event_receipt,
++)
+ from gateway.run import _CONVERSATION_SCOPED_STATE, GatewayRunner
+ 
+ KEY = "agent:main:telegram:dm:777"
+@@ -53,3 +59,37 @@
+     assert OTHER in runner._pending_approvals
+     assert KEY not in runner._update_prompt_pending
+     assert KEY not in runner._pending_skills_reload_notes
++
++
++def test_funnel_cancels_typed_receipts_in_actual_queue_list():
++    runner = object.__new__(GatewayRunner)
++    content, marker = create_gateway_system_event(
++        content="[T3 continuation] completed",
++        session_key=KEY,
++        expected_session_id="session-777",
++        event_id="event-777",
++        event_kind="external_tool_completed",
++        plugin_id="notify-plugin",
++        expected_route={
++            "profile_name": "default",
++            "platform": "telegram",
++            "user_id": "777",
++            "chat_id": "777",
++            "topic_id": "",
++        },
++        eligibility_check=lambda: True,
++    )
++    receipt = new_gateway_event_receipt()
++    queued_event = SimpleNamespace(
++        text=content,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    other_event = object()
++    runner._queued_events = {KEY: [queued_event], OTHER: [other_event]}
++
++    runner._clear_conversation_scope(KEY, reason="test")
++
++    assert receipt.result()["status"] == "cancelled"
++    assert KEY not in runner._queued_events
++    assert runner._queued_events[OTHER] == [other_event]
+diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test_plugin_message_injection.py
+--- a/tests/gateway/test_plugin_message_injection.py
++++ b/tests/gateway/test_plugin_message_injection.py
+@@ -15,8 +15,14 @@
+     MessageEvent,
+     MessageType,
+     PlatformConfig,
++    SendResult,
+ )
+ from gateway.run import GatewayRunner
++from gateway.internal_events import (
++    create_gateway_system_event,
++    gateway_system_event_message,
++    new_gateway_event_receipt,
++)
+ from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
+ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+ 
+@@ -46,7 +52,10 @@
+     runner = object.__new__(GatewayRunner)
+     runner.session_store = SimpleNamespace()
+     runner._async_session_store = SimpleNamespace(
+-        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry)
++        _store=runner.session_store,
++        lookup_by_session_key=AsyncMock(return_value=entry),
++        typed_event_recovery_owner_state=AsyncMock(return_value="none"),
++        mark_typed_event_recovery_owner=AsyncMock(return_value=True),
+     )
+     runner.adapters = {Platform.TELEGRAM: adapter} if adapter else {}
+     runner._profile_adapters = {}
+@@ -560,3 +569,747 @@
+     assert manager.has_gateway_message_injector is True
+     assert manager.inject_gateway_message(value="kept") is True
+     newer_injector.assert_called_once_with(value="kept")
++
++
++def test_install_starts_registered_workers_before_ready_event():
++    runner = _runner(_entry())
++    runner._gateway_loop = MagicMock()
++    manager = MagicMock()
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        runner._install_plugin_message_injector()
++
++    assert manager.method_calls[0][0] == "set_gateway_message_injector"
++    assert manager.method_calls[1].args == (runner._gateway_loop,)
++    assert manager.method_calls[1][0] == "_start_gateway_tasks"
++    assert manager.method_calls[2][0] == "_emit_core_event"
++    assert manager.method_calls[2].args == ("gateway_ready",)
++
++
++def _typed_event(
++    entry: SessionEntry,
++    *,
++    event_id: str = "event-42",
++    route_overrides: dict | None = None,
++    eligibility_check=None,
++):
++    source = entry.origin
++    assert source is not None
++    expected_route = {
++        "profile_name": source.profile or "default",
++        "platform": source.platform.value,
++        "user_id": str(source.user_id or ""),
++        "chat_id": str(source.chat_id),
++        "topic_id": str(source.thread_id or ""),
++    }
++    expected_route.update(route_overrides or {})
++    content, marker = create_gateway_system_event(
++        content="[T3 continuation] work completed",
++        session_key=entry.session_key,
++        expected_session_id=entry.session_id,
++        event_id=event_id,
++        event_kind="external_tool_completed",
++        plugin_id="notify-plugin",
++        expected_route=expected_route,
++        eligibility_check=eligibility_check or (lambda: True),
++    )
++    return content, marker, new_gateway_event_receipt()
++
++
++@pytest.mark.asyncio
++async def test_system_event_dispatch_is_strict_and_uses_native_adapter_path():
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(entry)
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++
++    adapter.handle_message.assert_awaited_once()
++    routed = adapter.handle_message.await_args.args[0]
++    assert routed.text == content
++    assert routed.message_id is None
++    assert routed.gateway_system_event is marker
++    assert routed.gateway_event_receipt is receipt
++    assert routed.metadata["gateway_session_strict"] is True
++    assert not receipt.done()
++    runner._is_user_authorized.assert_called_once_with(
++        routed.source, allow_adapter_delegation=False
++    )
++
++
++@pytest.mark.asyncio
++async def test_system_event_rechecks_eligibility_at_actual_turn_admission():
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    eligibility_check = MagicMock(return_value=True)
++    content, marker, receipt = _typed_event(
++        entry, eligibility_check=eligibility_check
++    )
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++        routed = adapter.handle_message.await_args.args[0]
++        admitted_source = await runner._admit_gateway_system_event_turn(
++            routed, entry
++        )
++
++    assert admitted_source == entry.origin
++    assert eligibility_check.call_count == 2
++    assert receipt.running()
++
++
++@pytest.mark.asyncio
++async def test_typed_event_requires_lease_and_durable_owner_before_history():
++    entry = _entry()
++    runner = _runner(entry, SimpleNamespace(handle_message=AsyncMock()))
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        assert not await runner._mark_durable_active_turn(
++            event,
++            entry.session_key,
++            entry.session_id,
++            turn_lease_acquired=False,
++        )
++
++    assert receipt.result()["status"] == "agent_error"
++    runner._async_session_store.mark_typed_event_recovery_owner.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_sequential_distinct_typed_events_replace_owner_without_user_turn():
++    entry = _entry()
++    runner = _runner(entry, SimpleNamespace(handle_message=AsyncMock()))
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    events = []
++    for event_id in ("event-first", "event-second"):
++        content, marker, receipt = _typed_event(entry, event_id=event_id)
++        events.append(
++            MessageEvent(
++                text=content,
++                source=entry.origin,
++                internal=True,
++                allow_gateway_control=False,
++                gateway_system_event=marker,
++                gateway_event_receipt=receipt,
++            )
++        )
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        for event in events:
++            assert await runner._mark_durable_active_turn(
++                event,
++                entry.session_key,
++                entry.session_id,
++                turn_lease_acquired=True,
++            )
++
++    calls = runner._async_session_store.mark_typed_event_recovery_owner.await_args_list
++    assert [call.args[2] for call in calls] == [
++        events[0].gateway_system_event.receipt_id,
++        events[1].gateway_system_event.receipt_id,
++    ]
++
++
++@pytest.mark.asyncio
++async def test_typed_owner_persistence_failure_aborts_before_admission():
++    entry = _entry()
++    runner = _runner(entry, SimpleNamespace(handle_message=AsyncMock()))
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    runner._async_session_store.mark_typed_event_recovery_owner.return_value = False
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        assert not await runner._mark_durable_active_turn(
++            event,
++            entry.session_key,
++            entry.session_id,
++            turn_lease_acquired=True,
++        )
++
++    assert receipt.result()["status"] == "busy"
++
++
++@pytest.mark.asyncio
++async def test_system_event_rechecks_full_route_at_actual_turn_admission():
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(entry)
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++        routed = adapter.handle_message.await_args.args[0]
++        assert entry.origin is not None
++        entry.origin.user_id = "different-user"
++        admitted_source = await runner._admit_gateway_system_event_turn(
++            routed, entry
++        )
++
++    assert admitted_source is None
++    assert receipt.result()["status"] == "route_mismatch"
++
++
++@pytest.mark.asyncio
++async def test_system_event_accepts_native_default_profile_topic_route(tmp_path):
++    source = SessionSource(
++        platform=Platform.TELEGRAM,
++        chat_id="123456789",
++        chat_type="dm",
++        user_id="123456789",
++        thread_id="42",
++    )
++    entry = SessionEntry(
++        session_key=build_session_key(source),
++        session_id="20990101_000000_fixture0",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        origin=source,
++        platform=Platform.TELEGRAM,
++    )
++    assert entry.session_key == "agent:main:telegram:dm:123456789:42"
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    native_store = SessionStore(
++        sessions_dir=tmp_path / "sessions", config=runner.config
++    )
++    runner.session_store = native_store
++    runner._async_session_store._store = native_store
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(entry)
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++
++    adapter.handle_message.assert_awaited_once()
++    assert marker.expected_route.profile_name == "default"
++    assert marker.expected_route.topic_id == "42"
++    assert not receipt.done()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("field", "wrong_value"),
++    [
++        ("profile_name", "other-profile"),
++        ("user_id", "different-user"),
++        ("topic_id", "different-topic"),
++    ],
++)
++async def test_system_event_rejects_wrong_route_tuple_with_valid_key_and_session(
++    field, wrong_value
++):
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(
++        entry, route_overrides={field: wrong_value}
++    )
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++
++    assert receipt.result()["status"] == "route_mismatch"
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_system_event_message_metadata_excludes_route_and_authority():
++    entry = _entry()
++    content, marker, _receipt = _typed_event(entry)
++
++    message = gateway_system_event_message(marker, content)
++
++    assert message["display_metadata"] == {
++        "schema_version": 1,
++        "event_kind": "external_tool_completed",
++        "event_id": "event-42",
++        "plugin_id": "notify-plugin",
++    }
++    assert "eligibility_check" not in repr(marker)
++
++
++@pytest.mark.asyncio
++async def test_system_event_fails_closed_when_physical_session_changes():
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(entry)
++    changed = _entry()
++    changed.session_id = "replacement-session"
++    runner._async_session_store.lookup_by_session_key.return_value = changed
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++
++    assert receipt.result()["status"] == "session_mismatch"
++    adapter.handle_message.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("entry_field", "expected_status"),
++    [("suspended", "unauthorized"), ("resume_pending", "busy")],
++)
++async def test_system_event_rejects_session_recovery_conflict(
++    entry_field, expected_status
++):
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    setattr(entry, entry_field, True)
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(entry)
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++
++    assert receipt.result()["status"] == expected_status
++    adapter.handle_message.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_system_event_rejects_malformed_recovery_owner():
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    entry = _entry()
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._async_session_store.typed_event_recovery_owner_state.return_value = (
++        "conflict"
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++    content, marker, receipt = _typed_event(entry)
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        await runner._dispatch_plugin_system_event(
++            content=content, system_event=marker, receipt=receipt
++        )
++
++    assert receipt.result()["status"] == "busy"
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_system_event_busy_queue_is_fifo_and_full_queue_rejects():
++    entry = _entry()
++    adapter = SimpleNamespace(_pending_messages={})
++    runner = _runner(entry, adapter)
++    runner._queued_events = {}
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++
++    assert runner._queue_or_replace_pending_event(entry.session_key, event) is True
++    assert adapter._pending_messages[entry.session_key] is event
++    assert not receipt.done()
++
++    runner._BUSY_QUEUE_MAX_PENDING = 1
++    _, second_marker, second_receipt = _typed_event(entry, event_id="event-43")
++    second = MessageEvent(
++        text="second",
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=second_marker,
++        gateway_event_receipt=second_receipt,
++    )
++    assert runner._queue_or_replace_pending_event(entry.session_key, second) is False
++    assert second_receipt.result()["status"] == "busy"
++    assert adapter._pending_messages[entry.session_key] is event
++
++
++@pytest.mark.asyncio
++async def test_fifo_event_paused_before_drain_never_reaches_agent():
++    entry = _entry()
++    adapter = SimpleNamespace(_pending_messages={})
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._queued_events = {}
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    runner._run_agent = AsyncMock()
++    eligible = {"active": True}
++    content, marker, receipt = _typed_event(
++        entry, eligibility_check=lambda: eligible["active"]
++    )
++    event = MessageEvent(
++        text=content,
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        assert await runner._handle_active_session_busy_message(
++            event, entry.session_key
++        )
++        assert adapter._pending_messages[entry.session_key] is event
++        assert not receipt.done()
++        assert not receipt.running()
++
++        eligible["active"] = False
++        drained = adapter._pending_messages.pop(entry.session_key)
++        admitted_source = await runner._admit_gateway_system_event_turn(
++            drained, entry
++        )
++        if admitted_source is not None:
++            await runner._run_agent()
++
++    assert admitted_source is None
++    assert receipt.result()["status"] == "unauthorized"
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["exception", "awaitable"])
++async def test_turn_admission_fails_closed_for_invalid_eligibility_result(mode):
++    entry = _entry()
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    runner._run_agent = AsyncMock()
++
++    def raises():
++        raise RuntimeError("binding unavailable")
++
++    async def returns_awaitable():
++        return True
++
++    check = raises if mode == "exception" else returns_awaitable
++    content, marker, receipt = _typed_event(entry, eligibility_check=check)
++    event = MessageEvent(
++        text=content,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        admitted_source = await runner._admit_gateway_system_event_turn(
++            event, entry
++        )
++
++    assert admitted_source is None
++    assert receipt.result()["status"] == "unauthorized"
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_cancelled_pending_receipt_cannot_cross_turn_admission():
++    entry = _entry()
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    assert receipt.cancel()
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        admitted_source = await runner._admit_gateway_system_event_turn(
++            event, entry
++        )
++
++    assert admitted_source is None
++    assert receipt.cancelled()
++
++
++@pytest.mark.asyncio
++async def test_receipt_transitions_to_running_only_at_turn_admission():
++    entry = _entry()
++    adapter = SimpleNamespace(handle_message=AsyncMock())
++    runner = _runner(entry, adapter)
++    runner.config = GatewayConfig()
++    runner._session_db = SimpleNamespace(
++        get_session=MagicMock(
++            return_value={"id": entry.session_id, "ended_at": None}
++        )
++    )
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    manager = MagicMock()
++    manager.gateway_injection_allowed.return_value = True
++
++    assert not receipt.running()
++    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
++        admitted_source = await runner._admit_gateway_system_event_turn(
++            event, entry
++        )
++
++    assert admitted_source == entry.origin
++    assert receipt.running()
++
++
++@pytest.mark.asyncio
++async def test_system_event_receipt_waits_for_successful_platform_delivery():
++    entry = _entry()
++    adapter = _RoutingAdapter()
++    delivered = AsyncMock(return_value=SendResult(success=True, message_id="out-1"))
++    adapter.send = delivered
++    adapter.set_message_handler(AsyncMock(return_value="continuation response"))
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    adapter._active_sessions[entry.session_key] = asyncio.Event()
++
++    assert not receipt.done()
++    await adapter._process_message_background(event, entry.session_key)
++
++    delivered.assert_awaited_once()
++    assert receipt.result()["status"] == "completed"
++
++
++@pytest.mark.asyncio
++async def test_system_event_delivery_failure_is_terminal_agent_error():
++    entry = _entry()
++    adapter = _RoutingAdapter()
++    adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
++    adapter.set_message_handler(AsyncMock(return_value="continuation response"))
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    adapter._active_sessions[entry.session_key] = asyncio.Event()
++
++    await adapter._process_message_background(event, entry.session_key)
++
++    assert receipt.result()["status"] == "agent_error"
++
++
++@pytest.mark.asyncio
++async def test_system_event_scheduler_deduplicates_event_id_in_process():
++    entry = _entry()
++    runner = _runner(entry)
++    runner._gateway_loop = asyncio.get_running_loop()
++    runner._dispatch_plugin_system_event = AsyncMock()
++    content, marker, receipt = _typed_event(entry)
++    _, duplicate_marker, duplicate_receipt = _typed_event(entry)
++
++    first = runner._schedule_plugin_system_event(
++        content=content, system_event=marker, receipt=receipt
++    )
++    second = runner._schedule_plugin_system_event(
++        content=content,
++        system_event=duplicate_marker,
++        receipt=duplicate_receipt,
++    )
++    await asyncio.sleep(0)
++
++    assert first is receipt
++    assert second is receipt
++    runner._dispatch_plugin_system_event.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_system_event_pending_slot_cancellation_resolves_receipt():
++    entry = _entry()
++    adapter = _RoutingAdapter()
++    content, marker, receipt = _typed_event(entry)
++    event = MessageEvent(
++        text=content,
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    adapter._pending_messages[entry.session_key] = event
++
++    await adapter.cancel_session_processing(entry.session_key)
++
++    assert receipt.result()["status"] == "cancelled"
++
++
++@pytest.mark.asyncio
++async def test_system_event_is_never_written_to_legacy_shutdown_spool():
++    entry = _entry()
++    adapter = _RoutingAdapter()
++    content, marker, receipt = _typed_event(entry)
++    internal = MessageEvent(
++        text=content,
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++        internal=True,
++        allow_gateway_control=False,
++        gateway_system_event=marker,
++        gateway_event_receipt=receipt,
++    )
++    ordinary = MessageEvent(
++        text="ordinary queued user text",
++        message_type=MessageType.TEXT,
++        source=entry.origin,
++    )
++    adapter._pending_messages = {
++        entry.session_key: internal,
++        "agent:main:telegram:dm:other": ordinary,
++    }
++
++    with patch("gateway.shutdown_flush.flush_pending_to_file") as flush:
++        await adapter.cancel_background_tasks()
++
++    assert receipt.result()["status"] == "stopping"
++    flushed = flush.call_args.args[0]
++    assert list(flushed.values()) == [ordinary]
+diff --git a/tests/gateway/test_restart_resume_pending.py b/tests/gateway/test_restart_resume_pending.py
+--- a/tests/gateway/test_restart_resume_pending.py
++++ b/tests/gateway/test_restart_resume_pending.py
+@@ -44,7 +44,12 @@
+     _should_clear_resume_pending_after_turn,
+     build_resume_recovery_note,
+ )
+-from gateway.session import SessionEntry, SessionSource, SessionStore
++from gateway.session import (
++    TYPED_EVENT_RECOVERY_METADATA_KEY,
++    SessionEntry,
++    SessionSource,
++    SessionStore,
++)
+ from tests.gateway.restart_test_helpers import (
+     make_restart_runner,
+     make_restart_source,
+@@ -608,6 +613,30 @@
+         assert args[0][1] == "shutdown_timeout"
+ 
+ 
++@pytest.mark.asyncio
++async def test_planned_drain_cannot_arm_typed_owned_session(tmp_path):
++    runner, adapter = make_restart_runner()
++    adapter.disconnect = AsyncMock()
++    runner._restart_drain_timeout = 0.01
++    store = _make_store(tmp_path)
++    source = _make_source(chat_id="typed-drain")
++    entry = store.get_or_create_session(source)
++    assert store.mark_typed_event_recovery_owner(
++        entry.session_key, entry.session_id, "receipt-drain"
++    )
++    runner.session_store = store
++    runner._running_agents = {entry.session_key: MagicMock()}
++
++    with patch("gateway.status.remove_pid_file"), patch(
++        "gateway.status.write_runtime_status"
++    ):
++        await runner.stop()
++
++    current = store._entries[entry.session_key]
++    assert current.resume_pending is False
++    assert TYPED_EVENT_RECOVERY_METADATA_KEY in current.metadata
++
++
+ # ---------------------------------------------------------------------------
+ # Gateway startup auto-resume
+ # ---------------------------------------------------------------------------
+@@ -651,6 +680,32 @@
+     # No slot was claimed and nothing was persisted for the skipped session.
+     assert pending_entry.session_key not in runner._running_agents
+     runner._persist_active_agents.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_startup_scheduler_skips_malformed_typed_owner():
++    runner, adapter = make_restart_runner()
++    source = make_restart_source(chat_id="typed-owned")
++    pending_entry = SessionEntry(
++        session_key="agent:main:telegram:dm:typed-owned",
++        session_id="sid-typed-owned",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        origin=source,
++        platform=Platform.TELEGRAM,
++        chat_type="dm",
++        resume_pending=True,
++        resume_reason="restart_interrupted",
++        last_resume_marked_at=datetime.now(),
++        metadata={TYPED_EVENT_RECOVERY_METADATA_KEY: {"malformed": True}},
++    )
++    runner.session_store._entries = {pending_entry.session_key: pending_entry}
++    adapter.handle_message = AsyncMock()
++
++    assert runner._schedule_resume_pending_sessions() == 0
++    await asyncio.sleep(0)
++    adapter.handle_message.assert_not_awaited()
++    assert pending_entry.session_key not in runner._running_agents
+ 
+ 
+ @pytest.mark.asyncio
+@@ -1257,4 +1312,3 @@
+     runner._claim_pending_obligations.assert_awaited_once()
+     runner._redeliver_claimed_obligations.assert_awaited_once()
+ 
+-
+diff --git a/tests/hermes_cli/test_plugin_message_injection.py b/tests/hermes_cli/test_plugin_message_injection.py
+--- a/tests/hermes_cli/test_plugin_message_injection.py
++++ b/tests/hermes_cli/test_plugin_message_injection.py
+@@ -1,5 +1,7 @@
+ """Tests for plugin message injection across CLI and gateway hosts."""
+ 
++import asyncio
++import concurrent.futures
+ from queue import SimpleQueue
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+@@ -7,6 +9,19 @@
+ import yaml
+ 
+ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
++
++
++_EXPECTED_ROUTE = {
++    "profile_name": "default",
++    "platform": "telegram",
++    "user_id": "42",
++    "chat_id": "42",
++    "topic_id": "",
++}
++
++
++def _eligible() -> bool:
++    return True
+ 
+ 
+ def _context(name: str = "notify-plugin") -> tuple[PluginContext, PluginManager]:
+@@ -17,7 +32,7 @@
+ 
+ def _write_plugin_config(tmp_path, monkeypatch, entry: dict) -> None:
+     hermes_home = tmp_path / "hermes"
+-    hermes_home.mkdir()
++    hermes_home.mkdir(exist_ok=True)
+     (hermes_home / "config.yaml").write_text(
+         yaml.safe_dump({"plugins": {"entries": {"notify-plugin": entry}}})
+     )
+@@ -202,3 +217,196 @@
+         )
+         is False
+     )
++
++
++def test_system_event_passes_typed_marker_and_terminal_receipt(tmp_path, monkeypatch):
++    _write_plugin_config(
++        tmp_path, monkeypatch, {"allow_gateway_injection": True}
++    )
++    context, manager = _context()
++    terminal = concurrent.futures.Future()
++    terminal.set_result({"status": "completed", "receipt_id": "receipt"})
++    injector = MagicMock(return_value=terminal)
++    manager.set_gateway_message_injector(object(), injector)
++    route = dict(_EXPECTED_ROUTE)
++
++    receipt = context.inject_gateway_system_event(
++        "trusted event body\n",
++        session_key="agent:main:telegram:dm:42",
++        expected_session_id="session-42",
++        event_id="event-42",
++        event_kind="external_tool_completed",
++        expected_route=route,
++        eligibility_check=_eligible,
++    )
++    route["topic_id"] = "mutated-after-call"
++
++    assert receipt is terminal
++    assert receipt.result() == {"status": "completed", "receipt_id": "receipt"}
++    kwargs = injector.call_args.kwargs
++    assert kwargs["content"] == "trusted event body\n"
++    assert kwargs["system_event"].plugin_id == "notify-plugin"
++    assert kwargs["system_event"].expected_session_id == "session-42"
++    assert kwargs["system_event"].expected_route.topic_id == ""
++    assert kwargs["system_event"].eligibility_check is _eligible
++    assert isinstance(kwargs["receipt"], concurrent.futures.Future)
++
++
++def test_system_event_snapshots_route_and_rejects_ineligible_request(
++    tmp_path, monkeypatch
++):
++    _write_plugin_config(
++        tmp_path, monkeypatch, {"allow_gateway_injection": True}
++    )
++    context, manager = _context()
++    injector = MagicMock()
++    manager.set_gateway_message_injector(object(), injector)
++    route = dict(_EXPECTED_ROUTE)
++
++    receipt = context.inject_gateway_system_event(
++        "body",
++        session_key="agent:main:telegram:dm:42",
++        expected_session_id="session-42",
++        event_id="event-ineligible",
++        event_kind="external_tool_completed",
++        expected_route=route,
++        eligibility_check=lambda: False,
++    )
++    route["user_id"] = "mutated"
++
++    assert receipt.result()["status"] == "unauthorized"
++    injector.assert_not_called()
++
++
++def test_system_event_fails_closed_when_eligibility_raises_or_is_awaitable(
++    tmp_path, monkeypatch
++):
++    _write_plugin_config(
++        tmp_path, monkeypatch, {"allow_gateway_injection": True}
++    )
++    context, manager = _context()
++    injector = MagicMock()
++    manager.set_gateway_message_injector(object(), injector)
++
++    def raises():
++        raise RuntimeError("binding unavailable")
++
++    async def async_check():
++        return True
++
++    for event_id, eligibility_check in (
++        ("event-raises", raises),
++        ("event-awaitable", async_check),
++    ):
++        receipt = context.inject_gateway_system_event(
++            "body",
++            session_key="agent:main:telegram:dm:42",
++            expected_session_id="session-42",
++            event_id=event_id,
++            event_kind="external_tool_completed",
++            expected_route=_EXPECTED_ROUTE,
++            eligibility_check=eligibility_check,
++        )
++        assert receipt.result()["status"] == "unauthorized"
++
++    injector.assert_not_called()
++
++
++def test_system_event_rejects_invalid_kind_without_host_call(tmp_path, monkeypatch):
++    _write_plugin_config(
++        tmp_path, monkeypatch, {"allow_gateway_injection": True}
++    )
++    context, manager = _context()
++    injector = MagicMock()
++    manager.set_gateway_message_injector(object(), injector)
++
++    assert context.inject_gateway_system_event(
++        "body",
++        session_key="agent:main:telegram:dm:42",
++        expected_session_id="session-42",
++        event_id="event-42",
++        event_kind="arbitrary",
++        expected_route=_EXPECTED_ROUTE,
++        eligibility_check=_eligible,
++    ) is None
++    injector.assert_not_called()
++
++
++def test_system_event_requires_exact_complete_route_tuple(tmp_path, monkeypatch):
++    _write_plugin_config(
++        tmp_path, monkeypatch, {"allow_gateway_injection": True}
++    )
++    context, manager = _context()
++    injector = MagicMock()
++    manager.set_gateway_message_injector(object(), injector)
++
++    for route in (
++        {key: value for key, value in _EXPECTED_ROUTE.items() if key != "topic_id"},
++        {**_EXPECTED_ROUTE, "label": "caller-controlled"},
++    ):
++        assert context.inject_gateway_system_event(
++            "body",
++            session_key="agent:main:telegram:dm:42",
++            expected_session_id="session-42",
++            event_id="event-42",
++            event_kind="external_tool_completed",
++            expected_route=route,
++            eligibility_check=_eligible,
++        ) is None
++
++    injector.assert_not_called()
++
++
++def test_system_event_reports_authorization_and_liveness_refusals(
++    tmp_path, monkeypatch
++):
++    _write_plugin_config(tmp_path, monkeypatch, {})
++    context, manager = _context()
++    denied = context.inject_gateway_system_event(
++        "body",
++        session_key="agent:main:telegram:dm:42",
++        expected_session_id="session-42",
++        event_id="denied",
++        event_kind="external_tool_error",
++        expected_route=_EXPECTED_ROUTE,
++        eligibility_check=_eligible,
++    )
++    assert denied.result()["status"] == "unauthorized"
++
++    _write_plugin_config(
++        tmp_path, monkeypatch, {"allow_gateway_injection": True}
++    )
++    unavailable = context.inject_gateway_system_event(
++        "body",
++        session_key="agent:main:telegram:dm:42",
++        expected_session_id="session-42",
++        event_id="unavailable",
++        event_kind="external_tool_pending_decision",
++        expected_route=_EXPECTED_ROUTE,
++        eligibility_check=_eligible,
++    )
++    assert unavailable.result()["status"] == "stopping"
++
++
++def test_gateway_task_factory_runs_on_host_loop_and_cancels_on_stop():
++    async def exercise():
++        context, manager = _context()
++        started = asyncio.Event()
++        cancelled = asyncio.Event()
++
++        async def worker():
++            started.set()
++            try:
++                await asyncio.Event().wait()
++            finally:
++                cancelled.set()
++
++        handle = context.register_gateway_task(worker, name="continuation-worker")
++        manager._start_gateway_tasks(asyncio.get_running_loop())
++        await asyncio.wait_for(started.wait(), timeout=1)
++        manager._stop_gateway_tasks()
++        await asyncio.wait_for(cancelled.wait(), timeout=1)
++        handle.dispose()
++        assert manager._gateway_task_factories == {}
++
++    asyncio.run(exercise())

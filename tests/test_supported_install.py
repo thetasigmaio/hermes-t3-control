@@ -35,9 +35,14 @@ TEST_CREDENTIAL = "test-only-placeholder"
 DEVELOPMENT_UNTRACKED_ALLOWLIST = (
     pathlib.Path("auth.py"),
     pathlib.Path("after-install.md"),
+    pathlib.Path("continuation.py"),
+    pathlib.Path("continuation_cli.py"),
+    pathlib.Path("continuation_state.py"),
+    pathlib.Path("continuation_transport.py"),
     pathlib.Path("docs/community-index-entry.json"),
     pathlib.Path("docs/community-index.md"),
     pathlib.Path("docs/compatibility.md"),
+    pathlib.Path("docs/experimental-continuation.md"),
     pathlib.Path("docs/operations.md"),
     pathlib.Path("docs/security.md"),
     pathlib.Path("docs/tools.md"),
@@ -85,16 +90,23 @@ assert manifest.manifest_version == 1
 assert manifest.api_version == 1
 assert (manifest.name, manifest.version, manifest.kind) == (
     "hermes-t3-control",
-    "1.2.3",
+    "1.3.0",
     "standalone",
 )
 assert tuple(manifest.provides_tools) == expected_tools
 assert manifest.requires_env == []
+assert manifest.python_dependencies == ["websockets>=15,<16"]
 assert manifest.config_schema["auth_mode"]["type"] == "string"
 assert manifest.config_schema["base_url"]["type"] == "string"
 assert manifest.config_schema["base_url"]["required"] is False
 assert manifest.config_schema["t3_base_dir"]["required"] is False
 assert manifest.config_schema["default_runtime_mode"]["default"] == "approval-required"
+assert manifest.config_schema["default_instance_id"]["required"] is False
+assert manifest.config_schema["default_model"]["required"] is False
+assert manifest.config_schema["default_reasoning_effort"]["required"] is False
+assert manifest.config_schema["default_model_aliases"]["type"] == "array"
+assert manifest.config_schema["continuation_enabled"]["default"] is False
+assert manifest.config_schema["continuation_profile"]["default"] == "default"
 
 entries = []
 for name in expected_tools:
@@ -510,7 +522,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
             disabled_plugins = json.loads(listed_disabled.stdout)
             self.assertEqual(len(disabled_plugins), 1)
             self.assertEqual(disabled_plugins[0]["name"], "hermes-t3-control")
-            self.assertEqual(disabled_plugins[0]["version"], "1.2.3")
+            self.assertEqual(disabled_plugins[0]["version"], "1.3.0")
             self.assertEqual(disabled_plugins[0]["source"], "git")
             self.assertEqual(disabled_plugins[0]["status"], "not enabled")
 
@@ -519,8 +531,14 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 (installed_root / "plugin.yaml").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["manifest_version"], 1)
-            self.assertEqual(manifest["version"], "1.2.3")
+            self.assertEqual(manifest["version"], "1.3.0")
             self.assertEqual(tuple(manifest["provides_tools"]), EXPECTED_TOOLS)
+            self.assertEqual(
+                manifest["python_dependencies"], ["websockets>=15,<16"]
+            )
+            self.assertFalse(
+                manifest["config_schema"]["continuation_enabled"]["default"]
+            )
             after_install = (installed_root / "after-install.md").read_text(
                 encoding="utf-8"
             )
