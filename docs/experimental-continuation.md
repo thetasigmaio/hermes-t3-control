@@ -111,13 +111,14 @@ hermes config set plugins.entries.hermes-t3-control.allow_gateway_injection true
 
 The Sunsama-named field is an opaque operator task reference. The plugin does not contact Sunsama, and the basic tools do not require an account. Command arguments and `hermes t3-continuation status` contain private route, session, and task metadata; do not publish shell history or status output.
 
-Restart the owning gateway. Bind before the source thread's first turn, then wait for `status` to show a nonzero `cursor_sequence` before starting work. That first snapshot is only a baseline.
+Start or restart the owning gateway with the required native service and typed-injection APIs. A successful `bind` authenticates the exact source snapshot and durably captures its cursor before returning `baseline_captured: true` and `armed: true`, including when the cursor is zero. These fields confirm registration, not a running observer. Register before starting the authorized turn; binding an already running authorized turn also preserves its later completion if the observer starts after that completion. Events already in the registration snapshot are baseline history and do not wake Hermes. Confirm that the owning gateway actually started the observer before relying on delivery.
 
-Use `pause`, `resume`, `stop`, `cancel`, and `ack` through the same operator command. A crash, timeout, or agent error after admission becomes `uncertain` and is never retried automatically.
+Use `pause`, `resume`, `stop`, `cancel`, and `ack` through the same operator command. A crash, timeout, or agent error after admission is never retried automatically. If an acknowledgement arrives before the final host receipt, its audit status stays acknowledged while the eventual success or error receipt is retained. Pre-admission `busy` and `stopping` receipts retry inside the same worker even when the source stream stays silent: delays are 1, 2, 4, 8, 16, then at most 30 seconds, with a persisted 64-attempt limit across restarts. Stop, pause, and cancel interrupt the backoff. Exhausting that retry budget is a terminal failure, not a completed continuation.
 
-Renew an exhausted generation with a new binding ID and every bind argument supplied again:
+An exhausted binding reports `state: "exhausted"`, zero remaining continuations, and `armed: false`; it does not resubscribe after a restart. Explicitly stop that generation before renewing it with a new binding ID and every bind argument supplied again:
 
 ```bash
+hermes t3-continuation stop OLD_MISSION_ID
 hermes t3-continuation renew --replaces OLD_MISSION_ID \
   --binding-id NEW_MISSION_ID \
   --thread-id EXACT_T3_THREAD_ID \
@@ -130,9 +131,9 @@ hermes t3-continuation renew --replaces OLD_MISSION_ID \
   --followup-scope none --max-continuations 1
 ```
 
-The predecessor must be active or stopped, exhausted, fully acknowledged, and backed by completed host receipts. Paused, cancelled, in-flight, blocked, or uncertain predecessors are rejected. Source thread, owner, environment, and the complete Hermes destination must match. Task reference, source identity, follow-up scope, and budget are explicitly new. Renewal is atomic, keeps the old generation and lineage, starts the new cursor at zero, and deduplicates old turns/events across generations. The superseded generation cannot resume. A running v1.3 supervisor notices the new generation without another restart.
+The predecessor must be explicitly stopped, exhausted, fully acknowledged, and backed by completed host receipts matching its signed authority. Active, paused, cancelled, in-flight, blocked, or uncertain predecessors are rejected. Source thread, owner, environment, and canonical Hermes route must match. The physical session ID may be a newly resolved current session on that same route; every destination field must be supplied explicitly and is revalidated by the host before admission. Task reference, source identity, follow-up scope, and budget are explicitly new. Renewal is atomic, preserves the old generation and lineage, captures a fresh registration baseline, and deduplicates old turns/events across generations. The superseded generation cannot resume. A running compatible supervisor notices the new generation without another restart.
 
-Upgrading from older live code still requires a coordinated reload or restart of the owning gateway; never claim a hot upgrade by copying files. Downgrading a migrated v2 continuation ledger to pre-v2 experimental code is unsupported. Disable continuation before a stock basic-plugin rollback.
+Upgrading from older live code requires a coordinated reload or restart of the owning gateway; copying files does not upgrade an already running observer. Canonical public schema v1 and v2 ledgers migrate transactionally to v3, preserving authority, signed events, and lineage. A legacy positive cursor becomes a captured baseline; an ambiguous legacy zero remains unarmed until the worker captures its first snapshot. Experimental local ledgers that also call themselves v2 but have a different table shape are rejected without migration. Moving such state to this public plugin requires a separately reviewed and tested migration; do not edit the version or copy database rows manually. Downgrading a migrated v3 ledger to older continuation code is unsupported. Disable continuation before a stock basic-plugin rollback. These plugin changes do not add the required host APIs or expand the exact host-patch support described above.
 
 ## Roll back
 

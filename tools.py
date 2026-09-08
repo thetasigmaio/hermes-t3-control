@@ -25,7 +25,9 @@ try:
         MAX_TITLE_CHARS,
         MAX_TURN_LIMIT,
         ModelSwitchBusyError,
+        NetworkError,
         ProviderLimitExhaustedError,
+        ResponseBudgetExceededError,
         RUNTIME_MODES,
         T3Client,
         T3ClientError,
@@ -47,7 +49,9 @@ except ImportError:  # Direct repository import used by unit tests.
         MAX_TITLE_CHARS,
         MAX_TURN_LIMIT,
         ModelSwitchBusyError,
+        NetworkError,
         ProviderLimitExhaustedError,
+        ResponseBudgetExceededError,
         RUNTIME_MODES,
         T3Client,
         T3ClientError,
@@ -2459,20 +2463,39 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
         started = time.monotonic()
         deadline = started + max(float(timeout_seconds), 0.25)
         shell = transport.get_shell(deadline=deadline)
+        material = None
+        stop_reason = None
         while True:
-            detail = transport.get_thread(
-                thread_id,
-                turn_limit=MAX_TURN_LIMIT,
-                deadline=deadline,
-            )
-            project = _project_for_thread(shell, detail["thread"])
-            material = _material_projection(detail, project)
+            if material is not None and time.monotonic() >= deadline:
+                stop_reason = "deadline"
+            else:
+                try:
+                    detail = transport.get_thread(
+                        thread_id,
+                        turn_limit=MAX_TURN_LIMIT,
+                        deadline=deadline,
+                    )
+                except ResponseBudgetExceededError:
+                    if material is None:
+                        raise
+                    stop_reason = "response_budget_exhausted"
+                except NetworkError:
+                    if material is None or time.monotonic() < deadline:
+                        raise
+                    stop_reason = "deadline"
+                else:
+                    project = _project_for_thread(shell, detail["thread"])
+                    material = _material_projection(detail, project)
             projected = material["thread"]
             observed_sequence = material["thread_sequence"]
             progressed = after_sequence is None or observed_sequence > after_sequence
             liveness = projected["liveness"]
             lifecycle = projected["lifecycle"]
-            if liveness == "action_required":
+            if stop_reason == "response_budget_exhausted":
+                outcome = "observation_limit"
+            elif stop_reason == "deadline":
+                outcome = "timeout"
+            elif liveness == "action_required":
                 outcome = "action_required"
             elif until == "change" and progressed:
                 outcome = "progressed"
@@ -2491,7 +2514,7 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
             elif timeout_seconds == 0 or time.monotonic() >= deadline:
                 outcome = "timeout"
             else:
-                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
                 continue
             material_delta = {
                 "pending_requests": projected["pending_requests"],
@@ -2516,6 +2539,7 @@ def t3_thread_wait(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "action": "thread_wait_observed",
                 "thread_id": thread_id,
                 "wait_outcome": outcome,
+                **({"stop_reason": stop_reason} if stop_reason is not None else {}),
                 "snapshot_sequence": material["snapshot_sequence"],
                 "thread_sequence": observed_sequence,
                 "after_thread_sequence": after_sequence,

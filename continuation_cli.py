@@ -6,12 +6,16 @@ import json
 from typing import Any
 
 try:
-    from .continuation_state import ContinuationStateError, ContinuationStore
+    from .continuation_state import ContinuationStateError, ContinuationStore, utc_now
+    from .continuation_transport import read_thread_snapshot, ContinuationTransportError
+    from .client import T3ClientError
 except ImportError:
-    from continuation_state import ContinuationStateError, ContinuationStore
+    from continuation_state import ContinuationStateError, ContinuationStore, utc_now
+    from continuation_transport import read_thread_snapshot, ContinuationTransportError
+    from client import T3ClientError
 
 
-def _add_binding_arguments(parser: Any) -> None:
+def _add_binding_arguments(parser: Any, *, renewal: bool = False) -> None:
     parser.add_argument("--binding-id", required=True)
     parser.add_argument("--thread-id", required=True)
     parser.add_argument("--owner-id", required=True)
@@ -21,11 +25,11 @@ def _add_binding_arguments(parser: Any) -> None:
     parser.add_argument("--platform", required=True)
     parser.add_argument("--user-id", required=True)
     parser.add_argument("--chat-id", required=True)
-    parser.add_argument("--topic-id", default="")
+    parser.add_argument("--topic-id", default="", required=renewal)
     parser.add_argument("--sunsama-task-id", required=True)
     parser.add_argument("--source-identity", required=True)
-    parser.add_argument("--followup-scope", default="none")
-    parser.add_argument("--max-continuations", type=int, default=1)
+    parser.add_argument("--followup-scope", default="none", required=renewal)
+    parser.add_argument("--max-continuations", type=int, default=1, required=renewal)
 
 
 def setup_continuation_cli(parser: Any) -> None:
@@ -36,7 +40,7 @@ def setup_continuation_cli(parser: Any) -> None:
         "renew", help="Renew one exhausted binding with a new explicit authority"
     )
     renew.add_argument("--replaces", required=True)
-    _add_binding_arguments(renew)
+    _add_binding_arguments(renew, renewal=True)
     status = actions.add_parser("status", help="Show bounded continuation ledger status")
     status.add_argument("--binding-id")
     for name in ("resume", "pause", "stop", "cancel"):
@@ -72,22 +76,27 @@ def make_continuation_cli_handler(ctx: Any):
         try:
             store.initialize()
             action = args.continuation_action
-            if action == "bind":
-                binding = store.bind(**binding_values(args))
+            if action in {"bind", "renew"}:
+                values = binding_values(args)
+                store._normalize_binding_values(values)
+                captured_at = utc_now()
+                snapshot = read_thread_snapshot(
+                    ctx, thread_id=args.thread_id, environment_id=args.environment_id
+                )
+                baseline = (snapshot["snapshotSequence"], captured_at)
+                binding = (
+                    store.renew(args.replaces, baseline=baseline, **values)
+                    if action == "renew" else store.bind(baseline=baseline, **values)
+                )
+                status = store.status(binding.binding_id)["bindings"][0]
                 output = {
                     "ok": True,
                     "binding_id": binding.binding_id,
+                    **({"replaces_binding_id": args.replaces} if action == "renew" else {}),
                     "state": binding.state,
                     "cursor_sequence": binding.cursor_sequence,
-                }
-            elif action == "renew":
-                binding = store.renew(args.replaces, **binding_values(args))
-                output = {
-                    "ok": True,
-                    "binding_id": binding.binding_id,
-                    "replaces_binding_id": args.replaces,
-                    "state": binding.state,
-                    "cursor_sequence": binding.cursor_sequence,
+                    "baseline_captured": status["baseline_captured"],
+                    "armed": status["armed"],
                 }
             elif action == "status":
                 output = {"ok": True, **store.status(args.binding_id)}
@@ -105,7 +114,7 @@ def make_continuation_cli_handler(ctx: Any):
                 output = {"ok": True, "binding_id": args.binding_id, "status": "acknowledged"}
             else:
                 raise ValueError("unsupported continuation action")
-        except (ContinuationStateError, OSError, ValueError) as exc:
+        except (ContinuationStateError, ContinuationTransportError, T3ClientError, OSError, ValueError) as exc:
             output = {"ok": False, "error": str(exc)}
             print(json.dumps(output, sort_keys=True))
             return 1

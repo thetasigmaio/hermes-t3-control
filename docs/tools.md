@@ -95,7 +95,7 @@ Example for `t3_thread_wait`:
 }
 ```
 
-Wait returns only material deltas and one latest assistant update. Provider liveness and work progress remain separate. A timeout means no requested observation occurred in that bounded window; it does not declare provider failure.
+Wait returns only material deltas and one latest assistant update. Provider liveness and work progress remain separate. A timeout means no requested observation occurred in that bounded window; it does not declare provider failure. Polls are spaced by up to one second. If the cumulative response byte allowance runs out after a valid observation, `wait_outcome: "observation_limit"` and `stop_reason: "response_budget_exhausted"` return the last observed state; this is not evidence of completion. Initial read failures and transport failures before the wait deadline remain errors. If a later read reaches that deadline, the last validated observation is returned with `wait_outcome: "timeout"` and `stop_reason: "deadline"`; it does not claim current service health.
 
 ### Respond to a pending request
 

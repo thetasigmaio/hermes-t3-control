@@ -146,6 +146,7 @@ def exhaust_and_acknowledge(
     ):
         raise AssertionError("test predecessor event was not completed")
     store.acknowledge(binding.binding_id, event_id)
+    store.set_binding_state(binding.binding_id, "stopped")
 
 
 @dataclass(frozen=True)
@@ -339,11 +340,11 @@ class ContinuationStoreTests(unittest.TestCase):
             self.store.renew(
                 predecessor.binding_id,
                 **binding_values(
-                    binding_id="mission-2", hermes_session_id="other-session"
+                    binding_id="mission-2", hermes_session_key="other-route"
                 ),
             )
 
-        self.assertEqual(self.store.get_binding(predecessor.binding_id).state, "active")
+        self.assertEqual(self.store.get_binding(predecessor.binding_id).state, "stopped")
         self.assertEqual(len(self.store.status()["bindings"]), 1)
 
     def test_renewal_rejects_nonterminal_and_cancelled_predecessors(self):
@@ -365,7 +366,7 @@ class ContinuationStoreTests(unittest.TestCase):
         exhaust_and_acknowledge(paused_store, paused)
         paused_store.set_binding_state(paused.binding_id, "paused")
         with self.assertRaisesRegex(
-            continuation_state.ContinuationStateError, "active or stopped"
+            continuation_state.ContinuationStateError, "explicitly stopped"
         ):
             paused_store.renew(
                 paused.binding_id,
@@ -573,8 +574,282 @@ class ContinuationStoreTests(unittest.TestCase):
         value["hermes_session_id"] = "other"
         self.assertFalse(self.store.verify(value, signature))
 
+    def test_ack_before_terminal_host_error_keeps_audit_and_error_receipt_without_retry(self):
+        binding = self.store.bind(**binding_values())
+        self.store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+        self.store.claim_next(binding.binding_id)
+        self.store.acknowledge(binding.binding_id, "event-1")
+        receipt = {"status": "agent_error", "reason": "delivery_failed"}
+        self.assertFalse(self.store.finish(binding.binding_id, 1, "uncertain", receipt=receipt,
+                                          error_code="agent_error_after_admission"))
+        with self.store._connect() as db:
+            row = db.execute("SELECT * FROM events").fetchone()
+        self.assertEqual(row["status"], "acknowledged")
+        self.assertEqual(json.loads(row["receipt_json"]), receipt)
+        self.assertEqual(row["last_error_code"], "agent_error_after_admission")
+        self.assertIsNone(self.store.claim_next(binding.binding_id))
+        self.assertEqual(self.store.active_bindings("default"), [])
+        self.store.set_binding_state(binding.binding_id, "stopped")
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.renew(binding.binding_id, **binding_values(binding_id="mission-2"))
+
+
+    def completed_acknowledged_binding(self):
+        binding = self.store.bind(**binding_values(followup_scope="old-scope"))
+        self.store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+        self.store.claim_next(binding.binding_id)
+        self.store.finish(binding.binding_id, 1, "completed", receipt={"status": "completed"})
+        self.store.acknowledge(binding.binding_id, "event-1")
+        return binding
+
+
+    def test_spent_binding_is_truthfully_exhausted_and_not_observed_after_restart(self):
+        binding = self.completed_acknowledged_binding()
+        restarted = continuation_state.ContinuationStore(self.store.data_dir)
+        restarted.initialize()
+        status = restarted.status(binding.binding_id)["bindings"][0]
+        self.assertEqual(status["state"], "exhausted")
+        self.assertEqual(status["remaining_continuations"], 0)
+        self.assertFalse(status["armed"])
+        self.assertEqual(restarted.active_bindings("default"), [])
+        self.assertEqual(restarted.get_binding(binding.binding_id).state, "exhausted")
+
+
+    def test_same_source_new_id_requires_explicit_renewal(self):
+        self.completed_acknowledged_binding()
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.bind(**binding_values(binding_id="mission-2"))
+
+
+    def test_renewal_preserves_audit_and_uses_only_explicit_new_authority(self):
+        binding = self.completed_acknowledged_binding()
+        self.store.set_binding_state(binding.binding_id, "stopped")
+        with self.store._connect() as db:
+            before = dict(db.execute("SELECT * FROM events").fetchone())
+        values = binding_values(binding_id="mission-2", hermes_session_id="new-session",
+                                followup_scope="none", sunsama_task_id="new-task")
+        renewed = self.store.renew(binding.binding_id, **values)
+        self.assertEqual(renewed.hermes_session_id, "new-session")
+        self.assertEqual(renewed.followup_scope, "none")
+        self.assertEqual(renewed.cursor_sequence, 0)
+        self.assertFalse(self.store.status(renewed.binding_id)["bindings"][0]["armed"])
+        self.assertEqual(self.store.renew(binding.binding_id, **values), renewed)
+        with self.store._connect() as db:
+            self.assertEqual(dict(db.execute("SELECT * FROM events").fetchone()), before)
+        restarted = continuation_state.ContinuationStore(self.store.data_dir)
+        restarted.initialize()
+        self.assertEqual([b.binding_id for b in restarted.active_bindings("default")], ["mission-2"])
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            restarted.renew(binding.binding_id, **binding_values(binding_id="mission-3"))
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            restarted.set_binding_state(binding.binding_id, "active")
+
+
+    def test_renewal_rejects_active_paused_cancelled_or_wrong_route(self):
+        binding = self.completed_acknowledged_binding()
+        for state in ("active", "paused"):
+            self.store.set_binding_state(binding.binding_id, state)
+            with self.subTest(state=state), self.assertRaises(continuation_state.ContinuationStateError):
+                self.store.renew(binding.binding_id, **binding_values(binding_id="mission-2"))
+        self.store.set_binding_state(binding.binding_id, "stopped")
+        for field in ("t3_thread_id", "t3_owner_id", "t3_environment_id", "hermes_session_key",
+                      "profile_name", "platform", "user_id", "chat_id", "topic_id"):
+            with self.subTest(field=field), self.assertRaises(continuation_state.ContinuationStateError):
+                self.store.renew(binding.binding_id, **binding_values(binding_id="mission-2", **{field: "other"}))
+        self.assertEqual(len(self.store.status()["bindings"]), 1)
+        self.store.set_binding_state(binding.binding_id, "cancelled")
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.renew(binding.binding_id, **binding_values(binding_id="mission-2"))
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.set_binding_state(binding.binding_id, "stopped")
+
+
+    def test_renewal_rejects_missing_explicit_scope_and_incomplete_receipt(self):
+        binding = self.completed_acknowledged_binding()
+        self.store.set_binding_state(binding.binding_id, "stopped")
+        values = binding_values(binding_id="mission-2")
+        del values["followup_scope"]
+        with self.assertRaises((ValueError, continuation_state.ContinuationStateError)):
+            self.store.renew(binding.binding_id, **values)
+        with self.store._connect() as db:
+            db.execute("UPDATE events SET receipt_json=NULL")
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.renew(binding.binding_id, **binding_values(binding_id="mission-2"))
+
+
+    def test_unknown_schema_is_rejected_without_changing_rows(self):
+        self.completed_acknowledged_binding()
+        with self.store._connect() as db:
+            db.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
+            before = dict(db.execute("SELECT * FROM events").fetchone())
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.initialize()
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "999")
+            self.assertEqual(dict(db.execute("SELECT * FROM events").fetchone()), before)
+
+
+    def test_restart_after_ack_before_receipt_retires_waiter_without_replay_or_renewal(self):
+        binding = self.store.bind(**binding_values())
+        self.store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+        self.store.claim_next(binding.binding_id)
+        self.store.acknowledge(binding.binding_id, "event-1")
+        self.assertEqual(self.store.get_binding(binding.binding_id).state, "active")
+        self.assertEqual(self.store.recover_dispatching(), 1)
+        self.assertEqual(self.store.recover_dispatching(), 0)
+        self.assertEqual(self.store.get_binding(binding.binding_id).state, "exhausted")
+        self.assertEqual(self.store.status(binding.binding_id)["bindings"][0]["events"], {"acknowledged": 1})
+        self.assertIsNone(self.store.claim_next(binding.binding_id))
+        self.store.set_binding_state(binding.binding_id, "stopped")
+        with self.assertRaises(continuation_state.ContinuationStateError):
+            self.store.renew(binding.binding_id, **binding_values(binding_id="mission-2"))
+
+
+    def test_retry_cancellation_and_restart_never_replay_the_prior_attempt(self):
+        for retry_status in ("busy", "stopping"):
+            for ending in ("cancelled", "restart"):
+                with self.subTest(retry=retry_status, ending=ending):
+                    store = continuation_state.ContinuationStore(self.store.data_dir / f"{retry_status}-{ending}")
+                    store.initialize()
+                    binding = store.bind(**binding_values())
+                    store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+                    store.claim_next(binding.binding_id)
+                    store.finish(binding.binding_id, 1, "queued", receipt={"status": retry_status},
+                                 refund_attempt=True, count_busy=True)
+                    if ending == "cancelled":
+                        store.set_binding_state(binding.binding_id, "cancelled")
+                    else:
+                        claimed = store.claim_next(binding.binding_id)
+                        self.assertIsNone(claimed["receipt_json"])
+                        self.assertIsNone(claimed["last_error_code"])
+                        store.acknowledge(binding.binding_id, "event-1")
+                        self.assertEqual(store.get_binding(binding.binding_id).state, "active")
+                        self.assertEqual(store.recover_dispatching(), 1)
+                        self.assertEqual(store.recover_dispatching(), 0)
+                        with store._connect() as db:
+                            row = db.execute("SELECT * FROM events").fetchone()
+                        self.assertEqual(row["status"], "acknowledged")
+                        self.assertIsNone(row["receipt_json"])
+                        self.assertEqual(row["last_error_code"], "process_restart")
+                    self.assertIsNone(store.claim_next(binding.binding_id))
+                    self.assertEqual(store.active_bindings("default"), [])
+
+
+
+
+def create_public_v2_database(data_dir: pathlib.Path):
+    """Build the released v2 layout from the retained v1 fixture, without current DDL."""
+    store = create_v1_database(data_dir)
+    predecessor = populate_exhausted_v1_database(store)
+    with closing(sqlite3.connect(store.db_path)) as db:
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE name='bindings'").fetchone()[0]
+        sql = sql.replace("CREATE TABLE bindings", "CREATE TABLE bindings_v2")
+        sql = sql.replace("t3_thread_id TEXT NOT NULL UNIQUE", "t3_thread_id TEXT NOT NULL")
+        sql = sql.replace("updated_at TEXT NOT NULL", "updated_at TEXT NOT NULL, "
+                          "binding_schema_version INTEGER NOT NULL CHECK(binding_schema_version = 2)")
+        db.execute(sql)
+        columns = ",".join(continuation_state.V1_BINDING_COLUMNS)
+        db.execute(f"INSERT INTO bindings_v2 SELECT {columns},2 FROM bindings")
+        db.execute("DROP TABLE bindings")
+        db.execute("ALTER TABLE bindings_v2 RENAME TO bindings")
+        db.execute("CREATE UNIQUE INDEX bindings_live_thread_idx ON bindings(t3_thread_id) "
+                   "WHERE state IN ('active','paused')")
+        db.execute("CREATE TABLE binding_lineage ("
+                   "predecessor_binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),"
+                   "successor_binding_id TEXT NOT NULL UNIQUE REFERENCES bindings(binding_id),"
+                   "renewed_at TEXT NOT NULL)")
+        values = binding_values(binding_id="mission-2", source_identity="source-2")
+        values.update(state="active", cursor_sequence=0, created_at="2099-01-02T00:00:00Z",
+                      updated_at="2099-01-02T00:00:00Z", binding_schema_version=2)
+        columns = continuation_state.V2_BINDING_COLUMNS
+        db.execute(f"INSERT INTO bindings({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                   tuple(values[column] for column in columns))
+        db.execute("INSERT INTO binding_lineage VALUES(?,?,?)",
+                   (predecessor.binding_id, "mission-2", "2099-01-02T00:00:00Z"))
+        db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+        db.commit()
+    return store
+
 
 class ContinuationMigrationTests(unittest.TestCase):
+    def test_public_v2_migration_preserves_authority_signed_events_and_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = create_public_v2_database(pathlib.Path(temporary) / "state")
+            key_before = store.key_path.read_bytes()
+            with store._connect() as db:
+                bindings_before = [dict(row) for row in db.execute("SELECT * FROM bindings ORDER BY binding_id")]
+                events_before = [tuple(row) for row in db.execute("SELECT * FROM events")]
+                lineage_before = [tuple(row) for row in db.execute("SELECT * FROM binding_lineage")]
+            store.initialize()
+            store.initialize()  # Restart validates v3 without changing authority or audit.
+            self.assertEqual(store.status()["schema_version"], 3)
+            self.assertEqual(store.key_path.read_bytes(), key_before)
+            with store._connect() as db:
+                self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM events")], events_before)
+                self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM binding_lineage")], lineage_before)
+                for before in bindings_before:
+                    after = dict(db.execute("SELECT * FROM bindings WHERE binding_id=?", (before["binding_id"],)).fetchone())
+                    self.assertEqual(after.pop("baseline_captured"), int(before["cursor_sequence"] > 0))
+                    self.assertEqual(after.pop("binding_schema_version"), 3)
+                    before.pop("binding_schema_version")
+                    self.assertEqual(after, before)
+                event = db.execute("SELECT * FROM events").fetchone()
+                self.assertTrue(store.verify(json.loads(event["envelope_json"]), event["envelope_mac"]))
+                self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            successor = store.get_binding("mission-2")
+            self.assertFalse(successor.baseline_captured)  # Unknown legacy zero stays unarmed.
+            self.assertFalse(store.ingest(successor, cursor_sequence=2,
+                                         event=envelope(successor, sequence=2, event_id="replayed", turn_id="turn-1")))
+            with self.assertRaises(continuation_state.ContinuationStateError):
+                store.set_binding_state("mission-1", "active")
+
+    def test_public_v2_migration_failure_rolls_back_database_and_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = create_public_v2_database(pathlib.Path(temporary) / "state")
+            with store._connect() as db:
+                db.execute("CREATE TRIGGER fail_schema_update BEFORE UPDATE OF value ON meta "
+                           "BEGIN SELECT RAISE(ABORT, 'forced migration failure'); END")
+            before = store.db_path.read_bytes(), store.key_path.read_bytes()
+            with self.assertRaisesRegex(continuation_state.ContinuationStateError, "database operation failed"):
+                store.initialize()
+            self.assertEqual((store.db_path.read_bytes(), store.key_path.read_bytes()), before)
+
+    def test_nonpublic_v2_and_dirty_public_v2_fail_closed_without_mutation(self):
+        for variant in ("experimental", "missing_live_index", "wrong_discriminator"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                data_dir = pathlib.Path(temporary) / "state"
+                if variant == "experimental":
+                    store = create_v1_database(data_dir)
+                    with store._connect() as db:
+                        db.execute("ALTER TABLE bindings ADD COLUMN baseline_captured INTEGER NOT NULL DEFAULT 0")
+                        db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+                else:
+                    store = create_public_v2_database(data_dir)
+                    with store._connect() as db:
+                        if variant == "missing_live_index":
+                            db.execute("DROP INDEX bindings_live_thread_idx")
+                        else:
+                            db.execute("PRAGMA writable_schema=ON")
+                            db.execute("UPDATE sqlite_master SET sql=replace(sql, 'binding_schema_version = 2', "
+                                       "'binding_schema_version >= 2') WHERE name='bindings'")
+                before = store.db_path.read_bytes(), store.key_path.read_bytes()
+                with self.assertRaisesRegex(continuation_state.ContinuationStateError, "not canonical"):
+                    store.initialize()
+                self.assertEqual((store.db_path.read_bytes(), store.key_path.read_bytes()), before)
+
+    def test_retained_v2_writer_cannot_insert_into_migrated_v3(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = create_public_v2_database(pathlib.Path(temporary) / "state")
+            store.initialize()
+            with store._connect() as db:
+                columns = continuation_state.V2_BINDING_COLUMNS
+                old = dict(db.execute("SELECT * FROM bindings WHERE binding_id='mission-2'").fetchone())
+                old.update(binding_id="old-worker", t3_thread_id="other-thread", binding_schema_version=2)
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "binding_schema_version"):
+                    db.execute(f"INSERT INTO bindings({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                               tuple(old[column] for column in columns))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM bindings").fetchone()[0], 2)
+
     def test_v2_discriminator_has_no_default_and_rejects_legacy_insert(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = continuation_state.ContinuationStore(
@@ -653,11 +928,11 @@ class ContinuationMigrationTests(unittest.TestCase):
 
             store.initialize()
 
-            self.assertEqual(store.status()["schema_version"], 2)
+            self.assertEqual(store.status()["schema_version"], 3)
             migrated = store.get_binding(binding_before.binding_id)
             for field in LegacyV1BindingFixture.__dataclass_fields__:
                 self.assertEqual(getattr(migrated, field), getattr(binding_before, field))
-            self.assertEqual(migrated.binding_schema_version, 2)
+            self.assertEqual(migrated.binding_schema_version, 3)
             self.assertEqual(
                 store.status(binding_before.binding_id)["bindings"][0]["events"],
                 {"acknowledged": 1},

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_IDENTIFIER_CHARS = 512
 MAX_SESSION_KEY_CHARS = 512
 MAX_SESSION_ID_CHARS = 256
@@ -48,7 +48,6 @@ RENEWAL_SOURCE_FIELDS = (
 )
 RENEWAL_DESTINATION_FIELDS = (
     "hermes_session_key",
-    "hermes_session_id",
     "platform",
     "user_id",
     "chat_id",
@@ -75,7 +74,8 @@ V1_BINDING_COLUMNS = (
     "created_at",
     "updated_at",
 )
-BINDING_COLUMNS = V1_BINDING_COLUMNS + ("binding_schema_version",)
+V2_BINDING_COLUMNS = V1_BINDING_COLUMNS + ("binding_schema_version",)
+BINDING_COLUMNS = V2_BINDING_COLUMNS + ("baseline_captured",)
 EVENT_COLUMNS = (
     "binding_id",
     "source_sequence",
@@ -153,6 +153,7 @@ class Binding:
     created_at: str
     updated_at: str
     binding_schema_version: int
+    baseline_captured: bool
 
     def __post_init__(self) -> None:
         if self.binding_schema_version != SCHEMA_VERSION:
@@ -194,7 +195,7 @@ class ContinuationStore:
             )
         }
         if not objects:
-            self._create_schema_v2(db)
+            self._create_schema_current(db)
         elif "meta" not in objects:
             raise ContinuationStateError("continuation schema metadata is missing")
         else:
@@ -210,9 +211,11 @@ class ContinuationStore:
                     "continuation schema version is invalid"
                 ) from exc
             if version == 1:
-                self._migrate_v1_to_v2(db)
+                self._migrate_v1_to_current(db)
+            elif version == 2:
+                self._migrate_v2_to_current(db)
             elif version == SCHEMA_VERSION:
-                self._validate_schema_v2(db)
+                self._validate_schema(db)
             elif version > SCHEMA_VERSION:
                 raise ContinuationStateError(
                     "continuation schema is newer than this plugin"
@@ -222,7 +225,7 @@ class ContinuationStore:
 
     @staticmethod
     def _create_bindings_table(db: sqlite3.Connection, name: str = "bindings") -> None:
-        if name not in {"bindings", "bindings_v2"}:
+        if name not in {"bindings", "bindings_v2", "bindings_v3"}:
             raise ValueError("unsupported bindings table name")
         db.execute(
             f"""CREATE TABLE {name} (
@@ -245,7 +248,8 @@ class ContinuationStore:
                 cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK(cursor_sequence >= 0),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                binding_schema_version INTEGER NOT NULL CHECK(binding_schema_version = 2)
+                binding_schema_version INTEGER NOT NULL CHECK(binding_schema_version = 3),
+                baseline_captured INTEGER NOT NULL DEFAULT 0 CHECK(baseline_captured IN (0,1))
             )"""
         )
 
@@ -292,7 +296,7 @@ class ContinuationStore:
             "CREATE INDEX events_dispatch_idx ON events(status, updated_at, source_sequence)"
         )
 
-    def _create_schema_v2(self, db: sqlite3.Connection) -> None:
+    def _create_schema_current(self, db: sqlite3.Connection) -> None:
         db.execute("BEGIN IMMEDIATE")
         try:
             db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -370,7 +374,7 @@ class ContinuationStore:
         if db.execute("PRAGMA foreign_key_check").fetchall():
             raise ContinuationStateError("continuation database has invalid foreign keys")
 
-    def _validate_schema_v2(self, db: sqlite3.Connection) -> None:
+    def _validate_schema(self, db: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
         tables = {
             row["name"]
             for row in db.execute(
@@ -378,9 +382,9 @@ class ContinuationStore:
             )
         }
         if tables != {"meta", "bindings", "events", "binding_lineage"}:
-            raise ContinuationStateError("continuation schema v2 is not canonical")
-        if self._table_columns(db, "bindings") != BINDING_COLUMNS:
-            raise ContinuationStateError("continuation bindings schema v2 is not canonical")
+            raise ContinuationStateError("continuation schema is not canonical")
+        if self._table_columns(db, "bindings") != (V2_BINDING_COLUMNS if version == 2 else BINDING_COLUMNS):
+            raise ContinuationStateError("continuation bindings schema is not canonical")
         discriminator = next(
             (
                 row
@@ -402,20 +406,27 @@ class ContinuationStore:
             or discriminator["type"].upper() != "INTEGER"
             or not discriminator["notnull"]
             or discriminator["dflt_value"] is not None
-            or "binding_schema_versionintegernotnullcheck(binding_schema_version=2)"
+            or f"binding_schema_versionintegernotnullcheck(binding_schema_version={version})"
             not in bindings_sql
         ):
             raise ContinuationStateError(
-                "continuation binding discriminator v2 is not canonical"
+                "continuation binding discriminator is not canonical"
             )
+        if version == 3:
+            baseline = next(row for row in db.execute("PRAGMA table_info(bindings)")
+                            if row["name"] == "baseline_captured")
+            if (baseline["type"].upper() != "INTEGER" or not baseline["notnull"]
+                    or baseline["dflt_value"] != "0"
+                    or "baseline_capturedintegernotnulldefault0check(baseline_capturedin(0,1))" not in bindings_sql):
+                raise ContinuationStateError("continuation baseline discriminator is not canonical")
         if self._table_columns(db, "events") != EVENT_COLUMNS:
-            raise ContinuationStateError("continuation events schema v2 is not canonical")
+            raise ContinuationStateError("continuation events schema is not canonical")
         if self._table_columns(db, "binding_lineage") != (
             "predecessor_binding_id",
             "successor_binding_id",
             "renewed_at",
         ):
-            raise ContinuationStateError("continuation lineage schema v2 is not canonical")
+            raise ContinuationStateError("continuation lineage schema is not canonical")
         binding_indexes = {
             row["name"]: row for row in db.execute("PRAGMA index_list(bindings)")
         }
@@ -431,18 +442,18 @@ class ContinuationStore:
             or self._index_columns(db, "bindings_live_thread_idx") != ("t3_thread_id",)
             or "wherestatein('active','paused')" not in live_sql
         ):
-            raise ContinuationStateError("continuation schema v2 indexes are not canonical")
+            raise ContinuationStateError("continuation schema indexes are not canonical")
         if self._unique_index_columns(db, "binding_lineage") != {
             ("predecessor_binding_id",),
             ("successor_binding_id",),
         }:
-            raise ContinuationStateError("continuation lineage indexes v2 are not canonical")
+            raise ContinuationStateError("continuation lineage indexes are not canonical")
         if self._index_columns(db, "events_dispatch_idx") != (
             "status",
             "updated_at",
             "source_sequence",
         ):
-            raise ContinuationStateError("continuation schema v2 indexes are not canonical")
+            raise ContinuationStateError("continuation schema indexes are not canonical")
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ContinuationStateError("continuation database integrity check failed")
         if db.execute("PRAGMA foreign_key_check").fetchall():
@@ -459,14 +470,15 @@ class ContinuationStore:
             ("predecessor_binding_id", "bindings", "binding_id"),
             ("successor_binding_id", "bindings", "binding_id"),
         }:
-            raise ContinuationStateError("continuation schema v2 foreign keys are not canonical")
-        version = db.execute(
+            raise ContinuationStateError("continuation schema foreign keys are not canonical")
+        stored_version = db.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()
-        if version is None or version["value"] != str(SCHEMA_VERSION):
-            raise ContinuationStateError("continuation schema v2 version is not canonical")
+        if stored_version is None or stored_version["value"] != str(version):
+            raise ContinuationStateError("continuation schema version is not canonical")
 
-    def _migrate_v1_to_v2(self, db: sqlite3.Connection) -> None:
+
+    def _migrate_v1_to_current(self, db: sqlite3.Connection) -> None:
         self._validate_schema_v1(db)
         db.execute("PRAGMA foreign_keys=OFF")
         if db.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
@@ -478,7 +490,7 @@ class ContinuationStore:
             new_columns = ",".join(BINDING_COLUMNS)
             db.execute(
                 f"INSERT INTO bindings_v2({new_columns}) "
-                f"SELECT {old_columns},? FROM bindings",
+                f"SELECT {old_columns},?,cursor_sequence>0 FROM bindings",
                 (SCHEMA_VERSION,),
             )
             db.execute("DROP TABLE bindings")
@@ -513,7 +525,36 @@ class ContinuationStore:
             raise
         finally:
             db.execute("PRAGMA foreign_keys=ON")
-        self._validate_schema_v2(db)
+        self._validate_schema(db)
+
+    def _migrate_v2_to_current(self, db: sqlite3.Connection) -> None:
+        # Only the canonical public v2 schema is supported. Experimental local
+        # variants sharing its version number must fail closed without mutation.
+        self._validate_schema(db, version=2)
+        db.execute("PRAGMA foreign_keys=OFF")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+            raise ContinuationStateError("continuation migration could not suspend foreign keys")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            self._create_bindings_table(db, "bindings_v3")
+            db.execute(
+                f"INSERT INTO bindings_v3({','.join(BINDING_COLUMNS)}) "
+                f"SELECT {','.join(V1_BINDING_COLUMNS)},?,cursor_sequence>0 FROM bindings",
+                (SCHEMA_VERSION,),
+            )
+            db.execute("DROP TABLE bindings")
+            db.execute("ALTER TABLE bindings_v3 RENAME TO bindings")
+            db.execute("CREATE UNIQUE INDEX bindings_live_thread_idx ON bindings(t3_thread_id) "
+                       "WHERE state IN ('active','paused')")
+            db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+            self._validate_schema(db)
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
 
     @contextmanager
     def _connect(self, *, nonblocking: bool = False) -> Iterator[sqlite3.Connection]:
@@ -667,20 +708,23 @@ class ContinuationStore:
 
     @staticmethod
     def _insert_binding(
-        db: sqlite3.Connection, values: Mapping[str, Any], now: str
+        db: sqlite3.Connection, values: Mapping[str, Any], now: str,
+        baseline: tuple[int, str] | None = None,
     ) -> None:
         db.execute(
             """INSERT INTO bindings(
                 binding_id,profile_name,t3_thread_id,t3_owner_id,t3_environment_id,
                 hermes_session_key,hermes_session_id,platform,user_id,chat_id,topic_id,
                 sunsama_task_id,source_identity,followup_scope,max_continuations,state,
-                cursor_sequence,created_at,updated_at,binding_schema_version
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',0,?,?,?)""",
+                cursor_sequence,created_at,updated_at,binding_schema_version,baseline_captured
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?)""",
             tuple(values[field] for field in AUTHORITY_FIELDS)
-            + (now, now, SCHEMA_VERSION),
+            + (baseline[0] if baseline is not None else 0,
+               baseline[1] if baseline is not None else now, now, SCHEMA_VERSION, baseline is not None),
         )
 
-    def bind(self, **values: Any) -> Binding:
+    def bind(self, *, baseline: tuple[int, str] | None = None, **values: Any) -> Binding:
+        self._validate_baseline(baseline)
         normalized = self._normalize_binding_values(values)
         binding_id = normalized["binding_id"]
         now = utc_now()
@@ -715,7 +759,7 @@ class ContinuationStore:
                         raise ContinuationStateError(
                             "thread has binding history; use explicit renewal"
                         )
-                    self._insert_binding(db, normalized, now)
+                    self._insert_binding(db, normalized, now, baseline)
                 db.execute("COMMIT")
             except BaseException:
                 if db.in_transaction:
@@ -723,7 +767,11 @@ class ContinuationStore:
                 raise
         return self.get_binding(binding_id)
 
-    def renew(self, replaces_binding_id: str, **values: Any) -> Binding:
+    def renew(self, replaces_binding_id: str, *, baseline: tuple[int, str] | None = None,
+              **values: Any) -> Binding:
+        self._validate_baseline(baseline)
+        if any(field not in values for field in AUTHORITY_FIELDS):
+            raise ValueError("renewal requires every authority field explicitly")
         predecessor_id = _clean(replaces_binding_id, "replaces_binding_id")
         normalized = self._normalize_binding_values(values)
         successor_id = normalized["binding_id"]
@@ -756,7 +804,7 @@ class ContinuationStore:
                         )
                     ):
                         db.execute("ROLLBACK")
-                        return Binding(**dict(successor))
+                        return self._effective_binding(db, successor)
                     raise ContinuationStateError(
                         "predecessor binding already has a successor"
                     )
@@ -769,12 +817,12 @@ class ContinuationStore:
                     raise ContinuationStateError(
                         "renewal source and Hermes destination must match predecessor"
                     )
-                if predecessor["state"] not in {"active", "stopped"}:
+                if predecessor["state"] != "stopped":
                     raise ContinuationStateError(
-                        "predecessor must be active or stopped for renewal"
+                        "predecessor must be explicitly stopped for renewal"
                     )
                 events = db.execute(
-                    "SELECT status,receipt_json FROM events WHERE binding_id=?",
+                    "SELECT * FROM events WHERE binding_id=?",
                     (predecessor_id,),
                 ).fetchall()
                 if len(events) != predecessor["max_continuations"]:
@@ -792,6 +840,7 @@ class ContinuationStore:
                         event["status"] != "acknowledged"
                         or not isinstance(receipt, dict)
                         or receipt.get("status") != "completed"
+                        or not self._event_authority_matches(predecessor, event)
                     ):
                         raise ContinuationStateError(
                             "predecessor events must be acknowledged and completed"
@@ -800,7 +849,7 @@ class ContinuationStore:
                     "UPDATE bindings SET state='stopped',updated_at=? WHERE binding_id=?",
                     (now, predecessor_id),
                 )
-                self._insert_binding(db, normalized, now)
+                self._insert_binding(db, normalized, now, baseline)
                 db.execute(
                     """INSERT INTO binding_lineage(
                         predecessor_binding_id,successor_binding_id,renewed_at
@@ -820,15 +869,67 @@ class ContinuationStore:
                 raise
         return self.get_binding(successor_id)
 
+    @staticmethod
+    def _effective_binding(db: sqlite3.Connection, row: sqlite3.Row) -> Binding:
+        value = dict(row)
+        value["baseline_captured"] = bool(value["baseline_captured"])
+        used, pending = db.execute(
+            "SELECT COUNT(*),COALESCE(SUM(status IN ('queued','dispatching') OR "
+            "(status='acknowledged' AND receipt_json IS NULL AND last_error_code IS NULL)),0) "
+            "FROM events WHERE binding_id=?",
+            (row["binding_id"],),
+        ).fetchone()
+        if value["state"] == "active" and used >= value["max_continuations"] and not pending:
+            value["state"] = "exhausted"
+        return Binding(**value)
+
+
+    @staticmethod
+    def _validate_baseline(baseline: tuple[int, str] | None) -> None:
+        if baseline is None:
+            return
+        sequence, captured_at = baseline
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or not 0 <= sequence <= 2**63 - 1:
+            raise ValueError("registration baseline sequence is invalid")
+        try:
+            timestamp = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            if timestamp.utcoffset() is None or timestamp > datetime.now(timezone.utc):
+                raise ValueError("registration timestamp is invalid")
+        except (TypeError, AttributeError) as exc:
+            raise ValueError("registration timestamp is invalid") from exc
+
+
+    def capture_baseline(self, binding: Binding, sequence: int) -> None:
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or not 0 <= sequence <= 2**63 - 1:
+            raise ValueError("baseline sequence is invalid")
+        with self._lock, self._connect() as db:
+            db.execute(
+                "UPDATE bindings SET cursor_sequence=?,baseline_captured=1,updated_at=? "
+                "WHERE binding_id=? AND state='active' AND baseline_captured=0 AND cursor_sequence<=?",
+                (sequence, utc_now(), binding.binding_id, sequence),
+            )
+
+
+    def next_queued_busy_attempts(self, binding_id: str) -> int | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT busy_attempts FROM events WHERE binding_id=? AND status='queued' "
+                "ORDER BY source_sequence LIMIT 1",
+                (_clean(binding_id, "binding_id"),),
+            ).fetchone()
+        return row["busy_attempts"] if row is not None else None
+
+
     def get_binding(self, binding_id: str) -> Binding:
         binding_id = _clean(binding_id, "binding_id")
         with self._connect() as db:
             row = db.execute(
                 "SELECT * FROM bindings WHERE binding_id=?", (binding_id,)
             ).fetchone()
-        if row is None:
-            raise ContinuationStateError("binding was not found")
-        return Binding(**dict(row))
+            if row is None:
+                raise ContinuationStateError("binding was not found")
+            return self._effective_binding(db, row)
+
 
     def active_bindings(self, profile_name: str) -> list[Binding]:
         profile_name = _clean(profile_name, "profile_name")
@@ -837,7 +938,9 @@ class ContinuationStore:
                 "SELECT * FROM bindings WHERE profile_name=? AND state='active' ORDER BY binding_id",
                 (profile_name,),
             ).fetchall()
-        return [Binding(**dict(row)) for row in rows]
+            bindings = [self._effective_binding(db, row) for row in rows]
+        return [binding for binding in bindings if binding.state == "active"]
+
 
     def set_binding_state(self, binding_id: str, state: str) -> Binding:
         if state not in {"active", "paused", "stopped", "cancelled"}:
@@ -847,6 +950,9 @@ class ContinuationStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
+                current = db.execute("SELECT state FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
+                if current is not None and current["state"] == "cancelled" and state != "cancelled":
+                    raise ContinuationStateError("cancelled binding cannot be resumed or renewed")
                 if state in {"active", "paused"}:
                     superseded = db.execute(
                         "SELECT 1 FROM binding_lineage WHERE predecessor_binding_id=?",
@@ -896,8 +1002,10 @@ class ContinuationStore:
                     "SELECT status,COUNT(*) AS count FROM events WHERE binding_id=? GROUP BY status",
                     (row["binding_id"],),
                 ).fetchall()
-                item = asdict(Binding(**dict(row)))
+                item = asdict(self._effective_binding(db, row))
                 item["events"] = {count["status"]: count["count"] for count in counts}
+                item["remaining_continuations"] = max(0, row["max_continuations"] - sum(item["events"].values()))
+                item["armed"] = item["state"] == "active" and item["remaining_continuations"] > 0 and item["baseline_captured"]
                 predecessor = db.execute(
                     "SELECT predecessor_binding_id FROM binding_lineage "
                     "WHERE successor_binding_id=?",
@@ -1030,18 +1138,22 @@ class ContinuationStore:
                     db.execute("ROLLBACK")
                     return None
                 db.execute(
-                    "UPDATE events SET status='dispatching',attempts=attempts+1,updated_at=? "
+                    "UPDATE events SET status='dispatching',attempts=attempts+1,"
+                    "receipt_json=NULL,last_error_code=NULL,updated_at=? "
                     "WHERE binding_id=? AND source_sequence=? AND status='queued'",
                     (now, binding_id, row["source_sequence"]),
                 )
                 db.execute("COMMIT")
                 value = dict(row)
                 value["attempts"] += 1
+                value["receipt_json"] = None
+                value["last_error_code"] = None
                 return value
             except BaseException:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 raise
+
 
     def finish(
         self,
@@ -1081,15 +1193,15 @@ class ContinuationStore:
                         utc_now(), _clean(binding_id, "binding_id"), source_sequence,
                     ),
                 ).rowcount
-                if not changed and status == "completed":
+                if not changed and status in {"completed", "uncertain", "cancelled", "blocked"}:
                     # An operator can acknowledge while the host-owned Future is
                     # still running. Preserve that stronger terminal outcome while
-                    # retaining the eventual host receipt for audit.
+                    # retaining the eventual host success or error receipt for audit.
                     db.execute(
                         """UPDATE events SET receipt_json=COALESCE(?,receipt_json),
-                        last_error_code=NULL,updated_at=?
+                        last_error_code=?,updated_at=?
                         WHERE binding_id=? AND source_sequence=? AND status='acknowledged'""",
-                        (receipt_json, utc_now(), binding_id, source_sequence),
+                        (receipt_json, error_code, utc_now(), binding_id, source_sequence),
                     )
                 db.execute("COMMIT")
             except BaseException:
@@ -1097,15 +1209,30 @@ class ContinuationStore:
                 raise
         return bool(changed)
 
+
     def recover_dispatching(self) -> int:
         """Fail closed after a crash because delivery may already have occurred."""
-        with self._connect() as db:
-            result = db.execute(
-                "UPDATE events SET status='uncertain',last_error_code='process_restart',updated_at=? "
-                "WHERE status='dispatching'",
-                (utc_now(),),
-            )
-        return result.rowcount
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                result = db.execute(
+                    "UPDATE events SET status='uncertain',last_error_code='process_restart',updated_at=? "
+                    "WHERE status='dispatching'",
+                    (utc_now(),),
+                ).rowcount
+                # An in-run acknowledgement can precede the final host receipt.
+                # Preserve its audit status while retiring the lost receipt waiter.
+                result += db.execute(
+                    "UPDATE events SET last_error_code='process_restart',updated_at=? "
+                    "WHERE status='acknowledged' AND receipt_json IS NULL AND last_error_code IS NULL",
+                    (utc_now(),),
+                ).rowcount
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
 
     def acknowledge(self, binding_id: str, source_event_id: str) -> None:
         with self._lock, self._connect() as db:
