@@ -54,6 +54,8 @@ INSTALLER_NAME = "install-t3.sh"
 INSTALLER_CHECKSUM_NAME = f"{INSTALLER_NAME}.sha256"
 INSTALLER_SOURCE = ROOT / "scripts" / "install-signed.sh"
 SIGNED_MANIFEST = ROOT / "release" / "v1.3.1.sha256"
+# Commit authenticated by the immutable, signed v1.3.1 tag.
+SIGNED_RELEASE_COMMIT = "b728c2b3438ab31a4c112425fca6bd86d1288646"
 UPSTREAM_PATCH_LICENSE = """MIT License
 
 Copyright (c) 2025 Nous Research
@@ -130,7 +132,38 @@ def _load_smoke_module():
     return module
 
 
+def _requires_signed_manifest(head: str, clean: bool, ref: str) -> bool:
+    exact_source = head == SIGNED_RELEASE_COMMIT and clean
+    if ref == "refs/tags/v1.3.1" and not exact_source:
+        raise AssertionError("v1.3.1 tag build does not match its authenticated source")
+    return exact_source
+
+
+def _is_signed_release_source() -> bool:
+    # Read-only Git inspection; ambient config cannot replace the repository or
+    # launch an external diff driver. Generated untracked outputs are excluded.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=ROOT,
+                          env=env, check=True, capture_output=True, text=True, timeout=10)
+    difference = subprocess.run(["git", "diff", "--quiet", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
+                                cwd=ROOT, env=env, check=False, capture_output=True, timeout=10)
+    if difference.returncode not in (0, 1):
+        raise AssertionError("Could not establish release source identity")
+    return _requires_signed_manifest(head.stdout.strip(), difference.returncode == 0,
+                                     os.environ.get("GITHUB_REF", ""))
+
+
 class ReleaseMetadataTests(unittest.TestCase):
+    def test_signed_manifest_gate_distinguishes_candidates_from_authenticated_release(self):
+        self.assertTrue(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, True, "refs/heads/main"))
+        self.assertTrue(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, True, "refs/tags/v1.3.1"))
+        self.assertFalse(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, False, "refs/heads/fix"))
+        self.assertFalse(_requires_signed_manifest("a" * 40, True, "refs/pull/1/merge"))
+        for head, clean in (("a" * 40, True), (SIGNED_RELEASE_COMMIT, False)):
+            with self.subTest(head=head, clean=clean), self.assertRaisesRegex(AssertionError, "authenticated source"):
+                _requires_signed_manifest(head, clean, "refs/tags/v1.3.1")
+
     def test_version_license_homepage_and_changelog_agree(self) -> None:
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -425,12 +458,13 @@ class DeterministicArtifactTests(unittest.TestCase):
             self.assertEqual(
                 installer_verified.returncode, 0, installer_verified.stderr
             )
-            self.assertEqual(
-                SIGNED_MANIFEST.read_bytes(),
-                first_checksum.read_bytes()
-                + first_patch_checksum.read_bytes()
-                + first_installer_checksum.read_bytes(),
-            )
+            if _is_signed_release_source():
+                self.assertEqual(
+                    SIGNED_MANIFEST.read_bytes(),
+                    first_checksum.read_bytes()
+                    + first_patch_checksum.read_bytes()
+                    + first_installer_checksum.read_bytes(),
+                )
             self.assertEqual(first_archive.read_bytes()[4:8], b"\x00\x00\x00\x00")
             digest = hashlib.sha256(first_archive.read_bytes()).hexdigest()
             self.assertEqual(

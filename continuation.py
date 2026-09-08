@@ -489,6 +489,39 @@ async def dispatch_one(
     return True
 
 
+async def _wait_for_retry(store: ContinuationStore, binding_id: str,
+                          stop_event: asyncio.Event, delay: float) -> bool:
+    remaining = delay
+    while remaining > 0:
+        if stop_event.is_set() or store.get_binding(binding_id).state != "active":
+            return False
+        interval = min(1.0, remaining)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return False
+        except asyncio.TimeoutError:
+            remaining -= interval
+    return not stop_event.is_set() and store.get_binding(binding_id).state == "active"
+
+
+async def _drain_pending(ctx: Any, store: ContinuationStore, binding_id: str,
+                         stop_event: asyncio.Event, receipt_timeout: float) -> bool:
+    """Drain durable work in the subscription owner, including after restart."""
+    while not stop_event.is_set():
+        binding = store.get_binding(binding_id)
+        if binding.state != "active":
+            return False
+        busy_attempts = store.next_queued_busy_attempts(binding_id)
+        if busy_attempts is None:
+            return True
+        if busy_attempts:
+            delay = min(30.0, float(2 ** min(busy_attempts - 1, 5)))
+            if not await _wait_for_retry(store, binding_id, stop_event, delay):
+                return False
+        await dispatch_one(ctx, store, binding, receipt_timeout=receipt_timeout)
+    return False
+
+
 async def _binding_worker(ctx: Any, store: ContinuationStore, binding_id: str,
                           stop_event: asyncio.Event, reconnect_limit: int,
                           receipt_timeout: float) -> None:
@@ -497,17 +530,10 @@ async def _binding_worker(ctx: Any, store: ContinuationStore, binding_id: str,
         binding = store.get_binding(binding_id)
         if binding.state != "active":
             return
-        while await dispatch_one(
-            ctx,
-            store,
-            binding,
-            receipt_timeout=receipt_timeout,
-        ):
-            binding = store.get_binding(binding_id)
-            if binding.state != "active" or stop_event.is_set():
-                return
-            await asyncio.sleep(1.0)
-        baselining = binding.cursor_sequence == 0
+        if not await _drain_pending(ctx, store, binding_id, stop_event, receipt_timeout):
+            return
+        binding = store.get_binding(binding_id)
+        baselining = not binding.baseline_captured
         try:
             async for item in subscribe_thread(
                 ctx,
@@ -540,7 +566,7 @@ async def _binding_worker(ctx: Any, store: ContinuationStore, binding_id: str,
                     sequence = snapshot.get("snapshotSequence")
                     if isinstance(sequence, bool) or not isinstance(sequence, int):
                         raise ContinuationStateError("T3 stream cursor is invalid")
-                    store.ingest(current, cursor_sequence=sequence, event=None)
+                    store.capture_baseline(current, sequence)
                     baselining = False
                     continue
                 if kind == "event":
@@ -562,12 +588,10 @@ async def _binding_worker(ctx: Any, store: ContinuationStore, binding_id: str,
                 if isinstance(sequence, bool) or not isinstance(sequence, int):
                     raise ContinuationStateError("T3 stream cursor is invalid")
                 store.ingest(current, cursor_sequence=sequence, event=normalized)
-                await dispatch_one(
-                    ctx,
-                    store,
-                    current,
-                    receipt_timeout=receipt_timeout,
-                )
+                if not await _drain_pending(
+                    ctx, store, binding_id, stop_event, receipt_timeout
+                ):
+                    return
             return
         except asyncio.CancelledError:
             raise

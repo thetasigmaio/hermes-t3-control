@@ -17,7 +17,6 @@ from tests.support import LoopbackServer, Response, shell_snapshot
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-IDENTIFIER = "thetasigmaio/hermes-t3-control"
 EXPECTED_TOOLS = (
     "t3_threads",
     "t3_thread_read",
@@ -199,15 +198,13 @@ def _hermetic_environment(
     _private_directory(hermes_home)
     return {
         "GIT_ASKPASS": "/bin/false",
-        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_COUNT": "2",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_KEY_0": "protocol.file.allow",
         "GIT_CONFIG_KEY_1": "core.hooksPath",
-        "GIT_CONFIG_KEY_2": f"url.{repository.as_uri()}.insteadOf",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_VALUE_0": "always",
         "GIT_CONFIG_VALUE_1": str(hooks),
-        "GIT_CONFIG_VALUE_2": f"https://github.com/{IDENTIFIER}.git",
         "GIT_TERMINAL_PROMPT": "0",
         "HOME": str(sandbox_home),
         "HERMES_HOME": str(hermes_home),
@@ -317,7 +314,7 @@ def _assert_scanner_enforcement(
             str(hermes),
             "plugins",
             "install",
-            IDENTIFIER,
+            repository.as_uri(),
             "--ref",
             dangerous_revision.stdout.strip(),
             "--no-enable",
@@ -368,11 +365,9 @@ class SupportedInstallHarnessContractTests(unittest.TestCase):
                     "GIT_CONFIG_GLOBAL",
                     "GIT_CONFIG_KEY_0",
                     "GIT_CONFIG_KEY_1",
-                    "GIT_CONFIG_KEY_2",
                     "GIT_CONFIG_NOSYSTEM",
                     "GIT_CONFIG_VALUE_0",
                     "GIT_CONFIG_VALUE_1",
-                    "GIT_CONFIG_VALUE_2",
                     "GIT_TERMINAL_PROMPT",
                     "HOME",
                     "HERMES_HOME",
@@ -396,10 +391,8 @@ class SupportedInstallHarnessContractTests(unittest.TestCase):
             self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
             self.assertEqual(environment["GIT_CONFIG_KEY_0"], "protocol.file.allow")
             self.assertEqual(environment["GIT_CONFIG_KEY_1"], "core.hooksPath")
-            self.assertEqual(
-                environment["GIT_CONFIG_KEY_2"],
-                f"url.{repository.as_uri()}.insteadOf",
-            )
+            self.assertEqual(environment["GIT_CONFIG_COUNT"], "2")
+            self.assertFalse(any("insteadOf" in value for value in environment.values()))
             for key in (
                 "HOME",
                 "HERMES_HOME",
@@ -495,11 +488,14 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 cwd=isolated,
                 env=env,
             )
+            # This exercises the supported local Git source at an exact revision,
+            # without relying on URL rewrites stripped by hardened host Git.
+            # It does not claim GitHub transport coverage.
             install_command = [
                 str(hermes),
                 "plugins",
                 "install",
-                IDENTIFIER,
+                repository.as_uri(),
                 "--ref",
                 revision,
                 "--no-enable",

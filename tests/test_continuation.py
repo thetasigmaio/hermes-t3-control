@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import tempfile
 import unittest
@@ -352,6 +353,261 @@ class ContinuationTests(unittest.TestCase):
         self.assertFalse(ctx.future.cancelled())
         status = self.store.status(self.binding.binding_id)["bindings"][0]
         self.assertEqual(status["events"], {"uncertain": 1})
+
+    def test_retry_backoff_uses_persisted_attempts_and_caps_at_thirty_seconds(self):
+        store = continuation_state.ContinuationStore(self.store.data_dir / "backoff-cap")
+        store.initialize()
+        binding = store.bind(**binding_values())
+        store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+        ctx = FakeContext(store, {"status": "busy"})
+        delays = []
+
+        async def wait(_store, _binding_id, _stop_event, delay):
+            delays.append(delay)
+            return True
+
+        async def old_sleep(delay):
+            delays.append(delay)
+
+        with (mock.patch.object(continuation, "_wait_for_retry", wait, create=True),
+              mock.patch.object(continuation.asyncio, "sleep", old_sleep),
+              mock.patch.object(continuation, "MAX_BUSY_RETRIES", 8)):
+            asyncio.run(continuation._binding_worker(ctx, store, binding.binding_id,
+                                                     asyncio.Event(), 1, 0.1))
+        self.assertEqual(delays, [1, 2, 4, 8, 16, 30, 30])
+        self.assertEqual(len(ctx.calls), 8)
+        with store._connect() as db:
+            row = db.execute("SELECT * FROM events").fetchone()
+        self.assertEqual(row["busy_attempts"], 8)
+        self.assertEqual(row["last_error_code"], "busy_retry_exhausted")
+
+    def test_restart_waits_for_the_persisted_retry_delay_before_new_admission(self):
+        store = continuation_state.ContinuationStore(self.store.data_dir / "backoff-restart")
+        store.initialize()
+        binding = store.bind(**binding_values())
+        store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+        for _ in range(2):
+            store.claim_next(binding.binding_id)
+            store.finish(binding.binding_id, 1, "queued", receipt={"status": "busy"},
+                         count_busy=True, refund_attempt=True)
+        restarted = continuation_state.ContinuationStore(store.data_dir)
+        restarted.initialize()
+        restarted.recover_dispatching()
+        ctx = FakeContext(restarted, {"status": "completed"})
+        order = []
+        inject = ctx.inject_gateway_system_event
+
+        def admission(content, **kwargs):
+            order.append("admit")
+            return inject(content, **kwargs)
+
+        async def wait(_store, _binding_id, _stop_event, delay):
+            order.append(("wait", delay))
+            return True
+
+        ctx.inject_gateway_system_event = admission
+        with mock.patch.object(continuation, "_wait_for_retry", wait, create=True):
+            asyncio.run(continuation._binding_worker(ctx, restarted, binding.binding_id,
+                                                     asyncio.Event(), 1, 0.1))
+        self.assertEqual(order, [("wait", 2), "admit"])
+        with restarted._connect() as db:
+            self.assertEqual(db.execute("SELECT busy_attempts FROM events").fetchone()[0], 2)
+
+    def test_capped_backoff_remains_interruptible_by_pause_cancel_and_stop(self):
+        for ending in ("paused", "cancelled", "stop"):
+            with self.subTest(ending=ending):
+                store = continuation_state.ContinuationStore(self.store.data_dir / f"interrupt-{ending}")
+                store.initialize()
+                binding = store.bind(**binding_values())
+
+                async def exercise():
+                    stop_event = asyncio.Event()
+                    wait = asyncio.create_task(continuation._wait_for_retry(store, binding.binding_id, stop_event, 30))
+                    await asyncio.sleep(0)
+                    if ending == "stop":
+                        stop_event.set()
+                    else:
+                        store.set_binding_state(binding.binding_id, ending)
+                    self.assertFalse(await asyncio.wait_for(wait, 1.5))
+
+                asyncio.run(exercise())
+
+    async def _exercise_retry_on_silent_stream(self, retry_status, outcome):
+        store = continuation_state.ContinuationStore(self.store.data_dir / f"silent-{retry_status}-{outcome}")
+        store.initialize()
+        binding = store.bind(**binding_values())
+        store.capture_baseline(binding, 0)
+        ctx = FakeContext(store, {"status": retry_status})
+        inject = ctx.inject_gateway_system_event
+        connections = []
+        closed = []
+
+        def admission(content, **kwargs):
+            ctx.result = {"status": "completed" if outcome == "completed" and ctx.calls else retry_status}
+            return inject(content, **kwargs)
+
+        ctx.inject_gateway_system_event = admission
+
+        async def quiet_subscription(*_args, **kwargs):
+            connections.append(kwargs)
+            try:
+                yield {"kind": "snapshot", "snapshot": self.completed_snapshot()}
+                await asyncio.Event().wait()  # Healthy subscription, no more source events.
+            finally:
+                closed.append(True)
+
+        async def wait_for(predicate):
+            async def observe():
+                while not predicate():
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(observe(), 4.0)
+
+        with (mock.patch.object(continuation, "subscribe_thread", quiet_subscription),
+              mock.patch.object(continuation, "MAX_BUSY_RETRIES", 3)):
+            task = asyncio.create_task(continuation._binding_worker(
+                ctx, store, binding.binding_id, asyncio.Event(), 1, 0.1
+            ))
+            try:
+                await wait_for(lambda: store.status(binding.binding_id)["bindings"][0]["events"] == {"queued": 1})
+                if outcome in {"paused", "cancelled"}:
+                    store.set_binding_state(binding.binding_id, outcome)
+                    await asyncio.wait_for(asyncio.shield(task), 1.5)
+                    self.assertEqual(len(ctx.calls), 1)
+                    self.assertEqual(store.status(binding.binding_id)["bindings"][0]["events"], {"cancelled": 1})
+                else:
+                    expected_calls = 2 if outcome == "completed" else 3
+                    await wait_for(lambda: len(ctx.calls) == expected_calls)
+                    await asyncio.wait_for(asyncio.shield(task), 1.0)
+                    expected_status = "completed" if outcome == "completed" else "blocked"
+                    self.assertEqual(store.status(binding.binding_id)["bindings"][0]["events"], {expected_status: 1})
+                    with store._connect() as db:
+                        row = db.execute("SELECT * FROM events").fetchone()
+                    self.assertEqual(row["busy_attempts"], 1 if outcome == "completed" else 3)
+                    if outcome != "completed":
+                        self.assertEqual(row["last_error_code"], "busy_retry_exhausted")
+                self.assertEqual(len(connections), 1)
+                self.assertEqual(connections[0]["after_sequence"], 0)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    def test_silent_subscription_retries_busy_and_stopping_without_another_source_event(self):
+        for retry_status in ("busy", "stopping"):
+            with self.subTest(retry_status=retry_status):
+                asyncio.run(self._exercise_retry_on_silent_stream(retry_status, "completed"))
+
+    def test_silent_subscription_retry_budget_stops_without_reconnecting(self):
+        for retry_status in ("busy", "stopping"):
+            with self.subTest(retry_status=retry_status):
+                asyncio.run(self._exercise_retry_on_silent_stream(retry_status, "bounded"))
+
+    def test_silent_subscription_pause_and_cancel_during_retry_backoff_prevent_readmission(self):
+        for outcome in ("paused", "cancelled"):
+            with self.subTest(outcome=outcome):
+                asyncio.run(self._exercise_retry_on_silent_stream("busy", outcome))
+
+    def test_retry_attempt_clears_old_receipt_until_its_own_acknowledged_future_finishes(self):
+        for retry_status in ("busy", "stopping"):
+            for terminal_status in ("completed", "agent_error"):
+                with self.subTest(retry=retry_status, terminal=terminal_status):
+                    store = continuation_state.ContinuationStore(
+                        self.store.data_dir / f"{retry_status}-{terminal_status}"
+                    )
+                    store.initialize()
+                    binding = store.bind(**binding_values())
+                    store.ingest(binding, cursor_sequence=1, event=envelope(binding))
+                    with store._connect() as db:
+                        original = dict(db.execute("SELECT * FROM events").fetchone())
+                    for _ in range(2):
+                        busy = FakeContext(store, {"status": retry_status})
+                        self.assertTrue(asyncio.run(continuation.dispatch_one(busy, store, binding)))
+                    pending = PendingContext(store)
+
+                    async def exercise():
+                        dispatch = asyncio.create_task(continuation.dispatch_one(pending, store, binding))
+                        try:
+                            for _ in range(10):
+                                if pending.calls:
+                                    break
+                                await asyncio.sleep(0)
+                            self.assertEqual(len(pending.calls), 1)
+                            with store._connect() as db:
+                                current = dict(db.execute("SELECT * FROM events").fetchone())
+                            self.assertIsNone(current["receipt_json"])
+                            self.assertIsNone(current["last_error_code"])
+                            self.assertEqual(current["busy_attempts"], 2)
+                            for key in ("envelope_json", "envelope_mac", "source_event_id", "source_turn_id"):
+                                self.assertEqual(current[key], original[key])
+                            store.acknowledge(binding.binding_id, "event-1")
+                            self.assertEqual(store.get_binding(binding.binding_id).state, "active")
+                            self.assertEqual(len(store.active_bindings("default")), 1)
+                            pending.future.set_result({"status": terminal_status})
+                            self.assertTrue(await dispatch)
+                            with store._connect() as db:
+                                final = dict(db.execute("SELECT * FROM events").fetchone())
+                            self.assertEqual(final["status"], "acknowledged")
+                            self.assertEqual(json.loads(final["receipt_json"]), {"status": terminal_status})
+                            self.assertEqual(store.active_bindings("default"), [])
+                            self.assertIsNone(store.claim_next(binding.binding_id))
+                        finally:
+                            dispatch.cancel()
+                            await asyncio.gather(dispatch, return_exceptions=True)
+
+                    asyncio.run(exercise())
+
+    def test_supervisor_keeps_acknowledged_host_receipt_alive_until_completion(self):
+        # Fill the allowance with final rows, leaving its last delivery in flight.
+        for sequence in range(1, 4):
+            self.store.ingest(self.binding, cursor_sequence=sequence,
+                              event=envelope(self.binding, sequence=sequence,
+                                             event_id=f"event-{sequence}", turn_id=f"turn-{sequence}"))
+            self.store.claim_next(self.binding.binding_id)
+            self.store.finish(self.binding.binding_id, sequence, "completed", receipt={"status": "completed"})
+        self.store.ingest(self.binding, cursor_sequence=4,
+                          event=envelope(self.binding, sequence=4, event_id="event-4", turn_id="turn-4"))
+        ctx = PendingContext(self.store)
+        ctx.get_config = lambda key, default=None: default
+
+        async def exercise():
+            supervisor = asyncio.create_task(continuation.run_continuation_worker(ctx))
+            try:
+                for _ in range(100):
+                    if ctx.calls:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(len(ctx.calls), 1)
+                self.store.acknowledge(self.binding.binding_id, "event-4")
+                await asyncio.sleep(1.1)  # Exercise the real supervisor's cancellation scan.
+                self.assertEqual(self.store.get_binding(self.binding.binding_id).state, "active")
+                ctx.future.set_result({"status": "completed"})
+                for _ in range(100):
+                    if self.store.get_binding(self.binding.binding_id).state == "exhausted":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(self.store.get_binding(self.binding.binding_id).state, "exhausted")
+                with self.store._connect() as db:
+                    receipt = db.execute("SELECT receipt_json FROM events WHERE source_sequence=4").fetchone()[0]
+                self.assertIsNotNone(receipt)
+            finally:
+                supervisor.cancel()
+                await asyncio.gather(supervisor, return_exceptions=True)
+
+        asyncio.run(exercise())
+
+    def test_spent_binding_worker_does_not_subscribe_or_inject(self):
+        for sequence in range(1, 5):
+            self.store.ingest(self.binding, cursor_sequence=sequence,
+                              event=envelope(self.binding, sequence=sequence,
+                                             event_id=f"event-{sequence}", turn_id=f"turn-{sequence}"))
+            self.store.claim_next(self.binding.binding_id)
+            self.store.finish(self.binding.binding_id, sequence, "completed", receipt={"status": "completed"})
+            self.store.acknowledge(self.binding.binding_id, f"event-{sequence}")
+        ctx = FakeContext(self.store, {"status": "completed"})
+        with mock.patch.object(continuation, "subscribe_thread") as subscribe:
+            asyncio.run(continuation._binding_worker(ctx, self.store, self.binding.binding_id,
+                                                     asyncio.Event(), 1, 0.1))
+        subscribe.assert_not_called()
+        self.assertEqual(ctx.calls, [])
 
     def test_fresh_subscription_snapshot_is_cursor_baseline_only(self):
         snapshot = self.completed_snapshot()

@@ -225,9 +225,13 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("t3-continuation bind", EXPERIMENTAL)
         self.assertIn("t3-continuation renew --replaces OLD_MISSION_ID", EXPERIMENTAL)
         self.assertIn("every bind argument supplied again", EXPERIMENTAL)
-        self.assertIn("starts the new cursor at zero", EXPERIMENTAL)
+        self.assertIn("captures a fresh registration baseline", EXPERIMENTAL)
+        self.assertIn("including when the cursor is zero", EXPERIMENTAL)
+        self.assertIn("registration, not a running observer", EXPERIMENTAL)
+        self.assertIn("t3-continuation stop OLD_MISSION_ID", EXPERIMENTAL)
         self.assertIn("cannot resume", EXPERIMENTAL)
-        self.assertIn("pre-v2 experimental code is unsupported", EXPERIMENTAL)
+        self.assertIn("migrated v3 ledger to older continuation code is unsupported", EXPERIMENTAL)
+        self.assertIn("different table shape are rejected without migration", EXPERIMENTAL)
 
     def test_public_docs_do_not_contain_workstation_aliases_or_private_paths(self) -> None:
         public = "\n".join(

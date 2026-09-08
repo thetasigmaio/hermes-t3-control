@@ -2404,6 +2404,105 @@ class AgentFacingWaitToolTests(unittest.TestCase):
         self.assertNotIn(server.token, json.dumps(result))
         self.assertEqual([item["method"] for item in server.requests], ["GET", "GET"])
 
+    def _run_bounded_wait(self, *, budget_polls: int | None = None) -> tuple[dict, int, float]:
+        shell = shell_snapshot(sequence=12)
+        detail = with_projection_fields(
+            detail_snapshot(
+                sequence=12,
+                turn=latest_turn(turn_id="turn-1", state="running"),
+                current_session=session(status="running", active_turn_id="turn-1"),
+                messages=[message(text="x" * 120_000)],
+            ),
+            thread_sequence=12,
+        )
+        elapsed = [0.0]
+
+        def sleep(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        options = {}
+        if budget_polls is not None:
+            options["cumulative_response_limit"] = (
+                len(json.dumps(shell).encode("utf-8"))
+                + budget_polls * len(json.dumps(detail).encode("utf-8"))
+            )
+        responder = projection_responder(shell, detail)
+        with LoopbackServer([responder] * 400) as server:
+            transport = tools.T3Client(
+                server.base_url, server.token, clock=lambda: elapsed[0], **options
+            )
+            with (
+                mock.patch.object(tools, "_make_client", return_value=transport),
+                mock.patch.object(tools.time, "monotonic", side_effect=lambda: elapsed[0]),
+                mock.patch.object(tools.time, "sleep", side_effect=sleep),
+            ):
+                result = invoke(
+                    server, tools.t3_thread_wait,
+                    {"thread_id": "thread-1", "after_thread_sequence": 12,
+                     "until": "terminal", "timeout_seconds": 30},
+                )
+            request_count = len(server.requests)
+        return result, request_count, elapsed[0]
+
+    def test_wait_elapsed_deadline_returns_last_observation_without_network_error(self) -> None:
+        result, request_count, elapsed = self._run_bounded_wait()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["wait_outcome"], "timeout")
+        self.assertEqual(result["liveness"], "working")
+        self.assertEqual(result["thread_sequence"], 12)
+        self.assertEqual(elapsed, 30.0)
+        self.assertLessEqual(request_count, 31)
+
+    def test_wait_repeated_response_budget_returns_bounded_observation(self) -> None:
+        result, request_count, elapsed = self._run_bounded_wait(budget_polls=3)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["wait_outcome"], "observation_limit")
+        self.assertEqual(result["stop_reason"], "response_budget_exhausted")
+        self.assertEqual(result["liveness"], "working")
+        self.assertEqual(result["thread_sequence"], 12)
+        self.assertLessEqual(request_count, 5)
+        self.assertLessEqual(elapsed, 30.0)
+
+    def test_wait_initial_read_deadline_without_observation_remains_error(self) -> None:
+        with LoopbackServer([Response(value=shell_snapshot()),
+                             Response(value=detail_snapshot(), delay_before_body=1.2)]) as server:
+            result = invoke(server, tools.t3_thread_wait,
+                            {"thread_id": "thread-1", "timeout_seconds": 1})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "network_error")
+        self.assertNotIn("wait_outcome", result)
+
+    def test_wait_inflight_read_deadline_returns_prior_validated_observation(self) -> None:
+        detail = with_projection_fields(
+            detail_snapshot(turn=latest_turn(state="running"),
+                            current_session=session(status="running", active_turn_id="turn-1")),
+            thread_sequence=12,
+        )
+        with LoopbackServer([Response(value=shell_snapshot()), Response(value=detail),
+                             Response(value=detail, delay_before_body=1.2)]) as server:
+            result = invoke(server, tools.t3_thread_wait,
+                            {"thread_id": "thread-1", "timeout_seconds": 2})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["wait_outcome"], "timeout")
+        self.assertEqual(result["stop_reason"], "deadline")
+        self.assertEqual(result["thread_sequence"], 12)
+        self.assertEqual(result["liveness"], "working")
+        self.assertEqual(len(server.requests), 3)
+
+    def test_wait_actual_network_failure_after_observation_remains_an_error(self) -> None:
+        detail = detail_snapshot(turn=latest_turn(state="running"),
+                                 current_session=session(status="running", active_turn_id="turn-1"))
+
+        def disconnected(_request):
+            raise OSError("fixture connection lost")
+
+        with LoopbackServer([Response(value=shell_snapshot()), Response(value=detail), disconnected]) as server:
+            with mock.patch.object(tools.time, "sleep", return_value=None):
+                result = invoke(server, tools.t3_thread_wait,
+                                {"thread_id": "thread-1", "timeout_seconds": 30})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "network_error")
+
     def test_wait_reports_per_thread_progress_and_latest_assistant_delta(self) -> None:
         detail = with_projection_fields(
             detail_snapshot(
