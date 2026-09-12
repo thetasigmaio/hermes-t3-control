@@ -2006,6 +2006,7 @@ def _send_with_model_switch(
     before: dict[str, Any],
     target_selection: dict[str, Any],
     text: str,
+    *, message_id: str | None = None,
 ) -> dict[str, Any]:
     stored = before["thread"]
     previous_selection = copy.deepcopy(stored["modelSelection"])
@@ -2068,7 +2069,7 @@ def _send_with_model_switch(
         raise T3ClientError()
     metadata_thread = metadata_detail["thread"]
     metadata_anchor = _switch_anchor(metadata_thread)
-    message_id = transport.new_uuid4()
+    message_id = message_id or transport.new_uuid4()
     turn_command_id = transport.new_uuid4()
     phase_details = {
         "workflow_phase": "model_switch_turn",
@@ -2253,9 +2254,18 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             "model",
             "model_options",
             "busy_policy",
+            "continuation",
+            "completion_policy",
         },
         required={"thread_id", "message"},
     )
+    completion_policy = args.get("completion_policy")
+    if "completion_policy" in args and (not isinstance(completion_policy, str) or completion_policy not in {"required", "none"}):
+        _invalid("completion_policy must be required or none")
+    if ctx.get_config("continuation_enabled", False) is True and completion_policy is None:
+        raise ConflictError("enabled continuation requires explicit completion_policy required or none before dispatch")
+    if (completion_policy == "required") != ("continuation" in args):
+        _invalid("completion_policy required needs complete continuation authority; none forbids it")
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     text = normalize_message(args["message"])
     has_instance = "instance_id" in args
@@ -2281,6 +2291,10 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
     )
     busy_policy = _enum(args.get("busy_policy", "reject"), "busy_policy", BUSY_POLICIES)
     normalized = {"thread_id": thread_id, "message": text, "busy_policy": busy_policy}
+    if completion_policy is not None:
+        normalized["completion_policy"] = completion_policy
+    if "continuation" in args:
+        normalized["continuation"] = args["continuation"]
     if explicit_selection is not None:
         normalized.update(
             {
@@ -2311,6 +2325,23 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 "reject never dispatches. Select busy_policy queue explicitly to accept "
                 "start-or-queue semantics."
             )
+        continuation = {"armed": False, "consumer_ready": False} if completion_policy == "none" else None
+        if completion_policy == "none":
+            try:
+                from .continuation_state import ContinuationStore
+            except ImportError:
+                from continuation_state import ContinuationStore
+            store = ContinuationStore(ctx.state.data_dir)
+            store.initialize()
+            if any(binding.t3_thread_id == thread_id for binding in store.active_bindings(str(getattr(ctx, "profile_name", "default")))):
+                raise ConflictError("explicit no-continuation conflicts with an active binding")
+        reserved_message_id = transport.new_uuid4() if "continuation" in args else None
+        if "continuation" in args:
+            try:
+                from .continuation_handoff import prepare_handoff
+            except ImportError:
+                from continuation_handoff import prepare_handoff
+            continuation = prepare_handoff(ctx, args["continuation"], thread_id, before, transport, reserved_message_id)
         warning = FULL_ACCESS_WARNING if stored["runtimeMode"] == "full-access" else None
         target_selection: dict[str, Any] | None = None
         if explicit_selection is not None:
@@ -2333,7 +2364,7 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
         ):
             try:
                 payload = _send_with_model_switch(
-                    transport, before, target_selection, text
+                    transport, before, target_selection, text, message_id=reserved_message_id
                 )
             except T3ClientError as exc:
                 if warning is not None:
@@ -2341,9 +2372,11 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
                 raise
             if warning is not None:
                 payload["warning"] = warning
+            if continuation is not None:
+                payload["continuation"] = continuation
             return payload
         try:
-            command, message_id = _build_turn_command(transport, stored, text)
+            command, message_id = _build_turn_command(transport, stored, text, message_id=reserved_message_id)
 
             def message_observed(detail: dict[str, Any]) -> bool:
                 thread = detail["thread"]
@@ -2381,6 +2414,8 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             }
             if warning is not None:
                 payload["warning"] = warning
+            if continuation is not None:
+                payload["continuation"] = continuation
             return payload
         detail = result["detail"]
         if not isinstance(detail, dict):
@@ -2418,6 +2453,8 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
         }
         if warning is not None:
             payload["warning"] = warning
+        if continuation is not None:
+            payload["continuation"] = continuation
         return payload
 
     try:

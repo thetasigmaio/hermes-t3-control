@@ -150,6 +150,17 @@ T3_THREAD_SEND_SCHEMA = _schema(
                 "the same stored instance/model pair."
             ),
         },
+        "completion_policy": {"type": "string", "enum": ["required", "none"],
+            "description": "When continuation is enabled, explicitly require a scoped handoff or select none for an unwatched send."},
+        "continuation": {
+            "type": "object", "additionalProperties": False,
+            "description": "Required scoped Desktop handoff: register or explicitly renew before source dispatch; omission is a plain send without a continuation promise.",
+            "properties": {"notify_telegram": {"type": "boolean", "description": "Explicitly notify the configured Telegram home after this Desktop PM verification; separate durable receipt."}, **{name: dict(_ID) for name in ("binding_id", "owner_id", "environment_id", "sunsama_task_id", "source_identity", "followup_scope", "replaces")},
+                           "expected_turn_id": {"type": ["string", "null"]},
+                           "max_continuations": {"type": "integer", "minimum": 1, "maximum": 16},
+                           "desktop_upgrade": {"type": "boolean"}},
+            "required": ["binding_id", "owner_id", "environment_id", "source_identity", "followup_scope", "max_continuations", "expected_turn_id"],
+        },
         "busy_policy": {
             "type": "string",
             "enum": ["reject", "queue"],

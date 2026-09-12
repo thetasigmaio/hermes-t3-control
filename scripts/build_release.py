@@ -19,7 +19,7 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_ROOT = "hermes-t3-control"
-OPTIONAL_PATCH_SOURCE = "patches/hermes-gateway-continuation-63279301.patch"
+OPTIONAL_PATCH_SOURCE = "patches/hermes-gateway-continuation-ad03f20d.patch"
 OPTIONAL_PATCH_ROOT = "hermes-gateway-continuation"
 INSTALLER_SOURCE = "scripts/install-signed.sh"
 INSTALLER_NAME = "install-t3.sh"
@@ -33,6 +33,8 @@ RELEASE_FILES = (
     "client.py",
     "continuation.py",
     "continuation_cli.py",
+    "continuation_handoff.py",
+    "continuation_notifications.py",
     "continuation_state.py",
     "continuation_transport.py",
     "docs/community-index-entry.json",

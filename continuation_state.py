@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_IDENTIFIER_CHARS = 512
 MAX_SESSION_KEY_CHARS = 512
 MAX_SESSION_ID_CHARS = 256
@@ -178,6 +178,7 @@ class ContinuationStore:
         try:
             with self._connect() as db:
                 self._initialize_connection(db)
+
         except ContinuationStateError:
             raise
         except sqlite3.Error as exc:
@@ -214,6 +215,8 @@ class ContinuationStore:
                 self._migrate_v1_to_current(db)
             elif version == 2:
                 self._migrate_v2_to_current(db)
+            elif version == 3:
+                self._migrate_v3_to_current(db)
             elif version == SCHEMA_VERSION:
                 self._validate_schema(db)
             elif version > SCHEMA_VERSION:
@@ -248,7 +251,7 @@ class ContinuationStore:
                 cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK(cursor_sequence >= 0),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                binding_schema_version INTEGER NOT NULL CHECK(binding_schema_version = 3),
+                binding_schema_version INTEGER NOT NULL CHECK(binding_schema_version = 4),
                 baseline_captured INTEGER NOT NULL DEFAULT 0 CHECK(baseline_captured IN (0,1))
             )"""
         )
@@ -309,6 +312,8 @@ class ContinuationStore:
             )
             if db.execute("PRAGMA foreign_key_check").fetchall():
                 raise ContinuationStateError("continuation schema foreign keys are invalid")
+            self._create_extensions(db)
+            self._validate_schema(db)
             db.execute("COMMIT")
         except BaseException:
             if db.in_transaction:
@@ -381,8 +386,13 @@ class ContinuationStore:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        if tables != {"meta", "bindings", "events", "binding_lineage"}:
+        expected_tables = {"meta", "bindings", "events", "binding_lineage"}
+        if version == 4:
+            expected_tables |= {"source_reservations", "notification_targets", "notifications"}
+        if tables != expected_tables:
             raise ContinuationStateError("continuation schema is not canonical")
+        if version == 4:
+            self._validate_extensions(db)
         if self._table_columns(db, "bindings") != (V2_BINDING_COLUMNS if version == 2 else BINDING_COLUMNS):
             raise ContinuationStateError("continuation bindings schema is not canonical")
         discriminator = next(
@@ -412,7 +422,7 @@ class ContinuationStore:
             raise ContinuationStateError(
                 "continuation binding discriminator is not canonical"
             )
-        if version == 3:
+        if version >= 3:
             baseline = next(row for row in db.execute("PRAGMA table_info(bindings)")
                             if row["name"] == "baseline_captured")
             if (baseline["type"].upper() != "INTEGER" or not baseline["notnull"]
@@ -518,6 +528,8 @@ class ContinuationStore:
                 raise ContinuationStateError(
                     "continuation migration produced invalid foreign keys"
                 )
+            self._create_extensions(db)
+            self._validate_schema(db)
             db.execute("COMMIT")
         except BaseException:
             if db.in_transaction:
@@ -547,6 +559,7 @@ class ContinuationStore:
             db.execute("CREATE UNIQUE INDEX bindings_live_thread_idx ON bindings(t3_thread_id) "
                        "WHERE state IN ('active','paused')")
             db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+            self._create_extensions(db)
             self._validate_schema(db)
             db.execute("COMMIT")
         except BaseException:
@@ -623,6 +636,10 @@ class ContinuationStore:
             return False
         if any(envelope.get(field) != binding_row[field] for field in AUTHORITY_FIELDS):
             return False
+        if binding_row["platform"] == "desktop":
+            source_message = self.reserved_source(binding_row)
+            if not source_message or envelope.get("source_message_id") != source_message:
+                return False
         return (
             envelope.get("source_sequence") == event_row["source_sequence"]
             and envelope.get("source_event_id") == event_row["source_event_id"]
@@ -635,6 +652,7 @@ class ContinuationStore:
         expected_binding: Binding,
         source_sequence: int,
         expected_mac: str,
+        *, completion: bool = False,
     ) -> bool:
         """Reopen durable state for the host's pre-admission authorization check."""
         try:
@@ -651,7 +669,7 @@ class ContinuationStore:
                     binding_row is not None
                     and event_row is not None
                     and binding_row["state"] == "active"
-                    and event_row["status"] == "dispatching"
+                    and event_row["status"] in ({"dispatching", "acknowledged"} if completion else {"dispatching"})
                     and self._event_authority_matches(
                         binding_row,
                         event_row,
@@ -664,46 +682,23 @@ class ContinuationStore:
 
     @staticmethod
     def _normalize_binding_values(values: Mapping[str, Any]) -> dict[str, Any]:
-        normalized = {
-            "binding_id": _clean(values.get("binding_id"), "binding_id"),
-            "profile_name": _clean(values.get("profile_name"), "profile_name"),
-            "t3_thread_id": _clean(values.get("t3_thread_id"), "t3_thread_id"),
-            "t3_owner_id": _clean(values.get("t3_owner_id"), "t3_owner_id"),
-            "t3_environment_id": _clean(
-                values.get("t3_environment_id"), "t3_environment_id"
-            ),
-            "hermes_session_key": _clean(
-                values.get("hermes_session_key"),
-                "hermes_session_key",
-                maximum=MAX_SESSION_KEY_CHARS,
-            ),
-            "hermes_session_id": _clean(
-                values.get("hermes_session_id"),
-                "hermes_session_id",
-                maximum=MAX_SESSION_ID_CHARS,
-            ),
-            "platform": _clean(values.get("platform"), "platform"),
-            "user_id": _clean(values.get("user_id"), "user_id"),
-            "chat_id": _clean(values.get("chat_id"), "chat_id"),
-            "topic_id": _clean_optional(values.get("topic_id"), "topic_id"),
-            "sunsama_task_id": _clean(
-                values.get("sunsama_task_id"), "sunsama_task_id"
-            ),
-            "source_identity": _clean(
-                values.get("source_identity"), "source_identity"
-            ),
-            "followup_scope": _clean(
-                values.get("followup_scope", "none"), "followup_scope"
-            ),
-        }
-        max_continuations = values.get("max_continuations", 1)
-        if (
-            isinstance(max_continuations, bool)
-            or not isinstance(max_continuations, int)
-            or not 1 <= max_continuations <= 16
-        ):
-            raise ValueError("max_continuations must be between 1 and 16")
-        normalized["max_continuations"] = max_continuations
+        normalized = {}
+        for field in AUTHORITY_FIELDS:
+            if field == "max_continuations":
+                value = values.get(field, 1)
+                if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 16:
+                    raise ValueError("max_continuations must be between 1 and 16")
+                normalized[field] = value
+            elif field in {"topic_id", "sunsama_task_id"} or (values.get("platform") == "desktop" and field in {"user_id", "chat_id"}):
+                normalized[field] = _clean_optional(values.get(field), field)
+            else:
+                maximum = (MAX_SESSION_ID_CHARS if field == "hermes_session_id" else
+                           MAX_SESSION_KEY_CHARS if field == "hermes_session_key" else MAX_IDENTIFIER_CHARS)
+                normalized[field] = _clean(values.get(field, "none" if field == "followup_scope" else None),
+                                           field, maximum=maximum)
+        if normalized["platform"] == "desktop":
+            if any(normalized[field] for field in ("user_id", "chat_id", "topic_id")) or normalized["hermes_session_key"] != normalized["hermes_session_id"]:
+                raise ValueError("desktop authority requires an exact physical session and no gateway route")
         return normalized
 
     @staticmethod
@@ -723,7 +718,7 @@ class ContinuationStore:
                baseline[1] if baseline is not None else now, now, SCHEMA_VERSION, baseline is not None),
         )
 
-    def bind(self, *, baseline: tuple[int, str] | None = None, **values: Any) -> Binding:
+    def bind(self, *, baseline: tuple[int, str] | None = None, current_turn: tuple[str, str] | None = None, **values: Any) -> Binding:
         self._validate_baseline(baseline)
         normalized = self._normalize_binding_values(values)
         binding_id = normalized["binding_id"]
@@ -735,6 +730,8 @@ class ContinuationStore:
                     "SELECT * FROM bindings WHERE binding_id=?", (binding_id,)
                 ).fetchone()
                 if existing is not None:
+                    if current_turn is not None:
+                        raise ContinuationStateError("current-turn attachment requires a fresh binding id")
                     if any(
                         existing[field] != normalized[field]
                         for field in AUTHORITY_FIELDS
@@ -760,6 +757,7 @@ class ContinuationStore:
                             "thread has binding history; use explicit renewal"
                         )
                     self._insert_binding(db, normalized, now, baseline)
+                self._insert_current_turn_reservation(db, normalized, baseline, current_turn)
                 db.execute("COMMIT")
             except BaseException:
                 if db.in_transaction:
@@ -768,12 +766,19 @@ class ContinuationStore:
         return self.get_binding(binding_id)
 
     def renew(self, replaces_binding_id: str, *, baseline: tuple[int, str] | None = None,
-              **values: Any) -> Binding:
+              desktop_upgrade: bool = False, current_turn: tuple[str, str] | None = None,
+              replace_session_id: str | None = None, **values: Any) -> Binding:
         self._validate_baseline(baseline)
-        if any(field not in values for field in AUTHORITY_FIELDS):
+        if not isinstance(desktop_upgrade, bool):
+            raise ValueError("desktop_upgrade must be a boolean")
+        if any(field not in values for field in AUTHORITY_FIELDS if field != "sunsama_task_id"):
             raise ValueError("renewal requires every authority field explicitly")
         predecessor_id = _clean(replaces_binding_id, "replaces_binding_id")
         normalized = self._normalize_binding_values(values)
+        if replace_session_id is not None:
+            replace_session_id = _clean(replace_session_id, "replace_session_id", maximum=MAX_SESSION_ID_CHARS)
+            if current_turn is None or normalized["platform"] != "desktop":
+                raise ValueError("session replacement requires Desktop current-turn renewal")
         successor_id = normalized["binding_id"]
         if predecessor_id == successor_id:
             raise ContinuationStateError("renewal requires a new binding id")
@@ -795,6 +800,8 @@ class ContinuationStore:
                     "SELECT * FROM bindings WHERE binding_id=?", (successor_id,)
                 ).fetchone()
                 if lineage is not None:
+                    if current_turn is not None:
+                        raise ContinuationStateError("current-turn attachment requires a fresh successor")
                     if (
                         lineage["successor_binding_id"] == successor_id
                         and successor is not None
@@ -810,10 +817,18 @@ class ContinuationStore:
                     )
                 if successor is not None:
                     raise ContinuationStateError("successor binding id already exists")
-                if any(
-                    predecessor[field] != normalized[field]
-                    for field in RENEWAL_SOURCE_FIELDS + RENEWAL_DESTINATION_FIELDS
-                ):
+                checked_continuity = RENEWAL_SOURCE_FIELDS + RENEWAL_DESTINATION_FIELDS
+                if desktop_upgrade:
+                    if predecessor["platform"] == "desktop" or normalized["platform"] != "desktop":
+                        raise ContinuationStateError("desktop upgrade requires a gateway predecessor")
+                    checked_continuity = ("profile_name", "t3_thread_id", "t3_owner_id", "t3_environment_id", "hermes_session_id")
+                if replace_session_id is not None:
+                    if (predecessor["hermes_session_id"] != replace_session_id
+                            or normalized["hermes_session_id"] == replace_session_id):
+                        raise ContinuationStateError("session replacement must name the exact different predecessor session")
+                    checked_continuity = tuple(field for field in checked_continuity
+                                               if field not in {"hermes_session_id", "hermes_session_key"})
+                if any(predecessor[field] != normalized[field] for field in checked_continuity):
                     raise ContinuationStateError(
                         "renewal source and Hermes destination must match predecessor"
                     )
@@ -850,6 +865,7 @@ class ContinuationStore:
                     (now, predecessor_id),
                 )
                 self._insert_binding(db, normalized, now, baseline)
+                self._insert_current_turn_reservation(db, normalized, baseline, current_turn)
                 db.execute(
                     """INSERT INTO binding_lineage(
                         predecessor_binding_id,successor_binding_id,renewed_at
@@ -1022,6 +1038,9 @@ class ContinuationStore:
                 item["successor_binding_id"] = (
                     successor["successor_binding_id"] if successor else None
                 )
+                if row["platform"] == "desktop":
+                    item["source_message_id"] = self.reserved_source(row)
+                    item["armed"] = item["armed"] and bool(item["source_message_id"])
                 result.append(item)
         return {"schema_version": SCHEMA_VERSION, "bindings": result}
 
@@ -1031,6 +1050,8 @@ class ContinuationStore:
         *,
         cursor_sequence: int,
         event: Mapping[str, Any] | None,
+        native_event: Mapping[str, Any] | None = None,
+        snapshot_gap: bool = False,
     ) -> bool:
         if isinstance(cursor_sequence, bool) or cursor_sequence < 0:
             raise ValueError("cursor_sequence is invalid")
@@ -1049,6 +1070,14 @@ class ContinuationStore:
                 if cursor_sequence <= current["cursor_sequence"]:
                     db.execute("ROLLBACK")
                     return False
+                if native_event is not None and native_event.get("sequence") != cursor_sequence:
+                    raise ContinuationStateError("source correlation sequence is invalid")
+                if binding.platform == "desktop":
+                    self._correlate_source(db, binding, native_event, snapshot_gap)
+                    reservation = self._source_correlation(db, binding)
+                    correlation = (reservation or {}).get("correlation", {})
+                    if event is not None and correlation.get("phase") == "rejected":
+                        event = None
                 inserted = False
                 if event is not None:
                     queued = db.execute(
@@ -1210,21 +1239,27 @@ class ContinuationStore:
         return bool(changed)
 
 
-    def recover_dispatching(self) -> int:
+    def recover_dispatching(self, *, surface: str | None = None) -> int:
         """Fail closed after a crash because delivery may already have occurred."""
+        suffix = ""
+        if surface is not None:
+            if surface not in {"desktop", "gateway"}:
+                raise ValueError("unsupported consumer surface")
+            operator = "=" if surface == "desktop" else "!="
+            suffix = f" AND binding_id IN (SELECT binding_id FROM bindings WHERE platform {operator} 'desktop')"
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
                 result = db.execute(
                     "UPDATE events SET status='uncertain',last_error_code='process_restart',updated_at=? "
-                    "WHERE status='dispatching'",
+                    "WHERE status='dispatching'" + suffix,
                     (utc_now(),),
                 ).rowcount
                 # An in-run acknowledgement can precede the final host receipt.
                 # Preserve its audit status while retiring the lost receipt waiter.
                 result += db.execute(
                     "UPDATE events SET last_error_code='process_restart',updated_at=? "
-                    "WHERE status='acknowledged' AND receipt_json IS NULL AND last_error_code IS NULL",
+                    "WHERE status='acknowledged' AND receipt_json IS NULL AND last_error_code IS NULL" + suffix,
                     (utc_now(),),
                 ).rowcount
                 db.execute("COMMIT")
@@ -1273,3 +1308,189 @@ class ContinuationStore:
             except BaseException:
                 db.execute("ROLLBACK")
                 raise
+
+    @contextmanager
+    def consumer_lock(self, surface: str):
+        import fcntl
+        if surface not in {"desktop", "gateway"}:
+            raise ValueError("unsupported consumer surface")
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self.data_dir / f"consumer-{surface}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            os.close(descriptor)
+
+    def reserve_source(self, binding: Binding, message_id: str, *, excluded_turn_ids=()) -> None:
+        message_id = _clean(message_id, "message_id", maximum=256)
+        envelope = {field: getattr(binding, field) for field in AUTHORITY_FIELDS}
+        envelope["source_message_id"] = message_id
+        envelope["correlation"] = {"phase": "awaiting_start", "turn_id": None,
+            "excluded_turn_ids": sorted({_clean(turn, "excluded_turn_id") for turn in excluded_turn_ids if turn})}
+        encoded, signature = _canonical(envelope).decode("ascii"), self.sign(envelope)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT envelope_json,envelope_mac FROM source_reservations WHERE binding_id=?", (binding.binding_id,)).fetchone()
+            if existing is not None and tuple(existing) != (encoded, signature):
+                raise ContinuationStateError("binding already reserves a different source message")
+            db.execute("INSERT OR IGNORE INTO source_reservations VALUES(?,?,?)", (binding.binding_id, encoded, signature))
+            db.execute("COMMIT")
+
+    def reserved_source(self, binding: Binding | Mapping[str, Any]) -> str | None:
+        values = asdict(binding) if isinstance(binding, Binding) else dict(binding)
+        with self._connect() as db:
+            row = db.execute("SELECT envelope_json,envelope_mac FROM source_reservations WHERE binding_id=?", (values["binding_id"],)).fetchone()
+        if row is None:
+            return None
+        envelope = json.loads(row[0])
+        if not self.verify(envelope, row[1]) or any(envelope.get(field) != values[field] for field in AUTHORITY_FIELDS):
+            raise ContinuationStateError("source reservation authority is invalid")
+        return _clean(envelope.get("source_message_id"), "source_message_id", maximum=256)
+
+    def _source_correlation(self, db, binding):
+        row = db.execute("SELECT envelope_json,envelope_mac FROM source_reservations WHERE binding_id=?",
+                         (binding.binding_id,)).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row[0])
+        if not self.verify(value, row[1]) or any(value.get(field) != getattr(binding, field) for field in AUTHORITY_FIELDS):
+            raise ContinuationStateError("source reservation authority is invalid")
+        return value
+
+    def reserved_turn(self, binding):
+        with self._connect() as db:
+            value = self._source_correlation(db, binding)
+        correlation = (value or {}).get("correlation", {})
+        return correlation.get("turn_id") if correlation.get("phase") == "mapped" else None
+
+    def _correlate_source(self, db, binding, native_event, snapshot_gap):
+        """Correlate the visible native turn-start user message with its running turn."""
+        value = self._source_correlation(db, binding)
+        if value is None or "correlation" not in value:
+            return
+        correlation = value["correlation"]
+        phase = correlation["phase"]
+        if phase == "rejected":
+            return
+        if snapshot_gap:
+            correlation["phase"] = "rejected"
+        elif native_event is not None:
+            payload = native_event.get("payload", {})
+            if (native_event.get("aggregateKind") != "thread"
+                    or native_event.get("aggregateId") != binding.t3_thread_id
+                    or not isinstance(payload, dict) or payload.get("threadId") != binding.t3_thread_id):
+                raise ContinuationStateError("source correlation event identity is invalid")
+            try:
+                occurred_at = datetime.fromisoformat(native_event["occurredAt"].replace("Z", "+00:00"))
+                created_at = datetime.fromisoformat(binding.created_at.replace("Z", "+00:00"))
+                if occurred_at.utcoffset() is None or occurred_at < created_at:
+                    raise ValueError("event predates reservation")
+                _clean(native_event.get("eventId"), "source_event_id")
+            except (KeyError, AttributeError, TypeError, ValueError) as exc:
+                raise ContinuationStateError("source correlation event chronology is invalid") from exc
+            kind = native_event.get("type")
+            # subscribeThread filters out turn-start-requested. The native turn.start
+            # command emits this user message atomically with that request; imported
+            # history is the other user-message emitter and is explicitly marked.
+            if kind == "thread.message-sent" and payload.get("role") == "user":
+                metadata = native_event.get("metadata")
+                command_id = native_event.get("commandId")
+                witness = (payload.get("messageId") == value["source_message_id"]
+                    and "turnId" in payload and payload["turnId"] is None
+                    and payload.get("streaming") is False
+                    and isinstance(command_id, str) and bool(command_id.strip())
+                    and isinstance(metadata, dict) and metadata.get("historyImport", False) is False)
+                correlation["phase"] = "pending" if phase == "awaiting_start" and witness else "rejected"
+                if correlation["phase"] == "pending":
+                    correlation.update(start_event_id=native_event["eventId"], start_sequence=native_event["sequence"],
+                        start_command_id=_clean(command_id, "source_command_id"))
+            elif kind == "thread.session-set":
+                session = payload.get("session") or {}
+                status, turn = session.get("status"), session.get("activeTurnId")
+                if status == "running":
+                    if phase == "pending" and isinstance(turn, str) and turn and turn not in correlation["excluded_turn_ids"]:
+                        correlation.update(phase="mapped", turn_id=_clean(turn, "source_turn_id"),
+                            mapped_event_id=native_event["eventId"], mapped_sequence=native_event["sequence"])
+                    elif phase != "mapped" or turn != correlation["turn_id"]:
+                        correlation["phase"] = "rejected"
+                elif phase != "mapped" and status in {"ready", "error", "stopped", "interrupted"}:
+                    correlation["phase"] = "rejected"
+            elif kind in {"thread.checkpoint-revert-requested", "thread.reverted", "thread.deleted", "thread.session-stop-requested", "thread.turn-interrupt-requested"}:
+                correlation["phase"] = "rejected"
+            elif kind == "thread.activity-appended" and phase != "mapped":
+                activity = payload.get("activity") or {}
+                if activity.get("kind") in {"provider.turn.start.failed", "context-compaction"}:
+                    correlation["phase"] = "rejected"
+        db.execute("UPDATE source_reservations SET envelope_json=?,envelope_mac=? WHERE binding_id=?",
+                   (_canonical(value).decode("ascii"), self.sign(value), binding.binding_id))
+
+    def _insert_current_turn_reservation(self, db, values, baseline, current_turn) -> None:
+        if current_turn is None:
+            return
+        if values["platform"] != "desktop" or baseline is None or len(current_turn) != 2:
+            raise ValueError("current-turn attachment requires Desktop and a captured baseline")
+        message_id, turn_id = current_turn
+        envelope = {field: values[field] for field in AUTHORITY_FIELDS}
+        envelope["source_message_id"] = _clean(message_id, "source_message_id", maximum=256)
+        envelope["correlation"] = {
+            "phase": "mapped", "turn_id": _clean(turn_id, "source_turn_id"), "excluded_turn_ids": [],
+            "registration_sequence": baseline[0], "registration_created_at": baseline[1],
+        }
+        db.execute("INSERT INTO source_reservations VALUES(?,?,?)",
+            (values["binding_id"], _canonical(envelope).decode("ascii"), self.sign(envelope)))
+
+    @staticmethod
+    def _create_extensions(db: sqlite3.Connection) -> None:
+        db.execute("CREATE TABLE source_reservations (binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id), envelope_json TEXT NOT NULL, envelope_mac TEXT NOT NULL)")
+        db.execute("CREATE TABLE notification_targets (binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id), envelope_json TEXT NOT NULL, envelope_mac TEXT NOT NULL)")
+        db.execute("CREATE TABLE notifications (binding_id TEXT NOT NULL REFERENCES bindings(binding_id), source_sequence INTEGER NOT NULL, envelope_json TEXT NOT NULL, envelope_mac TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0, receipt_json TEXT, PRIMARY KEY(binding_id,source_sequence))")
+        db.execute("INSERT INTO meta(key,value) VALUES('source_reservation_version','1')")
+
+    def _validate_extensions(self, db: sqlite3.Connection) -> None:
+        expected = {
+            "source_reservations": ("binding_id", "envelope_json", "envelope_mac"),
+            "notification_targets": ("binding_id", "envelope_json", "envelope_mac"),
+            "notifications": ("binding_id", "source_sequence", "envelope_json", "envelope_mac", "status", "attempts", "retry_at", "receipt_json"),
+        }
+        version = db.execute("SELECT value FROM meta WHERE key='source_reservation_version'").fetchone()
+        if version is None or version[0] != '1':
+            raise ContinuationStateError("unsupported source reservation extension")
+        for table, columns in expected.items():
+            keys = {("binding_id", "source_sequence")} if table == "notifications" else {("binding_id",)}
+            foreign_keys = db.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            if (self._table_columns(db, table) != columns or self._unique_index_columns(db, table) != keys
+                    or len(foreign_keys) != 1 or foreign_keys[0]["table"] != "bindings"
+                    or foreign_keys[0]["from"] != "binding_id" or foreign_keys[0]["to"] != "binding_id"):
+                raise ContinuationStateError("continuation extension schema is not canonical")
+
+    def _migrate_v3_to_current(self, db: sqlite3.Connection) -> None:
+        self._validate_schema(db, version=3)
+        db.execute("PRAGMA foreign_keys=OFF")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+            raise ContinuationStateError("continuation migration could not suspend foreign keys")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            self._create_bindings_table(db, "bindings_v3")
+            db.execute(
+                f"INSERT INTO bindings_v3({','.join(BINDING_COLUMNS)}) "
+                f"SELECT {','.join(V1_BINDING_COLUMNS)},?,baseline_captured FROM bindings",
+                (SCHEMA_VERSION,),
+            )
+            db.execute("DROP TABLE bindings")
+            db.execute("ALTER TABLE bindings_v3 RENAME TO bindings")
+            db.execute("CREATE UNIQUE INDEX bindings_live_thread_idx ON bindings(t3_thread_id) WHERE state IN ('active','paused')")
+            db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+            self._create_extensions(db)
+            self._validate_schema(db)
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")

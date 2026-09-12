@@ -37,6 +37,8 @@ RUNTIME_FILES = (
     "continuation_cli.py",
     "continuation_state.py",
     "continuation_transport.py",
+    "continuation_handoff.py",
+    "continuation_notifications.py",
 )
 FORBIDDEN_IMPORT_ROOTS = frozenset(
     {
@@ -177,6 +179,7 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
 
     def __init__(self, filename: str) -> None:
         self.filename = filename
+        self.function_name = None
         self.aliases: dict[str, str] = {}
         self.violations: list[str] = []
 
@@ -236,7 +239,7 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
             )
             or (
                 self.filename == "continuation_transport.py"
-                and module in {"socket", "websockets"}
+                and module in {"socket", "websockets", "websockets.sync.client"}
             )
         ):
             self._record(node, f"forbidden direct import from {module}")
@@ -254,9 +257,15 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
             self.aliases[binding] = f"{module}.{alias.name}" if module else alias.name
         self.generic_visit(node)
 
+    def visit_FunctionDef(self, node):
+        previous = self.function_name
+        self.function_name = node.name
+        self.generic_visit(node)
+        self.function_name = previous
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         name = self._resolve(_dotted_name(node))
-        if name == "os.environ":
+        if name == "os.environ" and not (self.filename == "continuation_transport.py" and self.function_name == "operator_desktop_readiness"):
             self._record(node, "direct environment access")
         self.generic_visit(node)
 
@@ -313,7 +322,11 @@ class RuntimeSourcePolicy(ast.NodeVisitor):
             or final_name in OS_SIDE_EFFECT_CALLS
             and name.startswith("os.")
         ):
-            self._record(node, "direct environment or process access")
+            allowed_boot_token = (self.filename == "continuation_transport.py" and name == "os.environ.get"
+                                  and node.args and isinstance(node.args[0], ast.Constant)
+                                  and node.args[0].value == "HERMES_DASHBOARD_SESSION_TOKEN")
+            if not allowed_boot_token:
+                self._record(node, "direct environment or process access")
         if name and any(name.startswith(prefix) for prefix in ALTERNATE_NETWORK_PREFIXES) and not (
             self.filename == "continuation_transport.py"
             and name.startswith(("websocket.", "websockets."))
@@ -396,7 +409,7 @@ class RegistrationTests(unittest.TestCase):
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual(manifest["api_version"], 1)
-        self.assertEqual(manifest["version"], "1.3.1")
+        self.assertEqual(manifest["version"], "1.4.0")
         self.assertEqual(
             manifest["description"],
             "Control T3 work from Hermes with bounded tools and operation-scoped local authentication; core thread lifecycle verified end-to-end with Codex.",
@@ -420,6 +433,7 @@ class RegistrationTests(unittest.TestCase):
                 "default_model_aliases",
                 "continuation_enabled",
                 "continuation_profile",
+                "continuation_excluded_bindings",
                 "continuation_max_queue_rows",
                 "continuation_max_reconnects",
                 "continuation_receipt_timeout_seconds",

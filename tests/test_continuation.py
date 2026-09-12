@@ -46,6 +46,9 @@ class FakeContext:
         self.result = result
         self.calls = []
 
+    def get_config(self, key, default=None):
+        return default
+
     def inject_gateway_system_event(self, content, **kwargs):
         self.calls.append((content, kwargs))
         future = Future()

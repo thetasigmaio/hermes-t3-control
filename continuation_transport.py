@@ -208,3 +208,33 @@ async def subscribe_thread(
         finally:
             if sock is not None:
                 sock.close()
+
+def operator_desktop_readiness(ctx, destination, url):
+    """Authenticated read-only serve probe; the operator supplies its boot token privately."""
+    import json
+    import os
+    import logging
+    from urllib.parse import urlencode, urlsplit, urlunsplit
+    from websockets.sync.client import connect
+    parsed = urlsplit(url or "")
+    if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "::1"} or parsed.path != "/api/ws" or parsed.query or parsed.fragment or parsed.username:
+        raise ValueError("desktop readiness requires a numeric loopback /api/ws URL")
+    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    if not token:
+        raise ValueError("desktop readiness requires the operator-supplied serve boot token")
+    endpoint = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode({"token": token}), ""))
+    try:
+        with connect(endpoint, open_timeout=5, close_timeout=2, max_size=16384, proxy=None,
+                     logger=logging.Logger("desktop-readiness", level=logging.CRITICAL + 1)) as ws:
+            ws.send(json.dumps({"jsonrpc": "2.0", "id": "continuation-readiness", "method": "session.continuation.readiness",
+                                "params": {"plugin_id": "hermes-t3-control", "destination": destination}}))
+            for _ in range(8):
+                result = json.loads(ws.recv(timeout=5))
+                if result.get("id") == "continuation-readiness":
+                    readiness = result.get("result", {})
+                    if readiness.get("ready") is True and readiness.get("destination") == destination:
+                        return readiness
+                    break
+    except Exception:
+        raise ValueError("native Desktop consumer readiness could not be verified") from None
+    raise ValueError("native Desktop consumer is not ready for this exact destination")

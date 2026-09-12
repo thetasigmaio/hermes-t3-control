@@ -15,7 +15,7 @@ EXPERIMENTAL = (ROOT / "docs" / "experimental-continuation.md").read_text(
 )
 INSTALLER_PATH = ROOT / "scripts" / "install-signed.sh"
 INSTALLER = INSTALLER_PATH.read_text(encoding="utf-8")
-EXACT_BASE = "63279301bcbdc185c1b07b98a9312eb0c862f26d"
+EXACT_BASE = "ad03f20dd61919ca2135d6904e787a94284aacaf"
 PINNED_SIGNER = "SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4"
 REVISION = "a" * 40
 
@@ -24,7 +24,7 @@ def _run_installer(
     *,
     answer: str = "y\n",
     tag_type: str = "tag",
-    tag_name: str = "v1.3.1",
+    tag_name: str = "v1.4.0",
     signature: str = PINNED_SIGNER,
     revision: str = REVISION,
     revision_status: int = 0,
@@ -164,7 +164,7 @@ class ReadmeContractTests(unittest.TestCase):
         ):
             with self.subTest(heading=heading):
                 self.assertIn(heading, README)
-        self.assertIn("v1.3.1/install-t3.sh", README)
+        self.assertIn("v1.4.0/install-t3.sh", README)
         self.assertEqual(README.count("bash install-t3.sh"), 1)
         self.assertIn("> Show my T3 threads.", README)
         self.assertNotIn("/dev/fd", README)
@@ -174,7 +174,7 @@ class ReadmeContractTests(unittest.TestCase):
 
     def test_readme_states_the_plain_bootstrap_and_experimental_boundaries(self) -> None:
         self.assertIn("trusts the installer published by this project on GitHub over HTTPS", README)
-        self.assertIn("Automatic updates into the same Hermes conversation are experimental and off by default", README)
+        self.assertIn("Same-conversation verification and optional Telegram completion notices are experimental and off by default", README)
         self.assertIn("a separate patch for one exact Hermes revision", README)
         self.assertNotIn(EXACT_BASE, README)
         self.assertNotIn("Sunsama", README)
@@ -182,17 +182,17 @@ class ReadmeContractTests(unittest.TestCase):
 
     def test_installer_retains_the_signed_disabled_validation_boundary(self) -> None:
         for required in (
-            "refs/tags/v1.3.1:refs/tags/v1.3.1",
-            "cat-file -t refs/tags/v1.3.1",
-            "for-each-ref --format='%(tag)' refs/tags/v1.3.1",
-            "verify-tag --raw v1.3.1",
+            "refs/tags/v1.4.0:refs/tags/v1.4.0",
+            "cat-file -t refs/tags/v1.4.0",
+            "for-each-ref --format='%(tag)' refs/tags/v1.4.0",
+            "verify-tag --raw v1.4.0",
             PINNED_SIGNER,
             "plugins.scan_on_install true",
             "--no-enable",
             "plugins doctor hermes-t3-control --ci",
             "--no-allow-tool-override",
             "plugins list --user --enabled --json",
-            "v1.3.1^{commit}",
+            "v1.4.0^{commit}",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, INSTALLER)
@@ -202,36 +202,36 @@ class ReadmeContractTests(unittest.TestCase):
 
     def test_downloadable_assets_are_authenticated_by_signed_source(self) -> None:
         for guide in (OPERATIONS, EXPERIMENTAL):
-            self.assertIn("verify-tag --raw v1.3.1", guide)
-            self.assertIn("for-each-ref --format='%(tag)' refs/tags/v1.3.1", guide)
+            self.assertIn("verify-tag --raw v1.4.0", guide)
+            self.assertIn("for-each-ref --format='%(tag)' refs/tags/v1.4.0", guide)
             self.assertIn(PINNED_SIGNER, guide)
-            self.assertIn("release/v1.3.1.sha256", guide)
+            self.assertIn("release/v1.4.0.sha256", guide)
             self.assertIn("--proto '=https'", guide)
             self.assertIn("cmp --", guide)
-        self.assertIn("hermes-t3-control-1.3.1.tar.gz", OPERATIONS)
+        self.assertIn("hermes-t3-control-1.4.0.tar.gz", OPERATIONS)
         self.assertIn("install-t3.sh.sha256", OPERATIONS)
         self.assertIn('$RELEASE_REF:scripts/install-signed.sh', OPERATIONS)
-        self.assertIn("hermes-gateway-continuation-1.3.1.patch", EXPERIMENTAL)
-        self.assertIn("v1.3.1^{commit}", OPERATIONS)
-        self.assertIn("v1.3.1^{commit}", EXPERIMENTAL)
+        self.assertIn("hermes-gateway-continuation-1.4.0.patch", EXPERIMENTAL)
+        self.assertIn("v1.4.0^{commit}", OPERATIONS)
+        self.assertIn("v1.4.0^{commit}", EXPERIMENTAL)
 
     def test_experimental_manual_patch_contract_is_exact(self) -> None:
         self.assertIn(EXACT_BASE, EXPERIMENTAL)
         self.assertIn("git apply --check", EXPERIMENTAL)
         self.assertIn("git diff --check", EXPERIMENTAL)
-        self.assertIn("uv sync --frozen --python 3.11 --extra dev", EXPERIMENTAL)
-        self.assertIn("uv run --frozen --extra dev pytest -q", EXPERIMENTAL)
+        self.assertIn("uv sync --frozen --python 3.11 --extra dev --extra messaging", EXPERIMENTAL)
+        self.assertIn("uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2", EXPERIMENTAL)
         self.assertNotIn("--with pytest", EXPERIMENTAL)
         self.assertIn("t3-continuation bind", EXPERIMENTAL)
-        self.assertIn("t3-continuation renew --replaces OLD_MISSION_ID", EXPERIMENTAL)
-        self.assertIn("every bind argument supplied again", EXPERIMENTAL)
-        self.assertIn("captures a fresh registration baseline", EXPERIMENTAL)
-        self.assertIn("including when the cursor is zero", EXPERIMENTAL)
-        self.assertIn("registration, not a running observer", EXPERIMENTAL)
-        self.assertIn("t3-continuation stop OLD_MISSION_ID", EXPERIMENTAL)
-        self.assertIn("cannot resume", EXPERIMENTAL)
-        self.assertIn("migrated v3 ledger to older continuation code is unsupported", EXPERIMENTAL)
-        self.assertIn("different table shape are rejected without migration", EXPERIMENTAL)
+        self.assertIn("renew --replaces OLD_MISSION_ID", EXPERIMENTAL)
+        self.assertIn("every destination/scope argument", EXPERIMENTAL)
+        self.assertIn("Every new mission requires fresh scope", EXPERIMENTAL)
+        self.assertIn("preserving empty captured baselines", EXPERIMENTAL)
+        self.assertIn("registration, not completed", EXPERIMENTAL)
+        self.assertIn("Explicitly stop the acknowledged predecessor", EXPERIMENTAL)
+        self.assertIn("cannot be renewed", EXPERIMENTAL)
+        self.assertIn("downgrade a v4 ledger to older code", EXPERIMENTAL)
+        self.assertIn("different table shape remain rejected", EXPERIMENTAL)
 
     def test_public_docs_do_not_contain_workstation_aliases_or_private_paths(self) -> None:
         public = "\n".join(
@@ -269,7 +269,7 @@ class InstallerBehaviorTests(unittest.TestCase):
                 "plugins list --user --enabled --json",
             ],
         )
-        self.assertIn("Hermes T3 Control 1.3.1 is installed and enabled.", result.stdout)
+        self.assertIn("Hermes T3 Control 1.4.0 is installed and enabled.", result.stdout)
 
     def test_decline_stops_before_git_or_mutation(self) -> None:
         result, calls, git_calls = _run_installer(answer="n\n")
@@ -287,7 +287,7 @@ class InstallerBehaviorTests(unittest.TestCase):
         result, calls, git_calls = _run_installer(tag_name="v1.3.0")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, ["config path"])
-        self.assertTrue(any("verify-tag --raw v1.3.1" in call for call in git_calls))
+        self.assertTrue(any("verify-tag --raw v1.4.0" in call for call in git_calls))
         self.assertIn("tag name did not match", result.stderr)
 
     def test_noncommit_tag_target_stops_before_config_mutation(self) -> None:
@@ -295,7 +295,7 @@ class InstallerBehaviorTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, ["config path"])
         self.assertTrue(
-            any("rev-parse --verify v1.3.1^{commit}" in call for call in git_calls)
+            any("rev-parse --verify v1.4.0^{commit}" in call for call in git_calls)
         )
 
     def test_install_failure_preserves_preexisting_plugin_and_restores_scan(self) -> None:

@@ -7,13 +7,13 @@ if [ "$#" -ne 0 ]; then
   exit 2
 fi
 
-printf '%s\n' 'Hermes T3 Control 1.3.1 installer'
+printf '%s\n' 'Hermes T3 Control 1.4.0 installer'
 printf '%s\n' 'Active Hermes profile:'
 hermes config path
 read -r -p 'Install into this Hermes profile? [y/N] ' CONFIRM
 case "$CONFIRM" in y|Y) ;; *) exit 1 ;; esac
 
-printf '%s\n' 'Verifying the signed v1.3.1 release...'
+printf '%s\n' 'Verifying the signed v1.4.0 release...'
 VERIFY_DIR="$(mktemp -d)"
 PLUGIN_CREATED=0
 SCAN_SETTING_CHANGED=0
@@ -118,24 +118,24 @@ PY
 }
 
 safe_git -C "$VERIFY_DIR/repo" init -q
-safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.3.1:refs/tags/v1.3.1'
-TAG_OBJECT_TYPE="$(safe_git -C "$VERIFY_DIR/repo" cat-file -t refs/tags/v1.3.1)"
+safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.4.0:refs/tags/v1.4.0'
+TAG_OBJECT_TYPE="$(safe_git -C "$VERIFY_DIR/repo" cat-file -t refs/tags/v1.4.0)"
 if [ "$TAG_OBJECT_TYPE" != tag ]; then
   printf '%s\n' 'Release ref is not an annotated tag.' >&2
   exit 1
 fi
-TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.3.1 2>&1 || true)"
+TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.4.0 2>&1 || true)"
 if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
   printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
   exit 1
 fi
-TAG_EMBEDDED_NAME="$(safe_git -C "$VERIFY_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.3.1)"
-if [ "$TAG_EMBEDDED_NAME" != v1.3.1 ]; then
+TAG_EMBEDDED_NAME="$(safe_git -C "$VERIFY_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.4.0)"
+if [ "$TAG_EMBEDDED_NAME" != v1.4.0 ]; then
   printf '%s\n' 'Release tag name did not match the requested version.' >&2
   exit 1
 fi
 
-HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.3.1^{commit}')"
+HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.4.0^{commit}')"
 printf '%s\n' "$HERMES_T3_CONTROL_REF" | grep -Eq '^[0-9a-f]{40}$'
 
 if ! read_scan_setting; then
@@ -171,5 +171,5 @@ if ! read_plugin_enabled_state || [ "$PLUGIN_ENABLED_STATE" != enabled ]; then
   printf '%s\n' 'Hermes did not enable the installed plugin.' >&2
   exit 1
 fi
-printf '%s\n' 'Hermes T3 Control 1.3.1 is installed and enabled.'
+printf '%s\n' 'Hermes T3 Control 1.4.0 is installed and enabled.'
 printf '%s\n' 'Reload the process that owns your Hermes session before trying the tools.'

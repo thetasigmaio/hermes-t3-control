@@ -10,7 +10,7 @@ Check on your T3 coding tasks and continue them from Hermes. You can review prog
 
 ## 1. Install
 
-[Download `install-t3.sh`](https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.3.1/install-t3.sh), open a Linux terminal in the downloaded file's folder, and run:
+[Download `install-t3.sh`](https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/install-t3.sh), open a Linux terminal in the downloaded file's folder, and run:
 
 ```bash
 bash install-t3.sh
@@ -64,7 +64,7 @@ Hermes should show your T3 tasks and their current progress, or tell you that no
 
 ## Experimental continuation
 
-Automatic updates into the same Hermes conversation are experimental and off by default. They require a separate patch for one exact Hermes revision; follow [Experimental continuation](docs/experimental-continuation.md) if you want to evaluate it.
+Same-conversation verification and optional Telegram completion notices are experimental and off by default. They require a separate patch for one exact Hermes revision; follow [Experimental continuation](docs/experimental-continuation.md) if you want to evaluate it.
 
 ## Help and reference
 

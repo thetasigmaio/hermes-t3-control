@@ -181,3 +181,11 @@ Material text is truncated with explicit metadata: messages/errors at 8192 UTF-1
 v1.2 changed omitted list/read views to compact/material. Legacy callers can request `t3_threads {"view":"raw"}` and `t3_thread_read {"thread_id":"...","view":"raw"}` explicitly.
 
 `full-access` permits a trusted provider to execute commands and modify or delete files without approval. Use it only with a trusted provider and checkout.
+
+## Optional completion handoff
+
+`t3_thread_send.continuation` can require an exact-session registration before
+dispatch on the separately patched Desktop host. It carries a fresh binding ID,
+finite scope/budget, optional predecessor, optional external task reference, and
+opt-in Telegram notice. Missing native context or readiness fails closed.
+See [experimental setup and limitations](experimental-continuation.md).

@@ -107,6 +107,8 @@ class AgentFacingSchemaTests(unittest.TestCase):
                 "model",
                 "model_options",
                 "busy_policy",
+                "continuation",
+                "completion_policy",
             },
         )
         self.assertEqual(send["busy_policy"]["type"], "string")

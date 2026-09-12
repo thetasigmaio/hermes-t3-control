@@ -18,7 +18,7 @@ The Codex live gate covered list/filter, exact read, create, idle send, explicit
 
 ## Continuation observer compatibility
 
-The eleven public tools retain their stock-Hermes compatibility when the observer stays at its default disabled setting. The optional observer requires Python `websockets` 15 and the separately published host patch for exact clean upstream commit `63279301bcbdc185c1b07b98a9312eb0c862f26d`. Stock Hermes 0.20.4, 0.20.5, 0.21.0, and current main do not provide its native APIs. See [Experimental continuation](experimental-continuation.md).
+The eleven public tools retain their stock-Hermes compatibility when the observer stays at its default disabled setting. The optional observer requires Python `websockets` 15 and the separately published host patch for exact clean upstream commit `ad03f20dd61919ca2135d6904e787a94284aacaf`. The stock Hermes revisions tested by this release do not provide these extension APIs. The clean-base patch is separately tested; other host revisions remain unsupported. See [Experimental continuation](experimental-continuation.md).
 
 The supported T3 boundary is the authenticated, replayable `orchestration.subscribeThread` RPC with a durable numeric sequence cursor and completion marker. A fresh subscription omits `afterSequence` and stores the returned current snapshot only as its baseline; replay gaps may also yield a snapshot. Assistant message and ready events trigger a bounded authenticated exact read, and completion requires a real completed latest turn plus an idle/ready session with no active turn. Every candidate needs a valid source timestamp at or after binding creation. Lightweight polling without the event stream is not the supported continuation path.
 
