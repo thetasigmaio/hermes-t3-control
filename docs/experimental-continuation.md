@@ -75,8 +75,8 @@ test -z "$(git status --porcelain)"
 git apply --check ../hermes-gateway-continuation-1.4.0.patch
 git apply ../hermes-gateway-continuation-1.4.0.patch
 git diff --check
-uv sync --frozen --python 3.11 --extra dev
-uv run --frozen --extra dev bash scripts/run_tests.sh -j 2 \
+uv sync --frozen --python 3.11 --extra dev --extra messaging
+uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2 \
   tests/agent/test_typed_event_turn_boundary.py \
   tests/gateway/test_plugin_message_injection.py \
   tests/hermes_cli/test_plugin_message_injection.py \
@@ -85,6 +85,9 @@ uv run --frozen --extra dev bash scripts/run_tests.sh -j 2 \
 ```
 
 Only after the exact base, clean-tree check, patch check, and affected tests pass should an operator apply the same authenticated patch to the exact clean checkout used by their Hermes installation. Stop and restart only that checkout's owning process. Do not copy individual files or apply the patch over another local modification.
+
+The locked `messaging` extra supplies the Telegram SDK required for notices and
+the notification contract tests. It is not installed by the basic plugin installer.
 
 The patch contains the gateway lifecycle, typed event admission, exact-session
 Desktop consumer, and notification adapter together. The release CI reconstructs

@@ -106,11 +106,11 @@ jobs:
           git -C hermes apply "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-ad03f20d.patch"
           git -C hermes diff --check
       - name: Sync frozen Hermes dependency graph
-        run: uv sync --frozen --project hermes --python 3.11 --extra dev
+        run: uv sync --frozen --project hermes --python 3.11 --extra dev --extra messaging
       - name: Run affected host tests
         working-directory: hermes
         run: |
-          uv run --frozen --extra dev bash scripts/run_tests.sh -j 2 \
+          uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2 \
             tests/agent/test_codex_responses_adapter.py \
             tests/agent/test_engine_preflight_wire.py \
             tests/agent/test_gateway_event_overflow.py \

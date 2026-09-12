@@ -688,11 +688,11 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("--force", supported_install)
         gateway = workflow.split("  gateway-patch:", 1)[1].split("  package:", 1)[0]
         self.assertIn(
-            "uv sync --frozen --project hermes --python 3.11 --extra dev",
+            "uv sync --frozen --project hermes --python 3.11 --extra dev --extra messaging",
             gateway,
         )
         self.assertIn(
-            "uv run --frozen --extra dev bash scripts/run_tests.sh -j 2",
+            "uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2",
             gateway,
         )
         self.assertNotIn("--with pytest", gateway)
