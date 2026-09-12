@@ -7,6 +7,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -771,7 +772,55 @@ def create_public_v2_database(data_dir: pathlib.Path):
     return store
 
 
+def create_public_v3_database(data_dir):
+    store = create_public_v2_database(data_dir)
+    with closing(sqlite3.connect(store.db_path)) as db:
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE name='bindings'").fetchone()[0]
+        sql = sql.replace('CREATE TABLE "bindings"', 'CREATE TABLE bindings_v3')
+        sql = sql.replace('binding_schema_version = 2', 'binding_schema_version = 3')
+        sql = sql[:-1] + ', baseline_captured INTEGER NOT NULL DEFAULT 0 CHECK(baseline_captured IN (0,1)))'
+        db.execute(sql)
+        db.execute(f"INSERT INTO bindings_v3 SELECT {','.join(continuation_state.V1_BINDING_COLUMNS)},3,1 FROM bindings")
+        db.execute("DROP TABLE bindings")
+        db.execute("ALTER TABLE bindings_v3 RENAME TO bindings")
+        db.execute("CREATE UNIQUE INDEX bindings_live_thread_idx ON bindings(t3_thread_id) WHERE state IN ('active','paused')")
+        db.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+        db.commit()
+    return store
+
+
 class ContinuationMigrationTests(unittest.TestCase):
+    def test_public_v3_migration_preserves_empty_baseline_audit_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = create_public_v3_database(pathlib.Path(directory) / "state")
+            key = store.key_path.read_bytes()
+            with store._connect() as db:
+                before = {t: [dict(row) for row in db.execute(f"SELECT * FROM {t}")] for t in ("bindings", "events", "binding_lineage")}
+            store.initialize()
+            store.initialize()
+            with store._connect() as db:
+                after = {t: [dict(row) for row in db.execute(f"SELECT * FROM {t}")] for t in before}
+                self.assertEqual(db.execute("SELECT count(*) FROM source_reservations").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT count(*) FROM notifications").fetchone()[0], 0)
+            for row in before["bindings"]:
+                row["binding_schema_version"] = 4
+            self.assertEqual(before, after)
+            self.assertEqual(store.key_path.read_bytes(), key)
+            self.assertTrue(store.get_binding("mission-2").baseline_captured)
+            self.assertEqual(store.get_binding("mission-2").cursor_sequence, 0)
+
+    def test_public_v3_migration_failure_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = create_public_v3_database(pathlib.Path(directory) / "state")
+            before = store.db_path.read_bytes()
+            key = store.key_path.read_bytes()
+            with mock.patch.object(store, "_create_extensions", side_effect=continuation_state.ContinuationStateError("fixture")):
+                with self.assertRaises(continuation_state.ContinuationStateError):
+                    store.initialize()
+            self.assertEqual(store.db_path.read_bytes(), before)
+            self.assertEqual(store.key_path.read_bytes(), key)
+
+
     def test_public_v2_migration_preserves_authority_signed_events_and_lineage(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = create_public_v2_database(pathlib.Path(temporary) / "state")
@@ -782,7 +831,7 @@ class ContinuationMigrationTests(unittest.TestCase):
                 lineage_before = [tuple(row) for row in db.execute("SELECT * FROM binding_lineage")]
             store.initialize()
             store.initialize()  # Restart validates v3 without changing authority or audit.
-            self.assertEqual(store.status()["schema_version"], 3)
+            self.assertEqual(store.status()["schema_version"], 4)
             self.assertEqual(store.key_path.read_bytes(), key_before)
             with store._connect() as db:
                 self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM events")], events_before)
@@ -790,7 +839,7 @@ class ContinuationMigrationTests(unittest.TestCase):
                 for before in bindings_before:
                     after = dict(db.execute("SELECT * FROM bindings WHERE binding_id=?", (before["binding_id"],)).fetchone())
                     self.assertEqual(after.pop("baseline_captured"), int(before["cursor_sequence"] > 0))
-                    self.assertEqual(after.pop("binding_schema_version"), 3)
+                    self.assertEqual(after.pop("binding_schema_version"), 4)
                     before.pop("binding_schema_version")
                     self.assertEqual(after, before)
                 event = db.execute("SELECT * FROM events").fetchone()
@@ -928,11 +977,11 @@ class ContinuationMigrationTests(unittest.TestCase):
 
             store.initialize()
 
-            self.assertEqual(store.status()["schema_version"], 3)
+            self.assertEqual(store.status()["schema_version"], 4)
             migrated = store.get_binding(binding_before.binding_id)
             for field in LegacyV1BindingFixture.__dataclass_fields__:
                 self.assertEqual(getattr(migrated, field), getattr(binding_before, field))
-            self.assertEqual(migrated.binding_schema_version, 3)
+            self.assertEqual(migrated.binding_schema_version, 4)
             self.assertEqual(
                 store.status(binding_before.binding_id)["bindings"][0]["events"],
                 {"acknowledged": 1},

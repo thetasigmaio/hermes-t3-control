@@ -20,6 +20,9 @@ from tests.test_continuation_state import binding_values, envelope
 
 
 class CliContext:
+    def get_config(self, key, default=None):
+        return default
+
     profile_name = "default"
 
     def __init__(self, data_dir: pathlib.Path):
@@ -163,6 +166,8 @@ class ContinuationCliTests(unittest.TestCase):
                     "cursor_sequence": 0,
                     "ok": True,
                     "replaces_binding_id": "mission-1",
+                    "consumer_ready": False,
+                    "notification_target": None,
                     "state": "active",
                     "baseline_captured": True,
                     "armed": True,

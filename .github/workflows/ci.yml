@@ -86,7 +86,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: NousResearch/hermes-agent
-          ref: 63279301bcbdc185c1b07b98a9312eb0c862f26d
+          ref: ad03f20dd61919ca2135d6904e787a94284aacaf
           path: hermes
           persist-credentials: false
       - name: Set up Python 3.11
@@ -100,23 +100,53 @@ jobs:
           enable-cache: false
       - name: Apply exact-base patch
         run: |
-          test "$(git -C hermes rev-parse HEAD)" = "63279301bcbdc185c1b07b98a9312eb0c862f26d"
+          test "$(git -C hermes rev-parse HEAD)" = "ad03f20dd61919ca2135d6904e787a94284aacaf"
           test -z "$(git -C hermes status --porcelain)"
-          git -C hermes apply --check "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-63279301.patch"
-          git -C hermes apply "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-63279301.patch"
+          git -C hermes apply --check "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-ad03f20d.patch"
+          git -C hermes apply "$GITHUB_WORKSPACE/plugin/patches/hermes-gateway-continuation-ad03f20d.patch"
           git -C hermes diff --check
       - name: Sync frozen Hermes dependency graph
         run: uv sync --frozen --project hermes --python 3.11 --extra dev
       - name: Run affected host tests
+        working-directory: hermes
         run: |
-          uv run --frozen --project hermes --extra dev pytest -q \
-            hermes/tests/agent/test_codex_responses_adapter.py \
-            hermes/tests/agent/test_turn_context.py \
-            hermes/tests/gateway/test_active_turn_recovery.py \
-            hermes/tests/gateway/test_conversation_scope_funnel.py \
-            hermes/tests/gateway/test_plugin_message_injection.py \
-            hermes/tests/gateway/test_restart_resume_pending.py \
-            hermes/tests/hermes_cli/test_plugin_message_injection.py
+          uv run --frozen --extra dev bash scripts/run_tests.sh -j 2 \
+            tests/agent/test_codex_responses_adapter.py \
+            tests/agent/test_engine_preflight_wire.py \
+            tests/agent/test_gateway_event_overflow.py \
+            tests/agent/test_preflight_compression_gate.py \
+            tests/agent/test_preflight_compression_timeout_fail_closed.py \
+            tests/agent/test_turn_context.py \
+            tests/agent/test_turn_facade_lease.py \
+            tests/agent/test_typed_event_turn_boundary.py \
+            tests/gateway/test_active_turn_recovery.py \
+            tests/gateway/test_conversation_scope_funnel.py \
+            tests/gateway/test_plugin_message_injection.py \
+            tests/gateway/test_restart_resume_pending.py \
+            tests/gateway/test_silent_partial_delivery_95382.py \
+            tests/hermes_cli/test_plugin_message_injection.py \
+            tests/hermes_cli/test_plugin_notifications.py \
+            tests/test_lazy_session_regressions.py \
+            tests/test_tui_gateway_queue_on_busy.py \
+            tests/test_tui_gateway_server.py \
+            tests/tui_gateway/test_106459_routing_provenance_reopen.py \
+            tests/tui_gateway/test_auto_continue.py \
+            tests/tui_gateway/test_bot_live_owner_delivery.py \
+            tests/tui_gateway/test_compression_config_hot_reload.py \
+            tests/tui_gateway/test_failed_turn_retention.py \
+            tests/tui_gateway/test_finalize_session_persist.py \
+            tests/tui_gateway/test_goal_command.py \
+            tests/tui_gateway/test_heartbeat_tui_tick.py \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py \
+            tests/tui_gateway/test_hosted_room_prompt_fence.py \
+            tests/tui_gateway/test_kanban_notify_poller.py \
+            tests/tui_gateway/test_loop_command.py \
+            tests/tui_gateway/test_plugin_events.py \
+            tests/tui_gateway/test_prompt_accept_logging.py \
+            tests/tui_gateway/test_protocol.py \
+            tests/tui_gateway/test_relay_live_author.py \
+            tests/tui_gateway/test_session_control.py \
+            tests/tui_gateway/test_turn_finished_failure_cause.py
 
   package:
     name: Deterministic release package
@@ -135,22 +165,22 @@ jobs:
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
         run: |
-          python -B scripts/verify_release.py dist/hermes-t3-control-1.3.1.tar.gz.sha256
-          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.3.1.patch.sha256
+          python -B scripts/verify_release.py dist/hermes-t3-control-1.4.0.tar.gz.sha256
+          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.4.0.patch.sha256
           python -B scripts/verify_release.py dist/install-t3.sh.sha256
       - name: Verify reproducibility and authenticated release source
-        # Candidate builds have fresh checksums. Only the exact signed v1.3.1
+        # Candidate builds have fresh checksums. Only the exact signed v1.4.0
         # source must reproduce its immutable manifest; tag mismatches fail.
         run: python -B -m unittest -v tests.test_release.DeterministicArtifactTests.test_builds_are_byte_identical_and_checksum_is_portable
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.3.1
+          name: hermes-t3-control-1.4.0
           path: |
-            dist/hermes-t3-control-1.3.1.tar.gz
-            dist/hermes-t3-control-1.3.1.tar.gz.sha256
-            dist/hermes-gateway-continuation-1.3.1.patch
-            dist/hermes-gateway-continuation-1.3.1.patch.sha256
+            dist/hermes-t3-control-1.4.0.tar.gz
+            dist/hermes-t3-control-1.4.0.tar.gz.sha256
+            dist/hermes-gateway-continuation-1.4.0.patch
+            dist/hermes-gateway-continuation-1.4.0.patch.sha256
             dist/install-t3.sh
             dist/install-t3.sh.sha256
           if-no-files-found: error

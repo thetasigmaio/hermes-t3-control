@@ -1117,10 +1117,11 @@ class PublicArgumentPreflightTests(unittest.TestCase):
             ("t3_threads", ("lifecycle",)): "running",
             ("t3_thread_read", ("view",)): "material",
             ("t3_thread_send", ("busy_policy",)): "queue",
+            ("t3_thread_send", ("completion_policy",)): "none",
             ("t3_thread_wait", ("until",)): "terminal",
             ("t3_thread_respond", ("decision",)): "accept",
         }
-        self.assertEqual(len(public_string_paths), 41)
+        self.assertEqual(len(public_string_paths), 42)
 
         with LoopbackServer([]) as server:
             for tool_name, field_path in sorted(public_string_paths):
@@ -1294,6 +1295,62 @@ class PublicArgumentPreflightTests(unittest.TestCase):
 
 
 class AgentFacingSendToolTests(unittest.TestCase):
+    def test_required_send_registers_reserved_message_before_normal_and_model_switch_dispatch(self):
+        import tempfile
+        from types import SimpleNamespace
+        from continuation_state import ContinuationStore
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="turn-old", state="completed"), current_session=session(status="ready"))
+        authority = {"binding_id": "mission-1", "owner_id": "owner-1", "environment_id": "environment-1",
+                     "sunsama_task_id": "task-1", "source_identity": "source-1", "followup_scope": "none",
+                     "max_continuations": 1, "expected_turn_id": "turn-old"}
+        for model_switch in (False, True):
+            with self.subTest(model_switch=model_switch), tempfile.TemporaryDirectory() as directory:
+                commands = []
+                def assert_reserved(message_id):
+                    store = ContinuationStore(directory)
+                    binding = store.get_binding("mission-1")
+                    self.assertEqual(store.reserved_source(binding), message_id)
+                    self.assertEqual(binding.hermes_session_id, "physical-1")
+                def dispatch(request):
+                    command = json.loads(request["body"])
+                    assert_reserved(command["message"]["messageId"])
+                    commands.append(command)
+                    return Response(value={"sequence": 4})
+                def projected(request):
+                    command = commands[0]
+                    return Response(value=detail_snapshot(sequence=4, messages=[projected_message(
+                        message_id=command["message"]["messageId"], role="user", text="Scoped work",
+                        turn_id=None, created_at=command["createdAt"])], turn=latest_turn(turn_id="turn-old", state="completed"), current_session=session(status="ready")))
+                def switched(transport, snapshot, selection, text, *, message_id=None):
+                    self.assertIsNotNone(message_id)
+                    assert_reserved(message_id)
+                    return {"message_id": message_id}
+                with LoopbackServer([Response(value=before), Response(value={"environmentId": "environment-1", "serverVersion": "test"}), dispatch, projected]) as server:
+                    ctx = FakeContext(server.base_url)
+                    original_config = ctx.get_config
+                    ctx.get_config = lambda key, default=None: True if key == "continuation_enabled" else original_config(key, default)
+                    ctx.state = SimpleNamespace(data_dir=directory)
+                    ctx.current_desktop_destination = lambda: {"profile_name": "default", "session_id": "physical-1"}
+                    ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+                    args = {"thread_id": "thread-1", "message": "Scoped work", "busy_policy": "queue",
+                            "completion_policy": "required", "continuation": authority}
+                    if model_switch:
+                        args.update(instance_id="different-instance", model="different-model")
+                    with mock.patch.object(tools, "_send_with_model_switch", side_effect=switched):
+                        result = invoke(server, tools.t3_thread_send, args, context=ctx)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["continuation"]["source_message_id"], result["message_id"])
+                self.assertEqual(len(commands), 0 if model_switch else 1)
+
+    def test_enabled_continuation_requires_explicit_completion_policy_before_dispatch(self):
+        context = FakeContext("http://127.0.0.1:9999")
+        context.get_config = lambda key, default=None: True if key == "continuation_enabled" else default
+        handler = tools.bind_handler(context, tools.t3_thread_send)
+        with mock.patch.object(tools, "_execute_operation", return_value={"dispatched": True}) as dispatch:
+            result = json.loads(handler({"thread_id": "thread-1", "message": "Authorized work", "busy_policy": "queue"}))
+        self.assertFalse(result["ok"], "enabled continuation silently dispatched without a completion policy")
+        dispatch.assert_not_called()
+
     def test_send_busy_policy_defaults_reject_and_never_posts(self) -> None:
         running = detail_snapshot(
             sequence=3,

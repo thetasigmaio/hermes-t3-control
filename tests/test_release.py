@@ -34,6 +34,8 @@ ARCHIVE_FILES = {
     "continuation_cli.py",
     "continuation_state.py",
     "continuation_transport.py",
+    "continuation_handoff.py",
+    "continuation_notifications.py",
     "docs/community-index-entry.json",
     "docs/community-index.md",
     "docs/compatibility.md",
@@ -45,17 +47,17 @@ ARCHIVE_FILES = {
     "schemas.py",
     "tools.py",
 }
-ARCHIVE_NAME = "hermes-t3-control-1.3.1.tar.gz"
+ARCHIVE_NAME = "hermes-t3-control-1.4.0.tar.gz"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
-PATCH_NAME = "hermes-gateway-continuation-1.3.1.patch"
+PATCH_NAME = "hermes-gateway-continuation-1.4.0.patch"
 PATCH_CHECKSUM_NAME = f"{PATCH_NAME}.sha256"
-PATCH_SOURCE = ROOT / "patches" / "hermes-gateway-continuation-63279301.patch"
+PATCH_SOURCE = ROOT / "patches" / "hermes-gateway-continuation-ad03f20d.patch"
 INSTALLER_NAME = "install-t3.sh"
 INSTALLER_CHECKSUM_NAME = f"{INSTALLER_NAME}.sha256"
 INSTALLER_SOURCE = ROOT / "scripts" / "install-signed.sh"
-SIGNED_MANIFEST = ROOT / "release" / "v1.3.1.sha256"
-# Commit authenticated by the immutable, signed v1.3.1 tag.
-SIGNED_RELEASE_COMMIT = "b728c2b3438ab31a4c112425fca6bd86d1288646"
+SIGNED_MANIFEST = ROOT / "release" / "v1.4.0.sha256"
+# Synthetic identity used only in the pure gate regression. Real tags are verified below.
+SIGNED_RELEASE_COMMIT = "b" * 40
 UPSTREAM_PATCH_LICENSE = """MIT License
 
 Copyright (c) 2025 Nous Research
@@ -132,10 +134,10 @@ def _load_smoke_module():
     return module
 
 
-def _requires_signed_manifest(head: str, clean: bool, ref: str) -> bool:
-    exact_source = head == SIGNED_RELEASE_COMMIT and clean
-    if ref == "refs/tags/v1.3.1" and not exact_source:
-        raise AssertionError("v1.3.1 tag build does not match its authenticated source")
+def _requires_signed_manifest(head: str, clean: bool, ref: str, signed_commit: str | None = SIGNED_RELEASE_COMMIT) -> bool:
+    exact_source = signed_commit is not None and head == signed_commit and clean
+    if ref == "refs/tags/v1.4.0" and not exact_source:
+        raise AssertionError("v1.4.0 tag build does not match its authenticated source")
     return exact_source
 
 
@@ -150,19 +152,35 @@ def _is_signed_release_source() -> bool:
                                 cwd=ROOT, env=env, check=False, capture_output=True, timeout=10)
     if difference.returncode not in (0, 1):
         raise AssertionError("Could not establish release source identity")
+    tag = "refs/tags/v1.4.0"
+    tag_type = subprocess.run(["git", "cat-file", "-t", tag], cwd=ROOT, env=env,
+                              capture_output=True, text=True, timeout=10)
+    signed_commit = None
+    if tag_type.returncode == 0:
+        name = subprocess.run(["git", "for-each-ref", "--format=%(tag)", tag], cwd=ROOT,
+                              env=env, capture_output=True, text=True, check=True, timeout=10)
+        verify = subprocess.run(["git", "-c", "gpg.format=ssh", "-c", "gpg.ssh.allowedSignersFile=/dev/null",
+                                 "verify-tag", "--raw", tag], cwd=ROOT, env=env,
+                                capture_output=True, text=True, timeout=10)
+        good = 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'
+        if tag_type.stdout.strip() != "tag" or name.stdout.strip() != "v1.4.0" or good not in verify.stderr.splitlines():
+            raise AssertionError("release tag is not authenticated")
+        revision = subprocess.run(["git", "rev-parse", "--verify", tag + "^{commit}"], cwd=ROOT,
+                                  env=env, capture_output=True, text=True, check=True, timeout=10)
+        signed_commit = revision.stdout.strip()
     return _requires_signed_manifest(head.stdout.strip(), difference.returncode == 0,
-                                     os.environ.get("GITHUB_REF", ""))
+                                     os.environ.get("GITHUB_REF", ""), signed_commit)
 
 
 class ReleaseMetadataTests(unittest.TestCase):
     def test_signed_manifest_gate_distinguishes_candidates_from_authenticated_release(self):
         self.assertTrue(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, True, "refs/heads/main"))
-        self.assertTrue(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, True, "refs/tags/v1.3.1"))
+        self.assertTrue(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, True, "refs/tags/v1.4.0"))
         self.assertFalse(_requires_signed_manifest(SIGNED_RELEASE_COMMIT, False, "refs/heads/fix"))
         self.assertFalse(_requires_signed_manifest("a" * 40, True, "refs/pull/1/merge"))
         for head, clean in (("a" * 40, True), (SIGNED_RELEASE_COMMIT, False)):
             with self.subTest(head=head, clean=clean), self.assertRaisesRegex(AssertionError, "authenticated source"):
-                _requires_signed_manifest(head, clean, "refs/tags/v1.3.1")
+                _requires_signed_manifest(head, clean, "refs/tags/v1.4.0")
 
     def test_version_license_homepage_and_changelog_agree(self) -> None:
         manifest = json.loads((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
@@ -170,14 +188,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
-        self.assertEqual(manifest["version"], "1.3.1")
+        self.assertEqual(manifest["version"], "1.4.0")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(
             manifest["homepage"],
             "https://github.com/thetasigmaio/hermes-t3-control",
         )
-        self.assertIn("## [1.3.1] - 2026-09-06", changelog)
-        self.assertIn("v1.3.1/install-t3.sh", readme)
+        self.assertIn("## [1.4.0] - 2026-09-12", changelog)
+        self.assertIn("v1.4.0/install-t3.sh", readme)
         self.assertIn("first non-thread-mutating prompt", changelog)
         self.assertIn("MIT", readme)
         self.assertTrue(license_text.startswith("MIT License\n"))
@@ -674,7 +692,7 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
             gateway,
         )
         self.assertIn(
-            "uv run --frozen --project hermes --extra dev pytest -q",
+            "uv run --frozen --extra dev bash scripts/run_tests.sh -j 2",
             gateway,
         )
         self.assertNotIn("--with pytest", gateway)
@@ -688,17 +706,17 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         upload = workflow.split("- name: Upload release artifacts", 1)[1]
         self.assertIn("python -B scripts/build_release.py --output-dir dist", workflow)
         self.assertIn(
-            "python -B scripts/verify_release.py dist/hermes-t3-control-1.3.1.tar.gz.sha256",
+            "python -B scripts/verify_release.py dist/hermes-t3-control-1.4.0.tar.gz.sha256",
             workflow,
         )
         paths = re.findall(r"(?m)^            (dist/\S+)$", upload)
         self.assertEqual(
             paths,
             [
-                "dist/hermes-t3-control-1.3.1.tar.gz",
-                "dist/hermes-t3-control-1.3.1.tar.gz.sha256",
-                "dist/hermes-gateway-continuation-1.3.1.patch",
-                "dist/hermes-gateway-continuation-1.3.1.patch.sha256",
+                "dist/hermes-t3-control-1.4.0.tar.gz",
+                "dist/hermes-t3-control-1.4.0.tar.gz.sha256",
+                "dist/hermes-gateway-continuation-1.4.0.patch",
+                "dist/hermes-gateway-continuation-1.4.0.patch.sha256",
                 "dist/install-t3.sh",
                 "dist/install-t3.sh.sha256",
             ],

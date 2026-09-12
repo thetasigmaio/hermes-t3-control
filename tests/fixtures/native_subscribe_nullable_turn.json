@@ -1,0 +1,271 @@
+[
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884787,
+      "eventId": "fixture-id-36",
+      "type": "thread.message-sent",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.364Z",
+      "commandId": "fixture-id-14",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "messageId": "fixture-id-7",
+        "role": "user",
+        "turnId": null,
+        "streaming": false
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884789,
+      "eventId": "fixture-id-15",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.364Z",
+      "commandId": "server:provider-session-set:fixture-id-3",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "starting",
+          "activeTurnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884790,
+      "eventId": "fixture-id-19",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.392Z",
+      "commandId": "provider:fixture-id-23:thread-session-set:fixture-id-20",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "starting",
+          "activeTurnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884791,
+      "eventId": "fixture-id-2",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.364Z",
+      "commandId": "server:provider-session-set:fixture-id-4",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "starting",
+          "activeTurnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884792,
+      "eventId": "fixture-id-16",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.853Z",
+      "commandId": "provider:fixture-id-18:thread-session-set:fixture-id-6",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "starting",
+          "activeTurnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884793,
+      "eventId": "fixture-id-27",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.873Z",
+      "commandId": "provider:fixture-id-22:thread-session-set:fixture-id-33",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "starting",
+          "activeTurnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884794,
+      "eventId": "fixture-id-28",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:35.948Z",
+      "commandId": "provider:fixture-id-9:thread-session-set:fixture-id-32",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "running",
+          "activeTurnId": "fixture-id-1"
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884800,
+      "eventId": "fixture-id-21",
+      "type": "thread.message-sent",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:42.256Z",
+      "commandId": "provider:fixture-id-11:assistant-delta-finalize:fixture-id-8",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "messageId": "fixture-id-25",
+        "role": "assistant",
+        "turnId": "fixture-id-1",
+        "streaming": true
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884801,
+      "eventId": "fixture-id-35",
+      "type": "thread.message-sent",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:42.256Z",
+      "commandId": "provider:fixture-id-11:assistant-complete:fixture-id-5",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "messageId": "fixture-id-25",
+        "role": "assistant",
+        "turnId": "fixture-id-1",
+        "streaming": false
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884802,
+      "eventId": "fixture-id-38",
+      "type": "thread.activity-appended",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:42.291Z",
+      "commandId": "provider:fixture-id-17:thread-activity-append:fixture-id-34",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "activity": {
+          "id": "fixture-id-17",
+          "kind": "context-window.updated",
+          "turnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884803,
+      "eventId": "fixture-id-24",
+      "type": "thread.session-set",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:42.302Z",
+      "commandId": "provider:fixture-id-31:thread-session-set:fixture-id-30",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "session": {
+          "threadId": "fixture-id-37",
+          "status": "ready",
+          "activeTurnId": null
+        }
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884804,
+      "eventId": "fixture-id-26",
+      "type": "thread.turn-diff-completed",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:42.302Z",
+      "commandId": "server:checkpoint-turn-diff-complete:fixture-id-13",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "turnId": "fixture-id-1"
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "sequence": 884805,
+      "eventId": "fixture-id-10",
+      "type": "thread.activity-appended",
+      "aggregateKind": "thread",
+      "aggregateId": "fixture-id-37",
+      "occurredAt": "2026-09-09T21:01:42.302Z",
+      "commandId": "server:checkpoint-captured-activity:fixture-id-29",
+      "metadata": {},
+      "payload": {
+        "threadId": "fixture-id-37",
+        "activity": {
+          "id": "fixture-id-12",
+          "kind": "checkpoint.captured",
+          "turnId": "fixture-id-1"
+        }
+      }
+    }
+  },
+  {
+    "kind": "synchronized"
+  }
+]
