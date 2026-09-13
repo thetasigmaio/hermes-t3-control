@@ -10,11 +10,13 @@ Check on your T3 coding tasks and continue them from Hermes. You can review prog
 
 ## 1. Install
 
-[Download `install-t3.sh`](https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/install-t3.sh), open a Linux terminal in the downloaded file's folder, and run:
+[Download `install-t3.sh`](https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/install-t3.sh), open a Linux terminal in the downloaded file's folder, and run:
 
 ```bash
 bash install-t3.sh
 ```
+
+Installer SHA-256: `dd5d6210c5d78e65925a083b369a5e45e7d1312dd1c2b97fc67b1b059662200e`.
 
 Confirm the Hermes profile shown by the installer.
 
@@ -64,7 +66,9 @@ Hermes should show your T3 tasks and their current progress, or tell you that no
 
 ## Experimental continuation
 
-Same-conversation verification and optional Telegram completion notices are experimental and off by default. They require a separate patch for one exact Hermes revision; follow [Experimental continuation](docs/experimental-continuation.md) if you want to evaluate it.
+Same-conversation verification and optional Telegram completion notices are experimental and off by default. Ordinary sends require automatic completion and fail before dispatch without the matching host APIs. On stock Hermes, intentionally send without automatic reporting using `completion_policy: "none"`.
+
+Automatic reporting requires a separate patch for one exact Hermes revision. The upstream PR is not merged; installing this plugin alone does not patch Hermes. Follow [Experimental continuation](docs/experimental-continuation.md) to install the matching v1.5.0 host patch.
 
 ## Help and reference
 

@@ -2,6 +2,16 @@
 
 All notable changes to Hermes T3 Control are documented in this file.
 
+## [1.5.0] - 2026-09-13
+
+- Make ordinary sends register automatic completion before dispatch, with an
+  explicit `completion_policy: "none"` escape for intentional unwatched sends.
+- Preserve automatic handoff through native Desktop and gateway callbacks,
+  with conservative recovery and duplicate-delivery protection.
+- Publish the matching experimental host patch for the exact ad03f20d base;
+  its upstream PR is not merged and stock Hermes needs unwatched sends.
+- Add native callback probes to the release CI gate.
+
 ## [1.4.0] - 2026-09-12
 
 - Restore opt-in same-session Desktop continuation with explicit per-turn
@@ -142,3 +152,5 @@ All notable changes to Hermes T3 Control are documented in this file.
 [1.2.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.2.0
 [1.1.1]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.1.1
 [1.1.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.1.0
+
+[1.5.0]: https://github.com/thetasigmaio/hermes-t3-control/releases/tag/v1.5.0

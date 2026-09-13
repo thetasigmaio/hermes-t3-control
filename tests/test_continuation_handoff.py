@@ -71,6 +71,26 @@ class ScopedHandoffTests(unittest.TestCase):
                 {"thread": {"messages": [{"id": "fixture-id-7", "role": "user", "turnId": None}]}})
             self.assertIsNotNone(mapped)
 
+    def test_gateway_captured_native_subscribe_stream_maps_reserved_nullable_user(self):
+        # Actual authenticated 2026-09-09 subscribeThread catch-up frames, text removed.
+        frames = json.loads((Path(__file__).parent / "fixtures/native_subscribe_nullable_turn.json").read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            store = ContinuationStore(directory)
+            store.initialize()
+            binding = store.bind(baseline=(884768, "2026-09-09T21:01:30Z"),
+                **binding_values(platform="telegram",
+                    t3_thread_id="fixture-id-37"))
+            store.reserve_source(binding, "fixture-id-7")
+            for frame in frames:
+                if frame["kind"] == "event":
+                    event = frame["event"]
+                    store.ingest(binding, cursor_sequence=event["sequence"], event=None, native_event=event)
+            self.assertEqual(store.reserved_turn(binding), "fixture-id-1")
+            mapped = continuation.reserved_event(store, binding,
+                envelope(binding, sequence=884803, turn_id="fixture-id-1"),
+                {"thread": {"messages": [{"id": "fixture-id-7", "role": "user", "turnId": None}]}})
+            self.assertIsNotNone(mapped)
+
     def test_captured_native_witness_rejects_import_and_missing_command_or_message_fields(self):
         captured = json.loads((Path(__file__).parent / "fixtures/native_subscribe_nullable_turn.json").read_text())
         for field, value in (("commandId", None), ("metadata", {"historyImport": True}),
@@ -252,3 +272,181 @@ class ScopedHandoffTests(unittest.TestCase):
             self.assertEqual(successor.platform, "desktop")
             self.assertEqual(store.get_binding(old.binding_id).platform, "telegram")
             self.assertEqual(store.get_binding(old.binding_id).state, "stopped")
+
+class AutomaticMissionTests(unittest.TestCase):
+    def make_store(self, directory):
+        store = ContinuationStore(directory)
+        store.initialize()
+        return store
+
+    def auto(self, store, name="auto-1", **overrides):
+        return store.bind_automatic(baseline=(3, utc_now()), message_id=name + "-message",
+            **binding_values(binding_id=name, sunsama_task_id="", t3_owner_id="thread-1", **overrides))
+
+    def test_parallel_sends_reserve_exactly_one_active_mission(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_store(directory)
+            def attempt(index):
+                try:
+                    return self.auto(ContinuationStore(directory), f"auto-{index}").binding_id
+                except ContinuationStateError:
+                    return None
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(attempt, range(2)))
+            self.assertEqual(sum(result is not None for result in results), 1)
+            store = ContinuationStore(directory)
+            binding = store.active_bindings("default")[0]
+            self.assertEqual(store.reserved_source(binding), binding.binding_id + "-message")
+
+    def test_terminal_uncertain_history_is_byte_preserved_and_not_replayed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            old = self.auto(store)
+            event = dict(envelope(old, sequence=4), source_message_id="auto-1-message")
+            self.assertTrue(store.ingest(old, cursor_sequence=4, event=event))
+            store.claim_next(old.binding_id)
+            store.finish(old.binding_id, 4, "uncertain", receipt={"status": "unknown"})
+            store.set_binding_state(old.binding_id, "stopped")
+            with store._connect() as db:
+                before = [tuple(row) for row in db.execute("SELECT * FROM events WHERE binding_id=?", (old.binding_id,))]
+                binding_before = tuple(db.execute("SELECT * FROM bindings WHERE binding_id=?", (old.binding_id,)).fetchone())
+            fresh = self.auto(store, "auto-2")
+            self.assertEqual(fresh.max_continuations, 1)
+            with store._connect() as db:
+                self.assertEqual(before, [tuple(row) for row in db.execute("SELECT * FROM events WHERE binding_id=?", (old.binding_id,))])
+                self.assertEqual(binding_before, tuple(db.execute("SELECT * FROM bindings WHERE binding_id=?", (old.binding_id,)).fetchone()))
+            self.assertIsNone(store.claim_next(old.binding_id))
+
+    def test_paused_queued_dispatching_and_foreign_identity_refuse_atomically(self):
+        for state in ("paused", "queued", "dispatching", "foreign"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                store = self.make_store(directory)
+                old = self.auto(store)
+                if state == "paused":
+                    store.set_binding_state(old.binding_id, "paused")
+                elif state in {"queued", "dispatching"}:
+                    store.ingest(old, cursor_sequence=4, event=dict(envelope(old, sequence=4), source_message_id="auto-1-message"))
+                    if state == "dispatching":
+                        store.claim_next(old.binding_id)
+                    with store._connect() as db:
+                        db.execute("UPDATE bindings SET state='stopped' WHERE binding_id=?", (old.binding_id,))
+                with self.assertRaises(ContinuationStateError):
+                    self.auto(store, "auto-2", **({"hermes_session_id": "foreign"} if state == "foreign" else {}))
+                with store._connect() as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM bindings").fetchone()[0], 1)
+                    self.assertEqual(db.execute("SELECT count(*) FROM source_reservations").fetchone()[0], 1)
+
+    def test_terminal_foreign_history_does_not_inherit_or_block_new_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            old = self.auto(store)
+            store.set_binding_state(old.binding_id, "stopped")
+            with store._connect() as db:
+                before = tuple(db.execute("SELECT * FROM bindings WHERE binding_id=?", (old.binding_id,)).fetchone())
+            fresh = self.auto(store, "auto-2", profile_name="other", hermes_session_id="current", t3_environment_id="current-env")
+            self.assertEqual(fresh.hermes_session_id, "current")
+            with store._connect() as db:
+                self.assertEqual(before, tuple(db.execute("SELECT * FROM bindings WHERE binding_id=?", (old.binding_id,)).fetchone()))
+
+    def test_completed_acknowledged_budget_retires_only_settled_active_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            old = self.auto(store)
+            event = dict(envelope(old, sequence=4), source_message_id="auto-1-message")
+            store.ingest(old, cursor_sequence=4, event=event)
+            store.claim_next(old.binding_id)
+            store.finish(old.binding_id, 4, "completed", receipt={"status": "completed"})
+            store.acknowledge(old.binding_id, event["source_event_id"])
+            fresh = self.auto(store, "auto-2")
+            self.assertEqual(store.get_binding(old.binding_id).state, "stopped")
+            self.assertEqual(fresh.state, "active")
+
+    def test_second_readiness_exception_retires_undispatched_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = {"profile_name": "default", "session_id": "session-1"}
+            ctx = SimpleNamespace(state=SimpleNamespace(data_dir=directory), current_desktop_destination=lambda: target,
+                desktop_continuation_readiness=mock.Mock(side_effect=[{"ready": True}, RuntimeError("gone")]),
+                get_config=lambda key, default=None: True if key == "continuation_enabled" else default)
+            before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready"))
+            transport = SimpleNamespace(get_environment_descriptor=lambda: {"environmentId": "environment-1"})
+            with self.assertRaises(RuntimeError):
+                continuation_handoff.prepare_handoff(ctx, None, "thread-1", before, transport, "message-1")
+            ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+            result = continuation_handoff.prepare_handoff(ctx, None, "thread-1", before, transport, "message-2")
+            self.assertTrue(result["armed"])
+
+class LocalV2MigrationTests(unittest.TestCase):
+    def fixture(self, directory):
+        import sqlite3
+        store = ContinuationStore(directory)
+        store.data_dir.mkdir(exist_ok=True)
+        store.key_path.write_bytes(b"k" * 32)
+        schema = json.loads((Path(__file__).parent / "fixtures/local-v2-schema.json").read_text())
+        with store._connect() as db:
+            for kind, name, sql in sorted(schema, key=lambda row: row[0] == "index"):
+                db.execute(sql)
+            db.execute("INSERT INTO meta VALUES('schema_version','2')")
+            db.execute("INSERT INTO meta VALUES('source_reservation_version','1')")
+            values = binding_values(sunsama_task_id="")
+            columns = list(values) + ["state", "cursor_sequence", "created_at", "updated_at", "baseline_captured"]
+            db.execute(f"INSERT INTO bindings({','.join(columns)}) VALUES({','.join('?' for _ in columns)})", tuple(values.values()) + ("stopped", 0, utc_now(), utc_now(), 1))
+            signed = dict(values, source_message_id="source-message", status="uncertain")
+            encoded = json.dumps(signed)
+            signature = store.sign(signed)
+            db.execute("INSERT INTO source_reservations VALUES(?,?,?)", ("mission-1", encoded, signature))
+            db.execute("INSERT INTO notification_targets VALUES(?,?,?)", ("mission-1", encoded, signature))
+            db.execute("INSERT INTO notifications VALUES(?,?,?,?,?,?,?,?)", ("mission-1", 1, encoded, signature, "uncertain", 1, 0, '{"status":"uncertain"}',))
+            db.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("mission-1", 1, "event-1", "turn-1", "external_tool_completed", utc_now(), encoded, signature, "uncertain", 1, 0, '{"status":"uncertain"}', None, utc_now(), utc_now()))
+        return store
+
+    def test_exact_local_v2_migration_preserves_signed_rows_and_empty_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.fixture(directory)
+            with store._connect() as db:
+                old = {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table}")] for table in ("source_reservations", "notification_targets", "notifications", "events", "binding_lineage")}
+            key = store.key_path.read_bytes()
+            store.initialize()
+            store.initialize()
+            with store._connect() as db:
+                self.assertEqual(old, {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table}")] for table in old})
+            self.assertTrue(store.get_binding("mission-1").baseline_captured)
+            self.assertEqual(store.get_binding("mission-1").cursor_sequence, 0)
+            self.assertEqual(store.key_path.read_bytes(), key)
+
+    def test_unknown_shape_and_injected_failure_leave_database_unchanged(self):
+        for corrupt in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                store = self.fixture(directory)
+                if corrupt:
+                    with store._connect() as db:
+                        db.execute("CREATE TABLE unexpected (id TEXT)")
+                before = store.db_path.read_bytes()
+                with mock.patch.object(store, "_create_bindings_table", side_effect=RuntimeError("injected")):
+                    with self.assertRaises((ContinuationStateError, RuntimeError)):
+                        store.initialize()
+                self.assertEqual(store.db_path.read_bytes(), before)
+
+
+    def test_duplicate_live_rows_wrong_metadata_and_bad_signature_refuse_without_mutation(self):
+        for fault in ("duplicate", "metadata", "signature", "missing_key"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                store = self.fixture(directory)
+                with store._connect() as db:
+                    if fault == "duplicate":
+                        db.execute("UPDATE bindings SET state='active'")
+                        row = dict(db.execute("SELECT * FROM bindings").fetchone())
+                        row["binding_id"] = "duplicate"
+                        db.execute(f"INSERT INTO bindings({','.join(row)}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
+                    elif fault == "metadata":
+                        db.execute("INSERT INTO meta VALUES('unexpected','1')")
+                    elif fault == "signature":
+                        db.execute("UPDATE events SET envelope_mac='wrong'")
+                if fault == "missing_key":
+                    store.key_path.unlink()
+                before = store.db_path.read_bytes()
+                with self.assertRaises(ContinuationStateError):
+                    store.initialize()
+                self.assertEqual(store.db_path.read_bytes(), before)
+                if fault == "missing_key":
+                    self.assertFalse(store.key_path.exists())

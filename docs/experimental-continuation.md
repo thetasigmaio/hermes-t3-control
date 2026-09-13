@@ -1,8 +1,8 @@
 # Experimental same-session continuation
 
-The eleven basic tools do not need this feature. The continuation observer is disabled by default and requires native Hermes gateway and Desktop APIs absent from the stock revisions listed in our compatibility matrix. Installing the basic plugin does not add these APIs.
+Read/control tools do not need this feature. An ordinary `t3_thread_send` defaults to required automatic completion; an intentional unwatched send must set `completion_policy: "none"`. The continuation observer is disabled by default and requires native Hermes gateway and Desktop APIs absent from the stock revisions listed in our compatibility matrix. Installing the basic plugin does not add these APIs.
 
-The public host patch is supported only against this exact clean upstream commit:
+The matching v1.5.0 experimental host patch adds the required automatic registration APIs. The upstream PR is not merged. Install the plugin and host patch from the same release. The host patch requires this exact clean upstream base:
 
 ```text
 ad03f20dd61919ca2135d6904e787a94284aacaf
@@ -29,34 +29,34 @@ The detached checksum detects corruption but is not an authenticity proof by its
   safe_git -C "$RELEASE_DIR/repo" init -q
   safe_git -C "$RELEASE_DIR/repo" -c protocol.file.allow=never fetch -q \
     --no-tags https://github.com/thetasigmaio/hermes-t3-control.git \
-    'refs/tags/v1.4.0:refs/tags/v1.4.0'
-  test "$(safe_git -C "$RELEASE_DIR/repo" cat-file -t refs/tags/v1.4.0)" = tag
-  test "$(safe_git -C "$RELEASE_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.4.0)" = v1.4.0
+    'refs/tags/v1.5.0:refs/tags/v1.5.0'
+  test "$(safe_git -C "$RELEASE_DIR/repo" cat-file -t refs/tags/v1.5.0)" = tag
+  test "$(safe_git -C "$RELEASE_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.5.0)" = v1.5.0
   TAG_VERIFY="$(safe_git -C "$RELEASE_DIR/repo" -c gpg.format=ssh \
-    -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.4.0 2>&1 || true)"
+    -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.5.0 2>&1 || true)"
   if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
     printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
     exit 1
   fi
-  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.4.0^{commit}')"
+  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.5.0^{commit}')"
   printf '%s\n' "$RELEASE_REF" | grep -Eq '^[0-9a-f]{40}$'
   safe_git -C "$RELEASE_DIR/repo" checkout -q --detach "$RELEASE_REF"
   safe_git -C "$RELEASE_DIR/repo" show \
-    "$RELEASE_REF:release/v1.4.0.sha256" > "$RELEASE_DIR/authenticated.sha256"
+    "$RELEASE_REF:release/v1.5.0.sha256" > "$RELEASE_DIR/authenticated.sha256"
   curl --fail --silent --show-error --location --proto '=https' \
-    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.4.0.patch" \
-    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/hermes-gateway-continuation-1.4.0.patch
+    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.5.0.patch" \
+    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/hermes-gateway-continuation-1.5.0.patch
   curl --fail --silent --show-error --location --proto '=https' \
-    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.4.0.patch.sha256" \
-    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/hermes-gateway-continuation-1.4.0.patch.sha256
-  grep '  hermes-gateway-continuation-1.4.0.patch$' \
+    --proto-redir '=https' -o "$RELEASE_DIR/hermes-gateway-continuation-1.5.0.patch.sha256" \
+    https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/hermes-gateway-continuation-1.5.0.patch.sha256
+  grep '  hermes-gateway-continuation-1.5.0.patch$' \
     "$RELEASE_DIR/authenticated.sha256" > "$RELEASE_DIR/expected.sha256"
-  cmp -- "$RELEASE_DIR/expected.sha256" "$RELEASE_DIR/hermes-gateway-continuation-1.4.0.patch.sha256"
+  cmp -- "$RELEASE_DIR/expected.sha256" "$RELEASE_DIR/hermes-gateway-continuation-1.5.0.patch.sha256"
   (cd "$RELEASE_DIR" && sha256sum -c expected.sha256)
   safe_git -C "$RELEASE_DIR/repo" show \
     "$RELEASE_REF:patches/hermes-gateway-continuation-ad03f20d.patch" \
-    | cmp - "$RELEASE_DIR/hermes-gateway-continuation-1.4.0.patch"
-  cp "$RELEASE_DIR/hermes-gateway-continuation-1.4.0.patch" ./hermes-gateway-continuation-1.4.0.patch
+    | cmp - "$RELEASE_DIR/hermes-gateway-continuation-1.5.0.patch"
+  cp "$RELEASE_DIR/hermes-gateway-continuation-1.5.0.patch" ./hermes-gateway-continuation-1.5.0.patch
 )
 ```
 
@@ -72,8 +72,8 @@ cd hermes-continuation
 git checkout --detach ad03f20dd61919ca2135d6904e787a94284aacaf
 test "$(git rev-parse HEAD)" = ad03f20dd61919ca2135d6904e787a94284aacaf
 test -z "$(git status --porcelain)"
-git apply --check ../hermes-gateway-continuation-1.4.0.patch
-git apply ../hermes-gateway-continuation-1.4.0.patch
+git apply --check ../hermes-gateway-continuation-1.5.0.patch
+git apply ../hermes-gateway-continuation-1.5.0.patch
 git diff --check
 uv sync --frozen --python 3.11 --extra dev --extra messaging
 uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2 \
@@ -112,37 +112,34 @@ requires that authenticated connection, its exact physical session, a live
 consumer, and the injection grant. A shared database or matching topic is not
 proof of continuity. Missing readiness rejects a required handoff before dispatch.
 
-## Register each authorized handoff
+## Automatic return to the current conversation
 
-In a patched Desktop conversation, `t3_thread_send` accepts this optional field:
+With the matching patched host and observer ready, an ordinary send needs only its task:
 
 ```json
-{
-  "completion_policy": "required",
-  "continuation": {
-    "binding_id": "new-mission",
-    "owner_id": "EXACT_OWNER",
-    "environment_id": "EXACT_ENVIRONMENT",
-    "source_identity": "OPERATOR_AUTHORITY",
-    "expected_turn_id": "LAST_OBSERVED_TURN",
-    "followup_scope": "Read the result and report once; no further writes.",
-    "max_continuations": 1,
-    "notify_telegram": false
-  }
-}
+{"thread_id": "EXACT_THREAD", "message": "Perform the authorized task", "busy_policy": "queue"}
 ```
 
-Supply the tool's ordinary exact thread and message arguments as well. Use the
-exact latest turn from the source read for `expected_turn_id`, or null when no
-turn exists. With continuation enabled, unwatched sends must explicitly choose
-`completion_policy: "none"`. The host
-resolves the destination from the current authenticated conversation; task output
-cannot choose it. A required handoff must return a confirmed registration along
-with dispatch. If it fails, do not silently send again or claim monitoring is
-active. The native handoff has deterministic contract coverage; a recent local
-attempt returned a sanitized `internal_error` whose cause was not established.
-The live accepted path was the supported explicit CLI registration below. CLI
-success is not evidence that every native caller supplies the required context.
+The host resolves the current authenticated Desktop or gateway conversation,
+including a Telegram-origin conversation reopened in Desktop. Registration pins
+its exact physical session and route, the authenticated T3 environment, and the
+new source message before dispatch. No token, URL, binding ID, ledger, or callback
+argument is required. A missing or unsupported consumer fails before dispatch.
+`completion_policy: "required"` may be stated explicitly; `none` deliberately
+requests an unwatched send and reports `armed: false`.
+
+Automatic scope permits one result/artifact read and one report in that same
+conversation. It authorizes no source/product/Sunsama writes or further work.
+The finite budget and source correlation are enforced by the plugin; the scope
+is an instruction to the receiving agent, not a filesystem sandbox. The optional
+`continuation` object remains for explicitly authorized extended Desktop missions;
+it is not part of the ordinary send workflow.
+
+Registration and `consumer_ready` prove pre-dispatch readiness, not delivery.
+Native contract tests exercise real PluginContext and worker context propagation;
+live Desktop and Telegram acceptance still requires coordinated activation and an
+authenticated client. Never treat an ambiguous source dispatch or receipt as
+permission to resend the task.
 
 For operator registration before a new source turn, use `bind` with an explicit
 future `--source-message-id`; that exact message must then be dispatched. To attach
@@ -190,7 +187,9 @@ acknowledge once. Completion of one turn never means completion of a product.
 
 ## Renewal, pause, and recovery
 
-Every new mission requires fresh scope and a fresh binding ID. Exhausted bindings
+Automatic sends create fresh scope and identity without renewing old authority. Terminal historical rows remain unchanged, including uncertain receipts. Paused, queued, dispatching, foreign-session, or unfinished active missions refuse automatic registration. Only a fully acknowledged active generation with completed receipts and exhausted budget can be retired. A failed second readiness check cancels its own undispatched reservation.
+
+Explicit extended missions require fresh scope and a fresh binding ID. Exhausted bindings
 remain exhausted across restart. Explicitly stop the acknowledged predecessor,
 then use `renew --replaces OLD_MISSION_ID` with every destination/scope argument
 supplied again. The Sunsama field may still be omitted. The predecessor must have
@@ -204,7 +203,7 @@ This is explicit new authority, never automatic inheritance from a topic label.
 Old audit rows, source events, and generation lineage are retained; old events are
 not replayed. Public schema v1/v2/v3 ledgers migrate transactionally to v4,
 preserving empty captured baselines, authority, signed receipts, and lineage.
-Experimental local v2 databases with a different table shape remain rejected.
+The one audited local Desktop v2 layout also migrates transactionally: its complete DDL and metadata signature must match, the original HMAC key and all signed rows must verify, and duplicate live generations are rejected. Existing empty baselines, envelopes, MACs, receipts, and notification state are preserved. Unknown experimental layouts remain rejected.
 Do not copy rows, edit schema metadata, or downgrade a v4 ledger to older code.
 
 The authenticated T3 stream uses durable sequence cursors. Restart recovers
@@ -221,11 +220,13 @@ controls before authorizing a new attempt.
 
 ## Roll back
 
+Before first v1.5.0 initialization, stop both consumers and take a consistent private backup of the ledger database and its original HMAC key. Code rollback alone cannot undo schema migration. Restoring that old ledger backup is valid only before any new dispatch or receipt has been accepted; afterward preserve the newer audit and use a forward fix or compatible recovery. Never restore an old snapshot over newly accepted work.
+
 Stop the owning Hermes process. From the same patched checkout, require the patch to reverse cleanly, reverse it, and confirm the exact upstream state:
 
 ```bash
-git apply --reverse --check ../hermes-gateway-continuation-1.4.0.patch
-git apply --reverse ../hermes-gateway-continuation-1.4.0.patch
+git apply --reverse --check ../hermes-gateway-continuation-1.5.0.patch
+git apply --reverse ../hermes-gateway-continuation-1.5.0.patch
 git diff --check
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = ad03f20dd61919ca2135d6904e787a94284aacaf

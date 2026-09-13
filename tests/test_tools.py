@@ -70,14 +70,26 @@ def invoke(
     credential: str | None = None,
     **kwargs: object,
 ) -> dict:
-    handler = tools.bind_handler(context or FakeContext(server.base_url), operation)
+    import tempfile
+    from types import SimpleNamespace
+    context = context or FakeContext(server.base_url)
+    # Basic transport fixtures deliberately opt out; automatic cases enable the observer.
+    if operation is tools.t3_thread_send and isinstance(args, dict) and context.get_config("continuation_enabled", False) is not True:
+        args = {"completion_policy": "none", **args}
+    temporary = tempfile.TemporaryDirectory()
+    if not hasattr(context, "state"):
+        context.state = SimpleNamespace(data_dir=temporary.name)
+    handler = tools.bind_handler(context, operation)
     resolved_credential = server.token if credential is None else credential
     with mock.patch.object(
         tools,
         "_profile_secret",
         return_value=resolved_credential,
     ), mock.patch.object(auth, "_profile_secret", return_value=resolved_credential):
-        return json.loads(handler(args, **kwargs))
+        try:
+            return json.loads(handler(args, **kwargs))
+        finally:
+            temporary.cleanup()
 
 
 def captured_dispatch(store: list[dict]):
@@ -1295,6 +1307,20 @@ class PublicArgumentPreflightTests(unittest.TestCase):
 
 
 class AgentFacingSendToolTests(unittest.TestCase):
+    def test_explicit_non_object_continuation_rejected_before_transport(self):
+        context = FakeContext("http://127.0.0.1:9999")
+        handler = tools.bind_handler(context, tools.t3_thread_send)
+        for value in (None, False, [], "", 1):
+            with self.subTest(value=value), mock.patch.object(
+                tools, "_execute_operation", return_value={"ok": True}
+            ) as operation:
+                result = json.loads(handler({
+                    "thread_id": "thread-1", "message": "Harmless task",
+                    "busy_policy": "queue", "continuation": value,
+                }))
+                self.assertEqual(result.get("error_code"), "invalid_input", result)
+                operation.assert_not_called()
+
     def test_required_send_registers_reserved_message_before_normal_and_model_switch_dispatch(self):
         import tempfile
         from types import SimpleNamespace
@@ -1321,9 +1347,11 @@ class AgentFacingSendToolTests(unittest.TestCase):
                     return Response(value=detail_snapshot(sequence=4, messages=[projected_message(
                         message_id=command["message"]["messageId"], role="user", text="Scoped work",
                         turn_id=None, created_at=command["createdAt"])], turn=latest_turn(turn_id="turn-old", state="completed"), current_session=session(status="ready")))
-                def switched(transport, snapshot, selection, text, *, message_id=None):
+                def switched(transport, snapshot, selection, text, *, message_id=None, before_source_dispatch=None):
                     self.assertIsNotNone(message_id)
                     assert_reserved(message_id)
+                    if before_source_dispatch is not None:
+                        before_source_dispatch()
                     return {"message_id": message_id}
                 with LoopbackServer([Response(value=before), Response(value={"environmentId": "environment-1", "serverVersion": "test"}), dispatch, projected]) as server:
                     ctx = FakeContext(server.base_url)
@@ -1342,14 +1370,220 @@ class AgentFacingSendToolTests(unittest.TestCase):
                 self.assertEqual(result["continuation"]["source_message_id"], result["message_id"])
                 self.assertEqual(len(commands), 0 if model_switch else 1)
 
-    def test_enabled_continuation_requires_explicit_completion_policy_before_dispatch(self):
+    def test_automatic_send_registers_reserved_message_before_normal_and_model_switch_dispatch(self):
+        import tempfile
+        from types import SimpleNamespace
+        from continuation_state import ContinuationStore
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="turn-old", state="completed"), current_session=session(status="ready"))
+        authority = {"binding_id": "mission-1", "owner_id": "owner-1", "environment_id": "environment-1",
+                     "sunsama_task_id": "task-1", "source_identity": "source-1", "followup_scope": "none",
+                     "max_continuations": 1, "expected_turn_id": "turn-old"}
+        for model_switch in (False, True):
+            with self.subTest(model_switch=model_switch), tempfile.TemporaryDirectory() as directory:
+                commands = []
+                def assert_reserved(message_id):
+                    store = ContinuationStore(directory)
+                    binding = store.active_bindings("default")[0]
+                    self.assertEqual(store.reserved_source(binding), message_id)
+                    self.assertEqual(binding.hermes_session_id, "physical-1")
+                def dispatch(request):
+                    command = json.loads(request["body"])
+                    assert_reserved(command["message"]["messageId"])
+                    commands.append(command)
+                    return Response(value={"sequence": 4})
+                def projected(request):
+                    command = commands[0]
+                    return Response(value=detail_snapshot(sequence=4, messages=[projected_message(
+                        message_id=command["message"]["messageId"], role="user", text="Scoped work",
+                        turn_id=None, created_at=command["createdAt"])], turn=latest_turn(turn_id="turn-old", state="completed"), current_session=session(status="ready")))
+                def switched(transport, snapshot, selection, text, *, message_id=None, before_source_dispatch=None):
+                    self.assertIsNotNone(message_id)
+                    assert_reserved(message_id)
+                    if before_source_dispatch is not None:
+                        before_source_dispatch()
+                    return {"message_id": message_id}
+                with LoopbackServer([Response(value=before), Response(value={"environmentId": "environment-1", "serverVersion": "test"}), dispatch, projected]) as server:
+                    ctx = FakeContext(server.base_url)
+                    original_config = ctx.get_config
+                    ctx.get_config = lambda key, default=None: True if key == "continuation_enabled" else original_config(key, default)
+                    ctx.state = SimpleNamespace(data_dir=directory)
+                    ctx.current_desktop_destination = lambda: {"profile_name": "default", "session_id": "physical-1"}
+                    ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+                    args = {"thread_id": "thread-1", "message": "Scoped work", "busy_policy": "queue",
+                            }
+                    if model_switch:
+                        args.update(instance_id="different-instance", model="different-model")
+                    with mock.patch.object(tools, "_send_with_model_switch", side_effect=switched):
+                        result = invoke(server, tools.t3_thread_send, args, context=ctx)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["continuation"]["source_message_id"], result["message_id"])
+                self.assertEqual(len(commands), 0 if model_switch else 1)
+
+    def test_metadata_wait_withdrawal_refuses_source_post_and_preserves_operator_state(self):
+        import tempfile
+        from types import SimpleNamespace
+        from continuation_state import ContinuationStore
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready"))
+        target = {"instanceId": "different-instance", "model": "different-model"}
+        projected = copy.deepcopy(before)
+        projected["snapshotSequence"] = 4
+        projected["page"].update(snapshotSequence=4, threadSequence=4)
+        projected["thread"]["modelSelection"] = target
+        for withdrawal in ("paused", "cancelled", "excluded", "disabled"):
+            with self.subTest(withdrawal=withdrawal), tempfile.TemporaryDirectory() as directory:
+                config = {"continuation_enabled": True}
+                ctx = FakeContext("http://127.0.0.1:9999")
+                ctx.get_config = lambda key, default=None: config.get(key, default)
+                ctx.state = SimpleNamespace(data_dir=directory)
+                ctx.current_desktop_destination = lambda: {"profile_name": "default", "session_id": "physical-1"}
+                ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+                commands, operator_rows = [], []
+                def metadata(request):
+                    commands.append(json.loads(request["body"]))
+                    return Response(value={"sequence": 4})
+                def withdraw(request):
+                    store = ContinuationStore(directory)
+                    binding = store.active_bindings("default")[0]
+                    if withdrawal in {"paused", "cancelled"}:
+                        store.set_binding_state(binding.binding_id, withdrawal)
+                        with store._connect() as db:
+                            operator_rows.append(tuple(db.execute("SELECT * FROM bindings WHERE binding_id=?", (binding.binding_id,)).fetchone()))
+                    elif withdrawal == "excluded":
+                        config["continuation_excluded_bindings"] = [binding.binding_id]
+                    else:
+                        config["continuation_enabled"] = False
+                    return Response(value=projected)
+                def forbidden_source(request):
+                    commands.append(json.loads(request["body"]))
+                    return Response(status=400, value={"code": "must-not-post"})
+                with LoopbackServer([Response(value=before), Response(value={"environmentId": "environment-1", "serverVersion": "test"}), metadata, withdraw, Response(value=projected), forbidden_source]) as peer:
+                    client = tools.T3Client(peer.base_url, peer.token)
+                    with mock.patch.object(tools, "_execute_operation", side_effect=lambda ctx, args, perform: perform(client)):
+                        result = json.loads(tools.bind_handler(ctx, tools.t3_thread_send)({"thread_id": "thread-1", "message": "Scoped task", "busy_policy": "queue", "instance_id": target["instanceId"], "model": target["model"]}))
+                    self.assertFalse(result["ok"])
+                    self.assertEqual([command["type"] for command in commands], ["thread.meta.update"])
+                    self.assertIn("authority was withdrawn", result["error"], result)
+                    store = ContinuationStore(directory)
+                    if operator_rows:
+                        with store._connect() as db:
+                            self.assertEqual(tuple(db.execute("SELECT * FROM bindings").fetchone()), operator_rows[0])
+                    else:
+                        self.assertEqual(store.status()["bindings"][0]["state"], "cancelled")
+
+    def test_real_post_boundary_refusal_cancels_reservation_and_allows_short_retry(self):
+        import tempfile
+        from types import SimpleNamespace
+        from continuation_state import ContinuationStore
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready"))
+        for refusal in ("wire_body_limit", "consumer_lost"):
+            with self.subTest(refusal=refusal), tempfile.TemporaryDirectory() as directory:
+                commands = []
+                def dispatch(request):
+                    command = json.loads(request["body"])
+                    commands.append(command)
+                    return Response(value={"sequence": 4})
+                def projected(request):
+                    command = commands[-1]
+                    return Response(value=detail_snapshot(sequence=4, messages=[projected_message(
+                        message_id=command["message"]["messageId"], role="user", text="Short retry",
+                        turn_id=None, created_at=command["createdAt"])], turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready")))
+                descriptor = Response(value={"environmentId": "environment-1", "serverVersion": "test"})
+                with LoopbackServer([Response(value=before), descriptor, Response(value=before), descriptor, dispatch, projected]) as peer:
+                    ctx = FakeContext(peer.base_url)
+                    ctx.get_config = lambda key, default=None: True if key == "continuation_enabled" else default
+                    ctx.state = SimpleNamespace(data_dir=directory)
+                    ctx.current_desktop_destination = lambda: {"profile_name": "default", "session_id": "physical-1"}
+                    ctx.desktop_continuation_readiness = (mock.Mock(side_effect=[{"ready": True}, {"ready": True}, {"ready": False}])
+                        if refusal == "consumer_lost" else lambda target: {"ready": True})
+                    client = tools.T3Client(peer.base_url, peer.token, request_body_limit=2048)
+                    handler = tools.bind_handler(ctx, tools.t3_thread_send)
+                    with mock.patch.object(tools, "_execute_operation", side_effect=lambda ctx, args, perform: perform(client)):
+                        result = json.loads(handler({"thread_id": "thread-1", "message": "x" * 3000 if refusal == "wire_body_limit" else "Short retry", "busy_policy": "queue"}))
+                        self.assertFalse(result["ok"], result)
+                        self.assertEqual(sum(request["method"] == "POST" for request in peer.requests), 0)
+                        store = ContinuationStore(directory)
+                        self.assertEqual(store.status()["bindings"][0]["state"], "cancelled")
+                        ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+                        retry = json.loads(handler({"thread_id": "thread-1", "message": "Short retry", "busy_policy": "queue"}))
+                        self.assertTrue(retry["ok"], retry)
+                    self.assertEqual(len(commands), 1)
+                    self.assertTrue(retry["continuation"]["armed"])
+
+    def test_automatic_metadata_pending_or_refusal_retires_only_undispatched_source(self):
+        import tempfile
+        from types import SimpleNamespace
+        import uuid
+        from continuation_state import ContinuationStore
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready"))
+        for phase in ("metadata_pending", "metadata_failure", "source_ambiguous"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                ctx = FakeContext("http://127.0.0.1:9999")
+                ctx.get_config = lambda key, default=None: True if key == "continuation_enabled" else default
+                ctx.state = SimpleNamespace(data_dir=directory)
+                ctx.current_desktop_destination = lambda: {"profile_name": "default", "session_id": "physical-1"}
+                ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+                seen = []
+                def mutate(thread, command, *args, **kwargs):
+                    if kwargs.get("on_dispatch_attempt") is not None:
+                        kwargs["on_dispatch_attempt"]()
+                    seen.append(command["type"])
+                    if phase == "metadata_pending":
+                        return {"dispatch_sequence": 4, "verification": "accepted_pending_projection", "thread_id": "thread-1", "command_id": command["commandId"], "reconciliation": {}}
+                    raise tools.T3ClientError()
+                transport = SimpleNamespace(get_thread=lambda *a, **k: before, new_uuid4=lambda: str(uuid.uuid4()),
+                    get_environment_descriptor=lambda: {"environmentId": "environment-1"}, mutate=mutate,
+                    now_iso=lambda: "2099-01-01T00:00:00Z")
+                args = {"thread_id": "thread-1", "message": "Scoped task", "busy_policy": "queue"}
+                if phase != "source_ambiguous":
+                    args.update(instance_id="different-instance", model="different-model")
+                handler = tools.bind_handler(ctx, tools.t3_thread_send)
+                with mock.patch.object(tools, "_execute_operation", side_effect=lambda ctx, args, perform: perform(transport)):
+                    result = json.loads(handler(args))
+                    first = ContinuationStore(directory).status()["bindings"][0]
+                    self.assertEqual(first["state"], "active" if phase == "source_ambiguous" else "cancelled")
+                    if phase != "source_ambiguous":
+                        retry = json.loads(handler(args))
+                        self.assertEqual(len(ContinuationStore(directory).status()["bindings"]), 2)
+                        self.assertNotEqual(retry.get("error_code"), "conflict", retry)
+                self.assertEqual(set(seen), {"thread.turn.start" if phase == "source_ambiguous" else "thread.meta.update"})
+
+    def test_automatic_conflicting_state_returns_clear_conflict(self):
+        import tempfile
+        from types import SimpleNamespace
+        from continuation_state import ContinuationStore
+        from tests.test_continuation_state import binding_values
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready"))
+        with tempfile.TemporaryDirectory() as directory:
+            store = ContinuationStore(directory)
+            store.initialize()
+            store.bind(baseline=(3, "2026-09-09T00:00:00Z"), **binding_values())
+            store.set_binding_state("mission-1", "paused")
+            ctx = FakeContext("http://127.0.0.1:9999")
+            ctx.get_config = lambda key, default=None: True if key == "continuation_enabled" else default
+            ctx.state = SimpleNamespace(data_dir=directory)
+            ctx.current_desktop_destination = lambda: {"profile_name": "default", "session_id": "physical-1"}
+            ctx.desktop_continuation_readiness = lambda target: {"ready": True}
+            transport = mock.Mock()
+            transport.get_thread.return_value = before
+            transport.get_environment_descriptor.return_value = {"environmentId": "environment-1"}
+            transport.new_uuid4.return_value = "message-1"
+            transport.now_iso.return_value = "2099-01-01T00:00:00Z"
+            with mock.patch.object(tools, "_execute_operation", side_effect=lambda ctx, args, perform: perform(transport)):
+                result = json.loads(tools.bind_handler(ctx, tools.t3_thread_send)({"thread_id": "thread-1", "message": "Scoped task", "busy_policy": "queue"}))
+            self.assertEqual(result["error_code"], "conflict", result)
+            self.assertIn("paused", result["error"])
+            transport.mutate.assert_not_called()
+
+    def test_disabled_continuation_ordinary_send_fails_before_dispatch(self):
         context = FakeContext("http://127.0.0.1:9999")
-        context.get_config = lambda key, default=None: True if key == "continuation_enabled" else default
         handler = tools.bind_handler(context, tools.t3_thread_send)
-        with mock.patch.object(tools, "_execute_operation", return_value={"dispatched": True}) as dispatch:
+        before = detail_snapshot(sequence=3, turn=latest_turn(turn_id="old", state="completed"), current_session=session(status="ready"))
+        transport = mock.Mock()
+        transport.get_thread.return_value = before
+        with mock.patch.object(tools, "_execute_operation", side_effect=lambda ctx, args, perform: perform(transport)):
             result = json.loads(handler({"thread_id": "thread-1", "message": "Authorized work", "busy_policy": "queue"}))
-        self.assertFalse(result["ok"], "enabled continuation silently dispatched without a completion policy")
-        dispatch.assert_not_called()
+        self.assertFalse(result["ok"])
+        transport.dispatch.assert_not_called()
 
     def test_send_busy_policy_defaults_reject_and_never_posts(self) -> None:
         running = detail_snapshot(

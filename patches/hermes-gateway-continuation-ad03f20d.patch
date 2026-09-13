@@ -67,7 +67,7 @@ index 6d55c2ab6..79ade822f 100644
          # compression must not be mistaken for a structural no-op. Thread-local + per-agent lock.
          # A stalled compression must not be mistaken for a structural no-op and followed by the oversized
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 6739c096e..ac0b8d3d9 100644
+index 6739c096e..c1d6e24bb 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
 @@ -1434,6 +1434,7 @@ def _run_conversation_turn(
@@ -77,7 +77,7 @@ index 6739c096e..ac0b8d3d9 100644
 +    gateway_system_event: Optional[Any] = None,
  ) -> Dict[str, Any]:
      """Run a complete conversation with tool calling until completion; returns the result dict.
- 
+
 @@ -1441,7 +1442,7 @@ def _run_conversation_turn(
      store when ``user_message`` carries API-only synthetic prefixes; timestamp / platform id are
      stored as metadata (platform id lets restart drain recovery dedup). ``persist_user_display_*``:
@@ -103,17 +103,58 @@ index 6739c096e..ac0b8d3d9 100644
      turn_author: Optional[Dict[str, Any]] = None,
  ) -> Dict[str, Any]:
      """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
-@@ -1608,7 +1611,10 @@ def run_conversation(
-         persist_user_platform_id=persist_user_platform_id,
-         moa_config=moa_config,
-         turn_author=turn_author,
-+        gateway_system_event=gateway_system_event,
-     )
-+    if gateway_system_event is not None:
-+        return result
-     return export_current_turn_boundary(agent, result, user_message)
- 
- 
+@@ -1594,22 +1597,35 @@ def run_conversation(
+     """
+     from agent.turn_context import export_current_turn_boundary
+
+-    result = _run_conversation_turn(
+-        agent,
+-        user_message,
+-        system_message=system_message,
+-        conversation_history=conversation_history,
+-        task_id=task_id,
+-        stream_callback=stream_callback,
+-        persist_user_message=persist_user_message,
+-        persist_user_timestamp=persist_user_timestamp,
+-        persist_user_display_kind=persist_user_display_kind,
+-        persist_user_display_metadata=persist_user_display_metadata,
+-        persist_user_platform_id=persist_user_platform_id,
+-        moa_config=moa_config,
+-        turn_author=turn_author,
+-    )
+-    return export_current_turn_boundary(agent, result, user_message)
++    missing = object()
++    previous_event = vars(agent).get("_gateway_system_event", missing)
++    try:
++        result = _run_conversation_turn(
++            agent,
++            user_message,
++            system_message=system_message,
++            conversation_history=conversation_history,
++            task_id=task_id,
++            stream_callback=stream_callback,
++            persist_user_message=persist_user_message,
++            persist_user_timestamp=persist_user_timestamp,
++            persist_user_display_kind=persist_user_display_kind,
++            persist_user_display_metadata=persist_user_display_metadata,
++            persist_user_platform_id=persist_user_platform_id,
++            moa_config=moa_config,
++            turn_author=turn_author,
++            gateway_system_event=gateway_system_event,
++        )
++        if gateway_system_event is not None:
++            return result
++        return export_current_turn_boundary(agent, result, user_message)
++    finally:
++        # The compression guard is active only during this turn, including
++        # exceptional exits; a later manual /compress is ordinary user work.
++        if previous_event is missing:
++            vars(agent).pop("_gateway_system_event", None)
++        else:
++            agent._gateway_system_event = previous_event
+
+
+ __all__ = ["run_conversation"]
 diff --git a/agent/turn_context.py b/agent/turn_context.py
 index 8ff904851..a60953dce 100644
 --- a/agent/turn_context.py
@@ -126,7 +167,7 @@ index 8ff904851..a60953dce 100644
 +    set_current_write_origin, ra, moa_active: bool=False, gateway_system_event: Optional[Any]=None,
  ) -> TurnContext:
      """Run the once-per-turn setup and return the loop's input context.
- 
+
 @@ -866,6 +866,12 @@ def build_turn_context(
      (else it persists system_prompt=NULL and costs a cache miss) and BEFORE preflight
      compression."""
@@ -137,13 +178,13 @@ index 8ff904851..a60953dce 100644
 +            raise ValueError("invalid typed gateway event")
 +        if agent.api_mode != "codex_responses" or agent.provider != "openai-codex":
 +            raise ValueError("typed gateway events require the supported Codex Responses transport")
- 
+
      # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
      install_safe_stdio()
 @@ -880,6 +886,13 @@ def build_turn_context(
      if recovered_history is not None:
          conversation_history = recovered_history
- 
+
 +    if gateway_system_event is not None:
 +        from gateway.internal_events import gateway_system_event_is_eligible
 +        if agent.session_id != gateway_system_event.expected_session_id:
@@ -161,7 +202,7 @@ index 8ff904851..a60953dce 100644
 -    _refresh_mcp_tools_between_turns(agent)
 +    if gateway_system_event is None:
 +        _refresh_mcp_tools_between_turns(agent)
- 
+
      if isinstance(user_message, str):
          user_message = sanitize_surrogates(user_message)
 @@ -905,8 +919,10 @@ def build_turn_context(
@@ -169,7 +210,7 @@ index 8ff904851..a60953dce 100644
      )
      _reset_per_turn_agent_state(agent)
 +    agent._gateway_system_event = gateway_system_event
- 
+
 -    _preview_text = summarize_user_message_for_log(user_message)
 +    _preview_text = (f"<gateway-system-event {gateway_system_event.event_id}>"
 +                     if gateway_system_event is not None else summarize_user_message_for_log(user_message))
@@ -177,7 +218,7 @@ index 8ff904851..a60953dce 100644
      logger.info(
          "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
 @@ -917,10 +933,16 @@ def build_turn_context(
- 
+
      # Copy so the caller's list is never mutated.
      messages = list(conversation_history) if conversation_history else []
 -    user_msg, pending_cli_message = _stage_turn_user_message(
@@ -200,7 +241,7 @@ index 8ff904851..a60953dce 100644
 @@ -929,17 +951,20 @@ def build_turn_context(
      current_turn_user_idx = len(messages) - 1
      agent._persist_user_message_idx = current_turn_user_idx
- 
+
 -    agent._user_turn_count += 1
 +    if gateway_system_event is None:
 +        agent._user_turn_count += 1
@@ -208,7 +249,7 @@ index 8ff904851..a60953dce 100644
      # tool-loop follow-ups revert to "agent".
 -    agent._is_user_initiated_turn = True
 +    agent._is_user_initiated_turn = gateway_system_event is None
- 
+
      # Preserve the original user message (no nudge injection).
      original_user_message = persist_user_message if persist_user_message is not None else user_message
 -    should_review_memory = _tick_memory_nudge(agent)
@@ -217,16 +258,16 @@ index 8ff904851..a60953dce 100644
 +    if gateway_system_event is None:
 +        should_review_memory = _tick_memory_nudge(agent)
 +        _emit_reaction(agent, original_user_message)
- 
+
 -    if not agent.quiet_mode:
 +    if not agent.quiet_mode and gateway_system_event is None:
          agent._safe_print(
              f"💬 Starting conversation: '{_preview_text[:60]}"
              f"{'...' if len(_preview_text) > 60 else ''}'"
 @@ -961,28 +986,38 @@ def build_turn_context(
- 
+
      _ensure_session_row(agent, pending_cli_message)
- 
+
 -    compaction = run_turn_start_compaction(
 -        agent, messages=messages, system_message=system_message,
 -        active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -274,26 +315,26 @@ index 8ff904851..a60953dce 100644
 +        agent._turn_preflight_compressed = False
 +        agent._turn_received_provider_response = False
 +        agent._turn_preflight_display_snapshot = None
- 
+
      _bind_interrupt_scope(agent, ra)
 -    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
 +    ext_prefetch_cache = ("" if gateway_system_event is not None else
 +                          _memory_turn_start_and_prefetch(agent, original_user_message, turn_author))
- 
+
      # Sidecar skipped for codex_app_server/MoA.
      if (
 @@ -1000,7 +1035,8 @@ def build_turn_context(
- 
+
      # Title the session now: the row exists and titling depends only on the user's ask,
      # so it runs concurrently with the turn. Daemon thread, no-op once titled.
 -    _maybe_title_session_at_turn_start(agent, messages)
 +    if gateway_system_event is None:
 +        _maybe_title_session_at_turn_start(agent, messages)
- 
+
      return TurnContext(
          user_message=user_message, original_user_message=original_user_message, messages=messages,
 diff --git a/agent/turn_facade.py b/agent/turn_facade.py
-index acd3bc97e..f378f1873 100644
+index acd3bc97e..69942e9d6 100644
 --- a/agent/turn_facade.py
 +++ b/agent/turn_facade.py
 @@ -27,6 +27,7 @@ class TurnFacadeMixin:
@@ -304,6 +345,15 @@ index acd3bc97e..f378f1873 100644
      ) -> Dict[str, Any]:
          """Forwarder — see ``agent.conversation_loop.run_conversation``."""
          # A review shares this session_id for cache parity: fence review startup or interrupt
+@@ -78,7 +79,7 @@ class TurnFacadeMixin:
+             _review_queue.note_turn_started()
+             admission = admit_durable_turn_lease(
+                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
+-                conversation_history=conversation_history,
++                conversation_history=conversation_history, gateway_system_event=gateway_system_event,
+             )
+             if admission.early_result is not None:
+                 relay_outcome = (
 @@ -130,6 +131,7 @@ class TurnFacadeMixin:
                          persist_user_display_metadata=persist_user_display_metadata,
                          persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
@@ -313,13 +363,13 @@ index acd3bc97e..f378f1873 100644
                  finally:
                      # Post-loop relay/task finalization must not receive a late refresh interrupt;
 diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
-index 9ae9c93a0..c3492e861 100644
+index 9ae9c93a0..6883cb15b 100644
 --- a/agent/turn_facade_lease.py
 +++ b/agent/turn_facade_lease.py
-@@ -230,6 +230,138 @@ def _durable_session_exists(db, session_id: str) -> bool:
+@@ -230,9 +230,141 @@ def _durable_session_exists(db, session_id: str) -> bool:
          return True
- 
- 
+
+
 +def _committed_history_id(message) -> Optional[int]:
 +    if not isinstance(message, dict) or message.get("_db_persisted") is not True:
 +        return None
@@ -454,8 +504,32 @@ index 9ae9c93a0..c3492e861 100644
 +
  def admit_durable_turn_lease(
      agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
-     conversation_history: Optional[List[Dict[str, Any]]],
-@@ -285,7 +417,7 @@ def admit_durable_turn_lease(
+-    conversation_history: Optional[List[Dict[str, Any]]],
++    conversation_history: Optional[List[Dict[str, Any]]], gateway_system_event: Optional[Any] = None,
+ ) -> TurnLeaseAdmission:
+     """Acquire the session turn lease when the session is durable; build (not start) its threads.
+
+@@ -282,10 +414,27 @@ def admit_durable_turn_lease(
+     agent._active_session_turn_lease_holder = holder
+     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+     try:
++        if gateway_system_event is not None:
++            from gateway.internal_events import GatewaySystemEvent
++            if (not isinstance(gateway_system_event, GatewaySystemEvent)
++                    or gateway_system_event.expected_session_id != session_id):
++                raise ValueError("typed gateway event has an invalid physical session")
++            # Process-local receipt caches and Desktop history can be stale. Check
++            # committed admission rows only after owning the physical DB lease,
++            # before staging the next event or entering the model loop.
++            durable = db.get_messages_as_conversation(
++                session_id, repair_alternation=False, include_row_ids=True
++            )
++            for message in durable:
++                metadata = message.get("display_metadata") or {}
++                if (message.get("role") == "developer" and isinstance(metadata, dict)
++                        and metadata.get("plugin_id") == gateway_system_event.plugin_id
++                        and metadata.get("event_id") == gateway_system_event.event_id):
++                    raise ValueError("typed gateway event was already admitted to this session")
          if waited:
              agent._emit_status("Session is free; loading the latest transcript...")
              # The holder may have compressed/rotated the session while we waited: reload only
@@ -464,7 +538,7 @@ index 9ae9c93a0..c3492e861 100644
              latest_session_id = db.resolve_resume_session_id(session_id)
              if latest_session_id:
                  agent.session_id = latest_session_id
-@@ -293,6 +425,56 @@ def admit_durable_turn_lease(
+@@ -293,6 +442,56 @@ def admit_durable_turn_lease(
              admission.conversation_history = db.get_messages_as_conversation(
                  agent.session_id, repair_alternation=True, include_row_ids=True
              )
@@ -528,7 +602,7 @@ index c11f783e0..6c2fc7616 100644
 @@ -438,6 +438,15 @@ def recover_from_overflow(
          approx_tokens=approx_tokens, compression_attempts=compression_attempts,
      )
- 
+
 +    from gateway.internal_events import GatewaySystemEvent
 +    if (isinstance(getattr(agent, "_gateway_system_event", None), GatewaySystemEvent)
 +            and (classified.reason in {FailoverReason.payload_too_large, FailoverReason.context_overflow}
@@ -548,7 +622,7 @@ index 557a02661..c4266a014 100644
 @@ -82,6 +82,20 @@ def run_preflight_compression(
              max_compression_attempts,
          )
- 
+
 +    from gateway.internal_events import GatewaySystemEvent
 +    if isinstance(getattr(agent, "_gateway_system_event", None), GatewaySystemEvent):
 +        threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
@@ -569,7 +643,7 @@ index 557a02661..c4266a014 100644
 @@ -262,6 +276,12 @@ def compress_after_tool_results(
              final_response=final_response, turn_exit_reason=turn_exit_reason,
          )
- 
+
 +    from gateway.internal_events import GatewaySystemEvent
 +    if isinstance(getattr(agent, "_gateway_system_event", None), GatewaySystemEvent):
 +        # Keep new tool evidence; the next request's preflight fails closed if
@@ -586,7 +660,7 @@ index 359553209..7a19b39b9 100644
 @@ -117,6 +117,12 @@ def assemble_api_request(
      )
      from agent.model_metadata import estimate_messages_tokens_rough
- 
+
 +    typed_event = getattr(agent, "_gateway_system_event", None)
 +    if typed_event is not None and (
 +        agent.session_id != typed_event.expected_session_id
@@ -607,7 +681,7 @@ index 359553209..7a19b39b9 100644
 +        api_messages = _apply_context_engine_selection(
 +            agent, api_messages, messages, _sel_incoming, logger=request_logger
 +        )
- 
+
      # Runs unconditionally (not gated on context_compressor) so orphaned tool
      # results from session loading or manual message edits are always caught.
 diff --git a/gateway/internal_events.py b/gateway/internal_events.py
@@ -947,7 +1021,7 @@ index 13a647fed..509124a96 100644
          event._gateway_accepted = self._start_session_processing(event, session_key)
 +        if not event._gateway_accepted:
 +            resolve_message_event_receipt(event, "busy")
- 
+
      async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
          """Route a message that arrived while ``session_key`` is busy: bypass
 @@ -4041,6 +4054,12 @@ class BasePlatformAdapter(ABC):
@@ -1012,21 +1086,21 @@ index d5353e3a4..4361d8d5c 100644
 @@ -84,6 +84,9 @@ class MessageEvent:
      # so untrusted payload text stays conversational. Kept last for positional compat.
      allow_gateway_control: bool = True
- 
+
 +    gateway_system_event: Any = None
 +    gateway_event_receipt: Any = None
 +
      # Process-local admission receipt, never routing metadata or execution acknowledgement.
      _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
- 
+
 diff --git a/gateway/run.py b/gateway/run.py
 index 34934d24a..6cfd8b038 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -3276,7 +3276,11 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
      return adapter_cls(config)
- 
- 
+
+
 +from gateway.run_plugin_events import GatewayPluginEventsMixin
 +
 +
@@ -1053,7 +1127,7 @@ index 8de64a2a0..bc8480f14 100644
 @@ -1669,21 +1673,83 @@ class GatewayInboundMixin:
              state.persistent.native_image_paths = []
          return paths
- 
+
 -    async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
 +    async def _mark_durable_active_turn(
 +        self,
@@ -1136,7 +1210,7 @@ index 8de64a2a0..bc8480f14 100644
 +        setattr(event, "_gateway_active_turn_session_key", session_key)
 +        setattr(event, "_gateway_active_turn_token", token)
          return True
- 
+
 +
      async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
          """Best-effort CAS clear of the marker owned by *event* (3 attempts; never blocks agent/lease
@@ -1144,24 +1218,24 @@ index 8de64a2a0..bc8480f14 100644
 @@ -1716,20 +1782,30 @@ class GatewayInboundMixin:
          """Publish this live gateway's plugin message scheduler."""
          from hermes_cli.plugins import get_plugin_manager
- 
+
 -        get_plugin_manager().set_gateway_message_injector(
 -            self, self._schedule_plugin_message_injection
 -        )
 +        manager = get_plugin_manager()
 +        manager.set_gateway_message_injector(self, self._schedule_plugin_message_injection)
 +        manager._start_gateway_tasks(getattr(self, "_gateway_loop", None))
- 
+
      def _clear_plugin_message_injector(self) -> None:
          """Remove this runner's scheduler without clobbering a newer owner."""
          from hermes_cli.plugins import get_plugin_manager
- 
+
 -        get_plugin_manager().clear_gateway_message_injector(self)
 +        manager = get_plugin_manager()
 +        if manager.gateway_message_injector_owned_by(self):
 +            manager._stop_gateway_tasks()
 +            manager.clear_gateway_message_injector(self)
- 
+
      def _schedule_plugin_message_injection(
 -        self, *, session_key: str, content: str, plugin_id: str
 -    ) -> bool:
@@ -1553,12 +1627,12 @@ index 195e42c64..0b69c1308 100644
          context = build_session_context(source, self.config, session_entry)
          # Session context variables for tools (task-local, concurrency-safe)
 @@ -1878,7 +1893,7 @@ class GatewayTurnMixin:
- 
+
          # A turn becomes durable recovery work only after it owns the per-session lease; marking
          # earlier would falsely recover a message that never began processing.
 -        await self._mark_durable_active_turn(event, session_entry.session_key)
 +        await self._mark_durable_active_turn(event, session_entry.session_key, session_entry.session_id)
- 
+
          # An unreadable store is not an empty conversation: stop before the agent invents continuity
          # from []. Restore task-local context here (before the broad cleanup finally).
 @@ -1974,6 +1989,11 @@ class GatewayTurnMixin:
@@ -1591,19 +1665,19 @@ index 195e42c64..0b69c1308 100644
 +                    event._gateway_event_terminal_status = "agent_error"
 +                else:
 +                    event._gateway_event_terminal_status = "completed"
- 
+
              # A queued (/queue) chain answered the LAST message of the chain, so the outer final
              # send (bracketed by the adapter against this event) must be ledgered under that
 @@ -2005,6 +2037,9 @@ class GatewayTurnMixin:
              await self._hmwa_stop_typing_for_turn(event, source)
- 
+
              if not self._is_session_run_current(_quick_key, run_generation):
 +                if getattr(event, "gateway_system_event", None) is not None:
 +                    from gateway.internal_events import resolve_message_event_receipt
 +                    resolve_message_event_receipt(event, "cancelled")
                  self._hmwa_discard_stale_result(source, _quick_key, run_generation)
                  return None
- 
+
 @@ -2022,9 +2057,10 @@ class GatewayTurnMixin:
              agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                  self._hmwa_classify_turn_failure(agent_result, history, session_entry)
@@ -1620,7 +1694,7 @@ index 195e42c64..0b69c1308 100644
                  agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
 @@ -2038,6 +2074,8 @@ class GatewayTurnMixin:
              )
- 
+
          except Exception as e:
 +            if getattr(event, "gateway_system_event", None) is not None:
 +                event._gateway_event_terminal_status = "agent_error"
@@ -1635,7 +1709,7 @@ index 195e42c64..0b69c1308 100644
 +        persist_user_display_metadata: Optional[dict] = None, gateway_system_event=None,
      ) -> Dict[str, Any]:
          """Run the agent; returns the full run_conversation result dict.
- 
+
          Keys: "final_response", "messages", "api_calls", "completed"."""
 +        if gateway_system_event is not None and self._get_proxy_url():
 +            return {"gateway_system_event_error": "unsupported_transport"}
@@ -1662,7 +1736,7 @@ index 195e42c64..0b69c1308 100644
                  return await self._run_agent_queued_followup(
                      turn_ctx, adapter, pending, pending_event, response, result, stream_task,
 diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
-index 295892b43..2427a27e7 100644
+index 295892b43..920ed28f0 100644
 --- a/gateway/run_turn_runner.py
 +++ b/gateway/run_turn_runner.py
 @@ -1441,6 +1441,13 @@ class TurnRunner:
@@ -1703,6 +1777,63 @@ index 295892b43..2427a27e7 100644
          pr = runner._provider_routing
          reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
          runner._reasoning_config = reasoning_config
+@@ -1743,7 +1760,9 @@ class TurnRunner:
+         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+-        result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
++        from gateway.session_context import plugin_gateway_turn
++        with plugin_gateway_turn(runner, ctx, agent):
++            result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+         self._finish_stream_consumer(result, agent_history, stream_consumer)
+         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
+         # returns, so early run_sync returns are also finalised.
+diff --git a/gateway/session_context.py b/gateway/session_context.py
+index 38af24a20..5a38ce46f 100644
+--- a/gateway/session_context.py
++++ b/gateway/session_context.py
+@@ -222,3 +222,41 @@ def session_history_delivery_supported() -> bool:
+
+     Fail closed on omitted bindings; never borrow authority from the environment."""
+     return _SESSION_HISTORY_DELIVERY.get() == "1"
++
++
++# Set only at the real gateway conversation boundary; never exported to subprocesses.
++_plugin_gateway_turn = ContextVar("plugin_gateway_turn", default=None)
++
++
++@contextmanager
++def plugin_gateway_turn(owner, turn, agent):
++    lease = {"owner": owner, "turn": turn, "agent": agent, "active": True}
++    token = _plugin_gateway_turn.set(lease)
++    try:
++        yield
++    finally:
++        lease["active"] = False
++        _plugin_gateway_turn.reset(token)
++
++
++def current_plugin_gateway_destination(owner):
++    current = _plugin_gateway_turn.get()
++    from agent.delegation_context import is_delegated_child_context
++    if current is None or current["owner"] is not owner or not current["active"] or is_delegated_child_context():
++        return None
++    turn, agent = current["turn"], current["agent"]
++    if getattr(turn, "gateway_system_event", None) is not None:
++        return None
++    if (getattr(agent, "api_mode", None) != "codex_responses"
++            or getattr(agent, "provider", None) != "openai-codex"
++            or not turn.session_id or getattr(agent, "session_id", None) != turn.session_id):
++        return None
++    source = turn.source
++    platform = getattr(source.platform, "value", source.platform)
++    profile = getattr(source, "profile", None) or "default"
++    if not turn.session_key or not source.user_id or not source.chat_id:
++        return None
++    return {"profile_name": str(profile), "session_id": turn.session_id,
++        "session_key": turn.session_key, "platform": str(platform),
++        "user_id": str(source.user_id), "chat_id": str(source.chat_id),
++        "topic_id": str(getattr(source, "thread_id", None) or "")}
 diff --git a/gateway/session_lifecycle.py b/gateway/session_lifecycle.py
 index 1c037af62..3148546bd 100644
 --- a/gateway/session_lifecycle.py
@@ -1710,17 +1841,17 @@ index 1c037af62..3148546bd 100644
 @@ -14,6 +14,9 @@ if TYPE_CHECKING:
  # Log-record parity with the origin module.
  logger = logging.getLogger("gateway.session")
- 
+
 +TYPED_EVENT_RECOVERY_METADATA_KEY = "_gateway_system_event_recovery_v1"
 +_TYPED_EVENT_RECOVERY_VERSION = 1
 +
- 
+
  def _now() -> datetime:
      """Return the current local time."""
 @@ -125,18 +128,76 @@ class SessionLifecycleMixin:
          if started_at is not None:
              entry.updated_at = started_at
- 
+
 -    def mark_turn_active(self, session_key: str) -> Optional[str]:
 -        """Persist exact ownership of the running agent turn; returns the opaque token for
 -        :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
@@ -1795,13 +1926,13 @@ index 1c037af62..3148546bd 100644
 +            entry.active_turn_started_at = now
 +            entry.updated_at = now
          return token
- 
+
 +
      def clear_turn_active(self, session_key: str, token: str) -> bool:
          """Compare-and-swap clear an active-turn marker; ``False`` when the entry disappeared or a
          newer turn owns it."""
 @@ -157,6 +218,8 @@ class SessionLifecycleMixin:
- 
+
          def _promote(entry: SessionEntry) -> bool:
              nonlocal promoted
 +            if entry.session_id in self._typed_event_recovery_session_ids_locked():
@@ -1820,7 +1951,7 @@ index 1c037af62..3148546bd 100644
              entry.resume_pending = True
 @@ -252,6 +317,8 @@ class SessionLifecycleMixin:
          cutoff = _now() - timedelta(seconds=max_age_seconds)
- 
+
          def _mark(entry: SessionEntry) -> bool:
 +            if entry.session_id in self._typed_event_recovery_session_ids_locked():
 +                return False
@@ -1935,7 +2066,7 @@ index 7c9d141a2..f10c8782a 100644
 --- a/gateway/shutdown_flush.py
 +++ b/gateway/shutdown_flush.py
 @@ -183,6 +183,11 @@ def _json_safe(value: Any) -> bool:
- 
+
  def _serialise_value(value: Any) -> Optional[dict]:
      """Convert a pending message value to a JSON-serialisable dict."""
 +    from gateway.internal_events import GatewaySystemEvent
@@ -1965,7 +2096,7 @@ index 1f65614e6..af881bc3e 100644
 @@ -92,6 +92,20 @@ class SessionTurnLeaseRegistry:
          for sid in idle[:overflow]:
              self._leases.pop(sid, None)
- 
+
 +    async def try_acquire(self, session_id: str, *, owner_key: str, generation: int):
 +        """Acquire an idle physical session without queueing external work behind a human turn."""
 +        if not session_id:
@@ -2061,24 +2192,24 @@ index bc45188e4..422966e82 100644
 +++ b/hermes_cli/plugins.py
 @@ -211,7 +211,10 @@ class LoadedPlugin:
      deferred: bool = False
- 
- 
+
+
 -class PluginContext:
 +from hermes_cli.plugins_gateway import PluginGatewayContextMixin, PluginGatewayManagerMixin
 +
 +
 +class PluginContext(PluginGatewayContextMixin):
      """Facade given to plugins so they can register tools and hooks."""
- 
+
      def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
 @@ -1108,7 +1111,7 @@ def _resolve_hook_callback_timeout() -> float:
      return timeout
- 
- 
+
+
 -class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
 +class PluginManager(PluginGatewayManagerMixin, PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
      """Central manager that discovers, loads, and invokes plugins."""
- 
+
      def __init__(self, scope_key: Optional[str] = None) -> None:
 @@ -1119,6 +1122,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
          self._discovery_lock = threading.RLock()
@@ -2092,10 +2223,10 @@ index bc45188e4..422966e82 100644
          # Manager-local registries keyed by name (see the matching ``PluginContext.register_*``):
 diff --git a/hermes_cli/plugins_gateway.py b/hermes_cli/plugins_gateway.py
 new file mode 100644
-index 000000000..d291fc3bf
+index 000000000..bfa29c791
 --- /dev/null
 +++ b/hermes_cli/plugins_gateway.py
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,313 @@
 +"""Host-owned typed continuation and deferred gateway task lifecycle for plugins."""
 +from __future__ import annotations
 +
@@ -2153,6 +2284,45 @@ index 000000000..d291fc3bf
 +        if consumer is None or not supervised or not self._gateway_injection_allowed() or getattr(self, "_desktop_observer_ready", False) is not True:
 +            return {"ready": False, "status": "unauthorized"}
 +        return consumer.readiness(destination)
++
++    def current_gateway_destination(self):
++        from gateway.session_context import current_plugin_gateway_destination
++        registered = self._manager._gateway_message_injector
++        return current_plugin_gateway_destination(registered[0]) if registered else None
++
++    def gateway_continuation_readiness(self, destination):
++        """Validate one native turn destination on its gateway owner's loop."""
++        from gateway.internal_events import create_gateway_system_event
++        registered = self._manager._gateway_message_injector
++        tasks = self._manager._gateway_tasks
++        supervised = any(key[0] == self.plugin_id and not task.done() for key, task in tasks.items())
++        if (not registered or not supervised or not self._gateway_injection_allowed()
++                or getattr(self, "_gateway_observer_ready", False) is not True
++                or destination != self.current_gateway_destination()):
++            return {"ready": False, "status": "unauthorized"}
++        owner = registered[0]
++        loop = getattr(owner, "_gateway_loop", None)
++        if loop is None or loop.is_closed() or not loop.is_running():
++            return {"ready": False, "status": "stopping"}
++        try:
++            if asyncio.get_running_loop() is loop:
++                return {"ready": False, "status": "unsupported_call_context"}
++        except RuntimeError:
++            pass
++        try:
++            _, event = create_gateway_system_event(content="Readiness probe", session_key=destination["session_key"],
++                expected_session_id=destination["session_id"], event_id="readiness", event_kind="external_tool_completed",
++                plugin_id=self.plugin_id, expected_route={key: destination[key] for key in
++                    ("profile_name", "platform", "user_id", "chat_id", "topic_id")}, eligibility_check=lambda: True)
++            pending = asyncio.run_coroutine_threadsafe(owner._gateway_system_event_target(event), loop)
++            status, _, _ = pending.result(timeout=5)
++        except Exception:
++            if "pending" in locals():
++                pending.cancel()
++            return {"ready": False, "status": "unavailable"}
++        if self._manager._gateway_message_injector is not registered:
++            return {"ready": False, "status": "stopping"}
++        return {"ready": status is None, "status": status or "ready", "destination": dict(destination)}
 +
 +    def inject_desktop_system_event(self, content, *, destination, event_id, event_kind, eligibility_check, completion_check):
 +        from gateway.internal_events import create_desktop_system_event
@@ -2375,9 +2545,9 @@ index 24d757167..ed7abe326 100644
 --- a/hermes_cli/web_server.py
 +++ b/hermes_cli/web_server.py
 @@ -245,9 +245,12 @@ async def _lifespan(app: "FastAPI"):
- 
+
      start_background_bootstrap()
- 
+
 +    from tui_gateway.plugin_events import start_desktop_plugins, stop_desktop_plugins
 +    desktop_plugins = await start_desktop_plugins()
      try:
@@ -2414,10 +2584,10 @@ index 47132b0b8..cf7dc88e0 100644
 +    assert messages == original
 diff --git a/tests/agent/test_gateway_event_overflow.py b/tests/agent/test_gateway_event_overflow.py
 new file mode 100644
-index 000000000..4ecd4863d
+index 000000000..960b726c6
 --- /dev/null
 +++ b/tests/agent/test_gateway_event_overflow.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,121 @@
 +"""Typed turns fail closed at pressure/overflow boundaries without rewriting history."""
 +import copy
 +from dataclasses import fields
@@ -2506,17 +2676,50 @@ index 000000000..4ecd4863d
 +    with pytest.raises(ValueError, match="typed gateway"):
 +        CompressionFacadeMixin._compress_context(agent, messages, "SYSTEM")
 +    assert messages == before and agent.session_id == "physical" and agent._cached_system_prompt == "SYSTEM"
++
++
++@pytest.mark.parametrize("failed", [False, True])
++def test_typed_turn_releases_compression_guard_on_every_exit(monkeypatch, failed):
++    from agent import conversation_loop, conversation_compression
++    agent, history, messages = fixture()
++    marker = agent._gateway_system_event
++    agent._gateway_system_event = None
++    agent._conversation_root_id.return_value = None
++
++    def turn(*args, **kwargs):
++        agent._gateway_system_event = kwargs["gateway_system_event"]
++        with pytest.raises(ValueError, match="typed gateway"):
++            CompressionFacadeMixin._compress_context(agent, messages, "SYSTEM", force=True)
++        if failed:
++            raise RuntimeError("typed turn failed")
++        return {"completed": True, "messages": messages}
++
++    monkeypatch.setattr(conversation_loop, "_run_conversation_turn", turn)
++    if failed:
++        with pytest.raises(RuntimeError, match="typed turn failed"):
++            conversation_loop.run_conversation(agent, "completion", gateway_system_event=marker)
++    else:
++        conversation_loop.run_conversation(agent, "completion", gateway_system_event=marker)
++    compressed = (history, "SYSTEM")
++    compressor = MagicMock(return_value=compressed)
++    monkeypatch.setattr(conversation_compression, "compress_context", compressor)
++    monkeypatch.setattr(conversation_compression, "resolve_context_compression_timeouts", lambda: (0, 0))
++    with patch("agent.compression_facade._mirror_result_onto_live_lists"), \
++         patch("agent.compression_facade._rebind_caller_session_context"), \
++         patch("agent.prompt_cache_scope.declared_conversation_scope_safe", return_value=None):
++        assert CompressionFacadeMixin._compress_context(agent, messages, "SYSTEM", force=True) == compressed
++    compressor.assert_called_once()
 diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
 index a08d6665e..307aa9ec6 100644
 --- a/tests/agent/test_turn_context.py
 +++ b/tests/agent/test_turn_context.py
 @@ -138,6 +138,7 @@ class _FakeAgent:
- 
+
      def _persist_session(self, *_a, **_k):
          self._persist_calls += 1
 +        self._last_persist_args = _a
- 
- 
+
+
  def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
 @@ -534,3 +535,72 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
      overwritten or never read.
@@ -2592,13 +2795,13 @@ index a08d6665e..307aa9ec6 100644
 +        _build(agent, user_message=content, gateway_system_event=marker)
 +    assert agent._persist_calls == 0
 diff --git a/tests/agent/test_turn_facade_lease.py b/tests/agent/test_turn_facade_lease.py
-index 689a59e57..bd00a1745 100644
+index 689a59e57..582602d42 100644
 --- a/tests/agent/test_turn_facade_lease.py
 +++ b/tests/agent/test_turn_facade_lease.py
 @@ -2,6 +2,8 @@
  import threading
  from types import SimpleNamespace
- 
+
 +import pytest
 +
  from agent.turn_facade_lease import (
@@ -2612,8 +2815,8 @@ index 689a59e57..bd00a1745 100644
 +        task_context={"session_id": "s1", "task_id": "t", "platform": getattr(agent, "platform", "cli")},
          conversation_history=history,
      )
- 
-@@ -122,3 +124,500 @@ def test_interrupt_turn_only_while_active():
+
+@@ -122,3 +124,532 @@ def test_interrupt_turn_only_while_active():
      assert calls == ["lost"] and lease.interrupt_message == "lost"
      lease.deactivate_after_liveness_abort()
      assert lease.stop.is_set() and lease.is_turn_active() is False
@@ -3114,6 +3317,38 @@ index 689a59e57..bd00a1745 100644
 +    finally:
 +        admission.lease.release()
 +    _assert_released(db, agent)
++
++
++@pytest.mark.parametrize("platform,cached_history", [("telegram", "empty"), ("telegram", "stale"), ("desktop", "stale")])
++def test_typed_replay_is_rejected_under_durable_lease_before_loop(
++    durable_history, monkeypatch, platform, cached_history,
++):
++    from unittest.mock import Mock
++    from run_agent import AIAgent
++    from gateway.internal_events import create_gateway_system_event, gateway_system_event_message
++    db, partial_agent, stale = durable_history
++    content, event = create_gateway_system_event(
++        content="completed external work", session_key="route", expected_session_id="s1",
++        event_id="already-admitted", event_kind="external_tool_completed", plugin_id="fixture",
++        expected_route={"profile_name": "default", "platform": "telegram", "user_id": "42", "chat_id": "42", "topic_id": ""},
++        eligibility_check=lambda: True,
++    )
++    db.append_messages_batch("s1", [gateway_system_event_message(event, content),
++                                   {"role": "assistant", "content": "completed"}])
++    before = db.get_messages_as_conversation("s1", repair_alternation=False, include_row_ids=True)
++    # A fresh agent has no gateway receipt cache (restart/eviction); Desktop's
++    # supplied cache was captured before the other owner committed this event.
++    agent = AIAgent.__new__(AIAgent)
++    agent.__dict__.update(vars(partial_agent))
++    agent.platform = platform
++    model_loop = Mock(return_value={"completed": True, "messages": []})
++    monkeypatch.setattr("agent.conversation_loop.run_conversation", model_loop)
++    with pytest.raises(ValueError, match="already admitted"):
++        agent.run_conversation(content, conversation_history=[] if cached_history == "empty" else stale,
++                               gateway_system_event=event)
++    model_loop.assert_not_called()
++    assert db.get_messages_as_conversation("s1", repair_alternation=False, include_row_ids=True) == before
++    _assert_released(db, agent)
 diff --git a/tests/agent/test_typed_event_turn_boundary.py b/tests/agent/test_typed_event_turn_boundary.py
 new file mode 100644
 index 000000000..e4e518e0a
@@ -3140,17 +3375,17 @@ index bd859325c..e4e68965c 100644
 --- a/tests/gateway/test_active_turn_recovery.py
 +++ b/tests/gateway/test_active_turn_recovery.py
 @@ -15,6 +15,9 @@ import pytest
- 
+
  from gateway.config import GatewayConfig, Platform
  from gateway.run import GatewayRunner
 +from gateway.session_lifecycle import TYPED_EVENT_RECOVERY_METADATA_KEY
 +from gateway.internal_events import create_gateway_system_event, new_gateway_event_receipt
 +from gateway.platforms.event import MessageEvent
  from gateway.session import SessionEntry, SessionSource, SessionStore
- 
- 
+
+
 @@ -513,3 +516,202 @@ async def test_unclean_recovery_promotes_exact_markers_before_legacy_fallback(
- 
+
      assert await runner._recover_unclean_sessions() == (1, 2)
      assert calls == ["exact", "fallback"]
 +
@@ -3353,7 +3588,7 @@ index bd859325c..e4e68965c 100644
 +    assert TYPED_EVENT_RECOVERY_METADATA_KEY in current.metadata
 +    assert current.active_turn_token is None
 diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test_plugin_message_injection.py
-index ed990550e..eea2a755a 100644
+index ed990550e..0a4a7ee32 100644
 --- a/tests/gateway/test_plugin_message_injection.py
 +++ b/tests/gateway/test_plugin_message_injection.py
 @@ -12,10 +12,12 @@ import yaml
@@ -3368,7 +3603,7 @@ index ed990550e..eea2a755a 100644
 +from gateway.internal_events import create_gateway_system_event, gateway_system_event_message, new_gateway_event_receipt
  from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
  from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
- 
+
 @@ -45,7 +47,9 @@ def _runner(entry: SessionEntry | None, adapter=None) -> GatewayRunner:
      runner = object.__new__(GatewayRunner)
      runner.session_store = SimpleNamespace()
@@ -3380,7 +3615,7 @@ index ed990550e..eea2a755a 100644
      )
      runner.adapters = {Platform.TELEGRAM: adapter} if adapter else {}
      runner._profile_adapters = {}
-@@ -559,3 +563,759 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
+@@ -559,3 +563,805 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
      assert manager.has_gateway_message_injector is True
      assert manager.inject_gateway_message(value="kept") is True
      newer_injector.assert_called_once_with(value="kept")
@@ -4140,14 +4375,60 @@ index ed990550e..eea2a755a 100644
 +        runner._hmwa_post_turn_hooks.side_effect = RuntimeError("post-turn failure")
 +        assert await runner._handle_message_with_agent(event, entry.origin, entry.session_key, 1) == "error"
 +        assert event._gateway_event_terminal_status == "agent_error"
++
++@pytest.mark.asyncio
++async def test_native_gateway_readiness_uses_host_turn_context_and_live_target(tmp_path, monkeypatch):
++    from gateway.session_context import plugin_gateway_turn
++    from tools.thread_context import propagate_context_to_thread
++    from concurrent.futures import ThreadPoolExecutor
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-env-session")
++    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}}))
++    entry = _entry()
++    runner = _runner(entry, _RoutingAdapter())
++    runner._gateway_loop = asyncio.get_running_loop()
++    runner._session_key_for_source = lambda source: entry.session_key
++    runner._session_db = SimpleNamespace(get_session=lambda sid: {"id": sid, "ended_at": None})
++    manager = PluginManager(scope_key=str(tmp_path))
++    ctx = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
++    manager.set_gateway_message_injector(runner, runner._schedule_plugin_system_event)
++    ctx._gateway_observer_ready = True
++    manager._gateway_tasks = {("notify-plugin", "observer"): SimpleNamespace(done=lambda: False)}
++    turn = SimpleNamespace(source=entry.origin, session_key=entry.session_key, session_id=entry.session_id)
++    agent = SimpleNamespace(session_id=entry.session_id, api_mode="codex_responses", provider="openai-codex")
++    assert ctx.current_gateway_destination() is None
++    def probe():
++        target = ctx.current_gateway_destination()
++        return target, ctx.gateway_continuation_readiness(target)
++    with plugin_gateway_turn(runner, turn, agent):
++        import contextvars
++        copied = contextvars.copy_context()
++        target, ticket = await asyncio.to_thread(propagate_context_to_thread(probe))
++        assert target["session_id"] == entry.session_id
++        assert ticket["ready"] is True
++        entry.session_id = "replaced-physical-session"
++        _, ticket = await asyncio.to_thread(propagate_context_to_thread(probe))
++        assert ticket["ready"] is False
++        entry.session_id = turn.session_id
++        runner._is_user_authorized.return_value = False
++        _, ticket = await asyncio.to_thread(propagate_context_to_thread(probe))
++        assert ticket["ready"] is False
++    assert ctx.current_gateway_destination() is None
++    assert copied.run(ctx.current_gateway_destination) is None
++    turn.gateway_system_event = object()
++    with plugin_gateway_turn(runner, turn, agent):
++        assert ctx.current_gateway_destination() is None
++    with plugin_gateway_turn(object(), turn, agent):
++        assert ctx.current_gateway_destination() is None
 diff --git a/tests/gateway/test_silent_partial_delivery_95382.py b/tests/gateway/test_silent_partial_delivery_95382.py
 index 1f4106377..79df116c7 100644
 --- a/tests/gateway/test_silent_partial_delivery_95382.py
 +++ b/tests/gateway/test_silent_partial_delivery_95382.py
 @@ -247,7 +247,7 @@ class _RecordlessFlagConsumer(GatewayStreamConsumer):
          self._delivered_commentary_texts = []
- 
- 
+
+
 -def _make_runner(adapter):
 +def _make_runner(adapter, tmp_path):
      gateway_run = importlib.import_module("gateway.run")
@@ -4166,7 +4447,7 @@ index 1f4106377..79df116c7 100644
          thread_sessions_per_user=False,
 @@ -310,7 +312,7 @@ async def _run_turn(monkeypatch, tmp_path, *, consumer_cls=None, session_id):
      )
- 
+
      adapter = CaptureAdapter()
 -    runner = _make_runner(adapter)
 +    runner = _make_runner(adapter, tmp_path)
@@ -4179,14 +4460,14 @@ index 209f6f3e6..d71a214ee 100644
 +++ b/tests/hermes_cli/test_plugin_message_injection.py
 @@ -1,5 +1,7 @@
  """Tests for plugin message injection across CLI and gateway hosts."""
- 
+
 +import asyncio
 +import concurrent.futures
  from queue import SimpleQueue
  from types import SimpleNamespace
  from unittest.mock import MagicMock, patch
 @@ -17,7 +19,7 @@ def _context(name: str = "notify-plugin") -> tuple[PluginContext, PluginManager]
- 
+
  def _write_plugin_config(tmp_path, monkeypatch, entry: dict) -> None:
      hermes_home = tmp_path / "hermes"
 -    hermes_home.mkdir()
@@ -4447,10 +4728,10 @@ index 000000000..58bd52c6b
 +    ctx.profile_name='default';platform.enabled=False;assert notices.resolve_target(ctx) is None
 diff --git a/tests/tui_gateway/test_plugin_events.py b/tests/tui_gateway/test_plugin_events.py
 new file mode 100644
-index 000000000..e61cfd9e5
+index 000000000..130429ffd
 --- /dev/null
 +++ b/tests/tui_gateway/test_plugin_events.py
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,298 @@
 +"""Native plugin events preserve exact-session authority across readiness and admission."""
 +import threading
 +from types import SimpleNamespace
@@ -4592,9 +4873,11 @@ index 000000000..e61cfd9e5
 +    from concurrent.futures import ThreadPoolExecutor
 +    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 +    from tools.thread_context import propagate_context_to_thread
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text("plugins:\n  entries:\n    native-test:\n      allow_gateway_injection: true\n")
 +    manager = PluginManager(scope_key=str(tmp_path))
 +    ctx = PluginContext(PluginManifest(name="native-test", key="native-test", source="user"), manager)
-+    record = {"session_key": "physical-1", "agent": SimpleNamespace(session_id="physical-1", api_mode="codex_responses", provider="openai-codex"),
++    record = {"session_key": "agent:main:telegram:dm:123", "agent": SimpleNamespace(session_id="physical-1", api_mode="codex_responses", provider="openai-codex"),
 +              "history_lock": threading.RLock(), "history": [], "running": True,
 +              "profile_home": str(tmp_path), "transport": object()}
 +    current = contextvars.ContextVar("native-test-record", default=None)
@@ -4604,14 +4887,13 @@ index 000000000..e61cfd9e5
 +    manager._desktop_consumer = consumer
 +    ctx._desktop_observer_ready = True
 +    manager._desktop_tasks = {"native-test:observer": SimpleNamespace(done=lambda: False)}
-+    monkeypatch.setattr(ctx, "_gateway_injection_allowed", lambda: True)
 +    def handler(args, **kwargs):
 +        target = ctx.current_desktop_destination()
 +        return json.dumps({"destination": target, "readiness": ctx.desktop_continuation_readiness(target)})
 +    handle = ctx.register_tool(name="native_context_probe", toolset="native_test", schema={"name": "native_context_probe", "parameters": {"type": "object", "properties": {}}}, handler=handler)
 +    token = current.set(record)
 +    try:
-+        with ThreadPoolExecutor(max_workers=1) as pool:
++        with plugin_events.desktop_plugin_turn(record), ThreadPoolExecutor(max_workers=1) as pool:
 +            result = json.loads(pool.submit(propagate_context_to_thread(lambda: ctx.dispatch_tool("native_context_probe", {}))).result())
 +        assert result["destination"] == {"profile_name": "default", "session_id": "physical-1"}
 +        assert result["readiness"]["ready"] is True
@@ -4728,14 +5010,34 @@ index 000000000..e61cfd9e5
 +        return True
 +    server._run_prompt_submit = race
 +    assert consumer.inject(content, event).result()["status"] == "cancelled"
++
++
++def test_reopened_gateway_session_resolves_physical_desktop_destination(tmp_path):
++    from contextvars import ContextVar
++    row = {"session_key": "agent:main:telegram:dm:123", "agent": SimpleNamespace(session_id="physical-1", api_mode="codex_responses", provider="openai-codex"), "transport": object()}
++    current = ContextVar("test_current", default=row)
++    server = SimpleNamespace(_sessions={"ui-1": row}, _sessions_lock=threading.RLock(), _current_runtime_session_record=current, _session_has_live_transport=lambda row: row.get("transport") is not None)
++    manager = SimpleNamespace(home_path=tmp_path)
++    consumer = plugin_events.DesktopPluginConsumer(manager, server)
++    manager._desktop_consumer = consumer
++    import contextvars
++    with plugin_events.desktop_plugin_turn(row):
++        assert consumer.current_destination() == {"profile_name": "default", "session_id": "physical-1"}
++        copied = contextvars.copy_context()
++        server._sessions["duplicate"] = dict(row)
++        assert consumer.current_destination() is None
++        del server._sessions["duplicate"]
++    assert copied.run(consumer.current_destination) is None
++    with plugin_events.desktop_plugin_turn(row, internal=True):
++        assert consumer.current_destination() is None
 diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
 index a6f38cd4e..7c11e50cc 100644
 --- a/tui_gateway/methods_session.py
 +++ b/tui_gateway/methods_session.py
 @@ -2198,6 +2198,18 @@ def _(rid, params: dict) -> dict:
      return _ok(rid, event_replay.replay_stats())
- 
- 
+
+
 +@method("session.continuation.readiness")
 +def _(rid, params: dict) -> dict:
 +    """Read-only exact native destination probe through the authenticated serve transport."""
@@ -4753,10 +5055,10 @@ index a6f38cd4e..7c11e50cc 100644
      bind_module(globals(), server, skip=("_",))
 diff --git a/tui_gateway/plugin_events.py b/tui_gateway/plugin_events.py
 new file mode 100644
-index 000000000..230770de0
+index 000000000..309985d8c
 --- /dev/null
 +++ b/tui_gateway/plugin_events.py
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,183 @@
 +"""Serve-owned typed plugin events for one exact, connected native session."""
 +from __future__ import annotations
 +
@@ -4764,6 +5066,21 @@ index 000000000..230770de0
 +import dataclasses
 +from pathlib import Path
 +import uuid
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++_current_plugin_turn = ContextVar("desktop_plugin_turn", default=None)
++
++
++@contextmanager
++def desktop_plugin_turn(row, internal=False):
++    lease = {"row": row, "active": True, "internal": internal}
++    token = _current_plugin_turn.set(lease)
++    try:
++        yield
++    finally:
++        lease["active"] = False
++        _current_plugin_turn.reset(token)
 +
 +from gateway.internal_events import (
 +    GatewaySystemEvent, gateway_system_event_is_eligible,
@@ -4787,8 +5104,7 @@ index 000000000..230770de0
 +            return None
 +        with self.server._sessions_lock:
 +            matches = [(sid, row) for sid, row in self.server._sessions.items()
-+                       if row.get("session_key") == destination["session_id"]
-+                       and getattr(row.get("agent"), "session_id", None) == destination["session_id"]
++                       if getattr(row.get("agent"), "session_id", None) == destination["session_id"]
 +                       and Path(row.get("profile_home") or self.manager.home_path).resolve()
 +                       == Path(self.manager.home_path).resolve()
 +                       and getattr(row.get("agent"), "api_mode", None) == "codex_responses"
@@ -4808,10 +5124,13 @@ index 000000000..230770de0
 +                "native_session_id": sid, "destination": dict(destination), "busy": bool(row.get("running"))}
 +
 +    def current_destination(self):
++        from agent.delegation_context import is_delegated_child_context
 +        row = self.server._current_runtime_session_record.get()
-+        if row is None:
++        lease = _current_plugin_turn.get()
++        if (row is None or not lease or lease["row"] is not row or not lease["active"]
++                or lease["internal"] or is_delegated_child_context()):
 +            return None
-+        target = {"profile_name": "default", "session_id": row.get("session_key")}
++        target = {"profile_name": "default", "session_id": getattr(row.get("agent"), "session_id", None)}
 +        found = self._resolve(target)
 +        if found is None or found[1] is not row:
 +            return None
@@ -4924,7 +5243,7 @@ index 000000000..230770de0
 +    if getattr(consumer.manager, "_desktop_consumer", None) is consumer:
 +        consumer.manager._desktop_consumer = None
 diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
-index a80e1579a..8e27e741f 100644
+index a80e1579a..b3e513ed4 100644
 --- a/tui_gateway/prompt_turn.py
 +++ b/tui_gateway/prompt_turn.py
 @@ -430,6 +430,8 @@ class _TurnRun:
@@ -4933,8 +5252,8 @@ index a80e1579a..8e27e741f 100644
      receipt_attempted: bool = False
 +    gateway_system_event: Any = None
 +    terminal_result: Any = None
- 
- 
+
+
  def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
 @@ -453,7 +455,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
      # The sudo password callback is thread-local: without re-wiring here, sudo prompts
@@ -4972,7 +5291,7 @@ index a80e1579a..8e27e741f 100644
 +        return prompt, prompt, cols, streamer
      run_message = _prepend_note(run_message, _pending_reaction_notes(session))
      return prompt, _prepend_note(run_message, _hud_surface_note(session)), cols, streamer
- 
+
 @@ -531,6 +536,8 @@ def _invoke_agent(
          "stream_callback": _stream,
          "persist_user_message": (
@@ -5062,7 +5381,18 @@ index a80e1579a..8e27e741f 100644
          st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
          goal_followup = None
          try:
-@@ -842,9 +873,18 @@ def _run_prompt_submit(
+@@ -836,15 +867,26 @@ def _run_prompt_submit(
+                     st.receipt_committed = True
+                 return
+             prompt, run_message, cols, streamer = prepared
+-            _invoke_agent(
+-                sid, session, st, prompt, run_message, streamer, images, display_kind,
+-                display_metadata, turn_author)
++            from tui_gateway.plugin_events import desktop_plugin_turn
++            with desktop_plugin_turn(session, internal=gateway_system_event is not None):
++                _invoke_agent(
++                    sid, session, st, prompt, run_message, streamer, images, display_kind,
++                    display_metadata, turn_author)
              status_note = _absorb_turn_result(
                  sid, session, st, text, display_kind, display_metadata)
              payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
@@ -5128,7 +5458,7 @@ index 00c23bbb8..7520883ea 100644
                      if peer.generation != generation:
 @@ -223,6 +231,23 @@ class FanoutTransport:
                  return
- 
+
      def write(self, obj: dict) -> bool:
 +        return self._enqueue(obj, {})
 +
@@ -5166,7 +5496,7 @@ index 480ed3663..a4946ad35 100644
 @@ -105,7 +105,11 @@ class WSTransport:
          # Socket writes need an async boundary: several batches can queue on the loop during a stall.
          self._send_lock = asyncio.Lock()
- 
+
 -    def write(self, obj: dict) -> bool:
 +    def write_confirmed(self, obj: dict, *, timeout: float = 5.0) -> bool:
 +        """Use the ordered writer but refuse a timeout as delivery evidence."""

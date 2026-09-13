@@ -2006,7 +2006,7 @@ def _send_with_model_switch(
     before: dict[str, Any],
     target_selection: dict[str, Any],
     text: str,
-    *, message_id: str | None = None,
+    *, message_id: str | None = None, before_source_dispatch=None,
 ) -> dict[str, Any]:
     stored = before["thread"]
     previous_selection = copy.deepcopy(stored["modelSelection"])
@@ -2179,6 +2179,7 @@ def _send_with_model_switch(
             stored["id"],
             turn_command,
             switched_turn_observed,
+            on_dispatch_attempt=before_source_dispatch,
             race_detector=turn_raced,
             terminal_error_detector=lambda detail: _correlated_start_failure(
                 detail, turn_command, message_id
@@ -2262,10 +2263,12 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
     completion_policy = args.get("completion_policy")
     if "completion_policy" in args and (not isinstance(completion_policy, str) or completion_policy not in {"required", "none"}):
         _invalid("completion_policy must be required or none")
-    if ctx.get_config("continuation_enabled", False) is True and completion_policy is None:
-        raise ConflictError("enabled continuation requires explicit completion_policy required or none before dispatch")
-    if (completion_policy == "required") != ("continuation" in args):
-        _invalid("completion_policy required needs complete continuation authority; none forbids it")
+    if completion_policy is None:
+        completion_policy = "required"
+    if "continuation" in args and not isinstance(args["continuation"], dict):
+        _invalid("continuation must be an object when supplied")
+    if "continuation" in args and completion_policy != "required":
+        _invalid("continuation authority requires completion_policy required")
     thread_id = normalize_string(args["thread_id"], "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     text = normalize_message(args["message"])
     has_instance = "instance_id" in args
@@ -2335,13 +2338,7 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             store.initialize()
             if any(binding.t3_thread_id == thread_id for binding in store.active_bindings(str(getattr(ctx, "profile_name", "default")))):
                 raise ConflictError("explicit no-continuation conflicts with an active binding")
-        reserved_message_id = transport.new_uuid4() if "continuation" in args else None
-        if "continuation" in args:
-            try:
-                from .continuation_handoff import prepare_handoff
-            except ImportError:
-                from continuation_handoff import prepare_handoff
-            continuation = prepare_handoff(ctx, args["continuation"], thread_id, before, transport, reserved_message_id)
+        reserved_message_id = transport.new_uuid4() if completion_policy == "required" else None
         warning = FULL_ACCESS_WARNING if stored["runtimeMode"] == "full-access" else None
         target_selection: dict[str, Any] | None = None
         if explicit_selection is not None:
@@ -2358,57 +2355,116 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             )
             if explicit_options is not None:
                 target_selection["options"] = copy.deepcopy(explicit_options)
-        if (
-            target_selection is not None
-            and target_selection != stored["modelSelection"]
-        ):
-            try:
-                payload = _send_with_model_switch(
-                    transport, before, target_selection, text, message_id=reserved_message_id
-                )
-            except T3ClientError as exc:
-                if warning is not None:
-                    _annotate_error(exc, warning=warning)
-                raise
-            if warning is not None:
-                payload["warning"] = warning
-            if continuation is not None:
-                payload["continuation"] = continuation
-            return payload
-        try:
+        if target_selection is not None and target_selection != stored["modelSelection"]:
+            _require_model_switch_ready(stored, target_selection)
+        else:
             command, message_id = _build_turn_command(transport, stored, text, message_id=reserved_message_id)
-
-            def message_observed(detail: dict[str, Any]) -> bool:
-                thread = detail["thread"]
-                return any(
-                    item["id"] == message_id
-                    and item["role"] == "user"
-                    and item["text"] == text
-                    and (
-                        item["turnId"] is None
-                        or (
-                            isinstance(thread.get("latestTurn"), dict)
-                            and item["turnId"] == thread["latestTurn"]["turnId"]
-                        )
+        if completion_policy == "required":
+            try:
+                from .continuation_handoff import prepare_handoff
+            except ImportError:
+                from continuation_handoff import prepare_handoff
+            continuation = prepare_handoff(ctx, args.get("continuation"), thread_id, before, transport, reserved_message_id)
+        source_attempted = False
+        def mark_source_attempted():
+            nonlocal source_attempted
+            if completion_policy == "required":
+                try:
+                    from .continuation_handoff import recheck_handoff
+                except ImportError:
+                    from continuation_handoff import recheck_handoff
+                recheck_handoff(ctx, continuation)
+            source_attempted = True
+        try:
+            if (
+                target_selection is not None
+                and target_selection != stored["modelSelection"]
+            ):
+                try:
+                    payload = _send_with_model_switch(
+                        transport, before, target_selection, text, message_id=reserved_message_id,
+                        before_source_dispatch=mark_source_attempted
                     )
-                    for item in thread["messages"]
-                )
+                except T3ClientError as exc:
+                    if warning is not None:
+                        _annotate_error(exc, warning=warning)
+                    raise
+                if warning is not None:
+                    payload["warning"] = warning
+                if continuation is not None:
+                    payload["continuation"] = continuation
+                return payload
+            try:
+                def message_observed(detail: dict[str, Any]) -> bool:
+                    thread = detail["thread"]
+                    return any(
+                        item["id"] == message_id
+                        and item["role"] == "user"
+                        and item["text"] == text
+                        and (
+                            item["turnId"] is None
+                            or (
+                                isinstance(thread.get("latestTurn"), dict)
+                                and item["turnId"] == thread["latestTurn"]["turnId"]
+                            )
+                        )
+                        for item in thread["messages"]
+                    )
 
-            result = transport.mutate(thread_id, command, message_observed)
-        except T3ClientError as exc:
-            details: dict[str, Any] = {
-                "race_semantics": MODE_RACE_SEMANTICS,
-                "queue_semantics": QUEUE_SEMANTICS,
-            }
-            if warning is not None:
-                details["warning"] = warning
-            raise _annotate_error(exc, **details)
-        if result["verification"] == "accepted_pending_projection":
+                result = transport.mutate(thread_id, command, message_observed, on_dispatch_attempt=mark_source_attempted)
+            except T3ClientError as exc:
+                details: dict[str, Any] = {
+                    "race_semantics": MODE_RACE_SEMANTICS,
+                    "queue_semantics": QUEUE_SEMANTICS,
+                }
+                if warning is not None:
+                    details["warning"] = warning
+                raise _annotate_error(exc, **details)
+            if result["verification"] == "accepted_pending_projection":
+                payload = {
+                    "action": "new_turn_accepted_pending_projection",
+                    "command_state": "accepted_pending_projection",
+                    "message_id": message_id,
+                    **result,
+                    "race_semantics": MODE_RACE_SEMANTICS,
+                    "queue_semantics": QUEUE_SEMANTICS,
+                }
+                if warning is not None:
+                    payload["warning"] = warning
+                if continuation is not None:
+                    payload["continuation"] = continuation
+                return payload
+            detail = result["detail"]
+            if not isinstance(detail, dict):
+                raise T3ClientError()
+            observed = detail["thread"]
+            matches = [item for item in observed["messages"] if item["id"] == message_id]
+            if len(matches) != 1:
+                raise T3ClientError()
+            persisted = matches[0]
+            pending = _pending_requests(observed)
+            latest = observed.get("latestTurn")
+            if persisted["turnId"] is None:
+                command_state = "queued"
+            elif pending:
+                command_state = "blocked"
+            elif isinstance(latest, dict) and latest["turnId"] == persisted["turnId"]:
+                command_state = {
+                    "running": "started",
+                    "completed": "completed",
+                    "error": "error",
+                    "interrupted": "completed",
+                }[latest["state"]]
+            else:
+                raise T3ClientError()
             payload = {
-                "action": "new_turn_accepted_pending_projection",
-                "command_state": "accepted_pending_projection",
+                "action": "new_turn_same_thread",
                 "message_id": message_id,
                 **result,
+                "command_state": command_state,
+                "persisted_message": _normalized_message(persisted),
+                "provider_session": observed["session"],
+                "latest_turn": observed["latestTurn"],
                 "race_semantics": MODE_RACE_SEMANTICS,
                 "queue_semantics": QUEUE_SEMANTICS,
             }
@@ -2417,45 +2473,14 @@ def t3_thread_send(ctx: Any, raw_args: Any) -> dict[str, Any]:
             if continuation is not None:
                 payload["continuation"] = continuation
             return payload
-        detail = result["detail"]
-        if not isinstance(detail, dict):
-            raise T3ClientError()
-        observed = detail["thread"]
-        matches = [item for item in observed["messages"] if item["id"] == message_id]
-        if len(matches) != 1:
-            raise T3ClientError()
-        persisted = matches[0]
-        pending = _pending_requests(observed)
-        latest = observed.get("latestTurn")
-        if persisted["turnId"] is None:
-            command_state = "queued"
-        elif pending:
-            command_state = "blocked"
-        elif isinstance(latest, dict) and latest["turnId"] == persisted["turnId"]:
-            command_state = {
-                "running": "started",
-                "completed": "completed",
-                "error": "error",
-                "interrupted": "completed",
-            }[latest["state"]]
-        else:
-            raise T3ClientError()
-        payload = {
-            "action": "new_turn_same_thread",
-            "message_id": message_id,
-            **result,
-            "command_state": command_state,
-            "persisted_message": _normalized_message(persisted),
-            "provider_session": observed["session"],
-            "latest_turn": observed["latestTurn"],
-            "race_semantics": MODE_RACE_SEMANTICS,
-            "queue_semantics": QUEUE_SEMANTICS,
-        }
-        if warning is not None:
-            payload["warning"] = warning
-        if continuation is not None:
-            payload["continuation"] = continuation
-        return payload
+
+        finally:
+            if continuation is not None and completion_policy == "required" and "continuation" not in args and not source_attempted:
+                try:
+                    from .continuation_handoff import cancel_undispatched_handoff
+                except ImportError:
+                    from continuation_handoff import cancel_undispatched_handoff
+                cancel_undispatched_handoff(ctx, continuation)
 
     try:
         return _execute_operation(ctx, normalized, perform)
