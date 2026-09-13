@@ -608,7 +608,7 @@ async def _binding_worker(ctx: Any, store: ContinuationStore, binding_id: str,
                     raise ContinuationStateError("T3 stream item kind is unsupported")
                 if isinstance(sequence, bool) or not isinstance(sequence, int):
                     raise ContinuationStateError("T3 stream cursor is invalid")
-                if normalized is not None and current.platform == "desktop":
+                if normalized is not None and (current.platform == "desktop" or store.reserved_source(current)):
                     source_snapshot = snapshot if kind == "snapshot" else await asyncio.to_thread(
                         read_thread_snapshot, ctx, thread_id=current.t3_thread_id,
                         environment_id=current.t3_environment_id)
@@ -645,8 +645,7 @@ async def run_continuation_worker(ctx: Any, *, surface: str = "gateway") -> None
         try:
             await _run_continuation_supervisor(ctx, surface=surface)
         finally:
-            if surface == "desktop":
-                ctx._desktop_observer_ready = False
+            setattr(ctx, f"_{surface}_observer_ready", False)
 
 
 async def _run_continuation_supervisor(ctx: Any, *, surface: str) -> None:
@@ -669,8 +668,7 @@ async def _run_continuation_supervisor(ctx: Any, *, surface: str) -> None:
         except ImportError:
             import continuation_notifications
         continuation_notifications.recover(store)
-    if surface == "desktop":
-        ctx._desktop_observer_ready = True
+    setattr(ctx, f"_{surface}_observer_ready", True)
     reconnect_limit = _bounded_int(
         ctx.get_config("continuation_max_reconnects", None), MAX_RECONNECTS, 1, 64
     )

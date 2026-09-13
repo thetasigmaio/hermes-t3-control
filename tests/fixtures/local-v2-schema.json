@@ -1,0 +1,42 @@
+[
+  [
+    "index",
+    "events_dispatch_idx",
+    "CREATE INDEX events_dispatch_idx\n                    ON events(status, updated_at, source_sequence)"
+  ],
+  [
+    "table",
+    "binding_lineage",
+    "CREATE TABLE binding_lineage (predecessor_binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),successor_binding_id TEXT NOT NULL UNIQUE REFERENCES bindings(binding_id),renewed_at TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "bindings",
+    "CREATE TABLE \"bindings\" (\n                    binding_id TEXT PRIMARY KEY,\n                    profile_name TEXT NOT NULL,\n                    t3_thread_id TEXT NOT NULL,\n                    t3_owner_id TEXT NOT NULL,\n                    t3_environment_id TEXT NOT NULL,\n                    hermes_session_key TEXT NOT NULL,\n                    hermes_session_id TEXT NOT NULL,\n                    platform TEXT NOT NULL,\n                    user_id TEXT NOT NULL,\n                    chat_id TEXT NOT NULL,\n                    topic_id TEXT NOT NULL,\n                    sunsama_task_id TEXT NOT NULL,\n                    source_identity TEXT NOT NULL,\n                    followup_scope TEXT NOT NULL,\n                    max_continuations INTEGER NOT NULL,\n                    state TEXT NOT NULL CHECK(state IN ('active','paused','stopped','cancelled')),\n                    cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK(cursor_sequence >= 0),\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                , baseline_captured INTEGER NOT NULL DEFAULT 0 CHECK(baseline_captured IN (0,1)))"
+  ],
+  [
+    "table",
+    "events",
+    "CREATE TABLE events (\n                    binding_id TEXT NOT NULL REFERENCES bindings(binding_id),\n                    source_sequence INTEGER NOT NULL CHECK(source_sequence >= 0),\n                    source_event_id TEXT NOT NULL,\n                    source_turn_id TEXT NOT NULL,\n                    event_kind TEXT NOT NULL,\n                    occurred_at TEXT NOT NULL,\n                    envelope_json TEXT NOT NULL,\n                    envelope_mac TEXT NOT NULL,\n                    status TEXT NOT NULL CHECK(status IN\n                        ('queued','dispatching','completed','acknowledged','cancelled','blocked','uncertain')),\n                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),\n                    busy_attempts INTEGER NOT NULL DEFAULT 0 CHECK(busy_attempts >= 0),\n                    receipt_json TEXT,\n                    last_error_code TEXT,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    PRIMARY KEY(binding_id, source_sequence),\n                    UNIQUE(binding_id, source_event_id),\n                    UNIQUE(binding_id, event_kind, source_turn_id)\n                )"
+  ],
+  [
+    "table",
+    "meta",
+    "CREATE TABLE meta (\n                    key TEXT PRIMARY KEY,\n                    value TEXT NOT NULL\n                )"
+  ],
+  [
+    "table",
+    "notification_targets",
+    "CREATE TABLE notification_targets (\n                binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),\n                envelope_json TEXT NOT NULL, envelope_mac TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "notifications",
+    "CREATE TABLE notifications (\n                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),\n                source_sequence INTEGER NOT NULL, envelope_json TEXT NOT NULL, envelope_mac TEXT NOT NULL,\n                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,\n                retry_at REAL NOT NULL DEFAULT 0, receipt_json TEXT,\n                PRIMARY KEY(binding_id,source_sequence))"
+  ],
+  [
+    "table",
+    "source_reservations",
+    "CREATE TABLE source_reservations (binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id), envelope_json TEXT NOT NULL, envelope_mac TEXT NOT NULL)"
+  ]
+]

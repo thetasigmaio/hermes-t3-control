@@ -848,6 +848,7 @@ class T3Client:
         ]
         | None = None,
         require_accepted_sequence: bool = False,
+        on_dispatch_attempt: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         normalized_thread_id = normalize_string(
             thread_id, "thread_id", max_chars=MAX_IDENTIFIER_CHARS
@@ -878,6 +879,9 @@ class T3Client:
         ):
             raise InvalidInputError("terminal error detector must be callable.")
 
+        if on_dispatch_attempt is not None and not callable(on_dispatch_attempt):
+            raise InvalidInputError("dispatch callback must be callable.")
+
         operation_deadline = self.clock() + self.mutation_timeout
         last_detail: dict[str, Any] | None = None
         ambiguous_cause_code: str | None = None
@@ -889,6 +893,7 @@ class T3Client:
                         "/api/orchestration/dispatch",
                         body=body,
                         deadline=operation_deadline,
+                        **({"_on_request_attempt": on_dispatch_attempt} if on_dispatch_attempt is not None else {}),
                     )
                 )
             except T3ClientError as exc:
@@ -1179,6 +1184,7 @@ class T3Client:
         body: bytes | None = None,
         deadline: float | None = None,
         _send_authorization: bool = True,
+        _on_request_attempt: Callable[[], None] | None = None,
     ) -> Any:
         self._validate_endpoint(method, path)
         if not _send_authorization and (
@@ -1214,6 +1220,8 @@ class T3Client:
                 headers["Authorization"] = f"Bearer {self.token}"
             if body is not None:
                 headers["Content-Type"] = "application/json"
+            if _on_request_attempt is not None:
+                _on_request_attempt()
             connection.request(method, path, body=body, headers=headers)
             self._set_socket_timeout(connection, request_deadline)
             response = connection.getresponse()

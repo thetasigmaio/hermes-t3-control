@@ -214,7 +214,10 @@ class ContinuationStore:
             if version == 1:
                 self._migrate_v1_to_current(db)
             elif version == 2:
-                self._migrate_v2_to_current(db)
+                if self._table_columns(db, "bindings") == V1_BINDING_COLUMNS + ("baseline_captured",):
+                    self._migrate_local_v2_to_current(db)
+                else:
+                    self._migrate_v2_to_current(db)
             elif version == 3:
                 self._migrate_v3_to_current(db)
             elif version == SCHEMA_VERSION:
@@ -539,6 +542,49 @@ class ContinuationStore:
             db.execute("PRAGMA foreign_keys=ON")
         self._validate_schema(db)
 
+    def _migrate_local_v2_to_current(self, db):
+        """Recognize only the audited local Desktop v2 layout, not arbitrary v2 files."""
+        db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            objects = [(row["type"], row["name"], "".join(row["sql"].lower().split()).replace('"', ''))
+                for row in db.execute("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
+            fingerprint = hashlib.sha256(json.dumps(objects, separators=(",", ":")).encode()).hexdigest()
+            if fingerprint != "51193c731228166b37f270ce077f2e902f134902c9cc2b627376e78e07c72b54":
+                raise ContinuationStateError("experimental continuation v2 shape is not canonical")
+            if dict(db.execute("SELECT key,value FROM meta")) != {"schema_version": "2", "source_reservation_version": "1"}:
+                raise ContinuationStateError("local continuation migration metadata is not supported")
+            if not self.key_path.is_file() or len(self.key_path.read_bytes()) != 32:
+                raise ContinuationStateError("local continuation migration requires its original HMAC key")
+            if db.execute("SELECT t3_thread_id FROM bindings WHERE state IN ('active','paused') GROUP BY t3_thread_id HAVING count(*)>1").fetchone():
+                raise ContinuationStateError("local continuation migration has conflicting live generations")
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or db.execute("PRAGMA foreign_key_check").fetchall():
+                raise ContinuationStateError("local continuation migration has invalid database integrity")
+            for table in ("events", "source_reservations", "notification_targets", "notifications"):
+                for row in db.execute(f"SELECT envelope_json,envelope_mac FROM {table}"):
+                    try:
+                        payload = json.loads(row["envelope_json"])
+                    except (TypeError, ValueError) as exc:
+                        raise ContinuationStateError("local continuation migration has invalid signed data") from exc
+                    if not isinstance(payload, dict) or not self.verify(payload, row["envelope_mac"]):
+                        raise ContinuationStateError("local continuation migration has invalid signed data")
+            self._create_bindings_table(db, "bindings_v3")
+            db.execute(f"INSERT INTO bindings_v3({','.join(BINDING_COLUMNS)}) SELECT {','.join(V1_BINDING_COLUMNS)},?,baseline_captured FROM bindings", (SCHEMA_VERSION,))
+            db.execute("DROP TABLE bindings")
+            db.execute("ALTER TABLE bindings_v3 RENAME TO bindings")
+            db.execute("CREATE UNIQUE INDEX bindings_live_thread_idx ON bindings(t3_thread_id) WHERE state IN ('active','paused')")
+            db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+            self._validate_schema(db)
+            if db.execute("PRAGMA foreign_key_check").fetchall():
+                raise ContinuationStateError("local continuation migration produced invalid foreign keys")
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
+
     def _migrate_v2_to_current(self, db: sqlite3.Connection) -> None:
         # Only the canonical public v2 schema is supported. Experimental local
         # variants sharing its version number must fail closed without mutation.
@@ -636,8 +682,8 @@ class ContinuationStore:
             return False
         if any(envelope.get(field) != binding_row[field] for field in AUTHORITY_FIELDS):
             return False
-        if binding_row["platform"] == "desktop":
-            source_message = self.reserved_source(binding_row)
+        source_message = self.reserved_source(binding_row)
+        if binding_row["platform"] == "desktop" or source_message:
             if not source_message or envelope.get("source_message_id") != source_message:
                 return False
         return (
@@ -764,6 +810,74 @@ class ContinuationStore:
                     db.execute("ROLLBACK")
                 raise
         return self.get_binding(binding_id)
+
+    def bind_automatic(self, *, baseline, message_id, excluded_turn_ids=(), **values):
+        """A fresh finite mission never rewrites or replays terminal history."""
+        self._validate_baseline(baseline)
+        normalized = self._normalize_binding_values(values)
+        if normalized["max_continuations"] != 1 or normalized["sunsama_task_id"]:
+            raise ContinuationStateError("automatic missions require one report and no ledger")
+        reservation = dict(normalized, source_message_id=_clean(message_id, "message_id", maximum=256),
+            correlation={"phase": "awaiting_start", "turn_id": None,
+                "excluded_turn_ids": sorted({_clean(turn, "excluded_turn_id") for turn in excluded_turn_ids if turn})})
+        now = utc_now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                history = db.execute("SELECT * FROM bindings WHERE t3_thread_id=?", (normalized["t3_thread_id"],)).fetchall()
+                for old in history:
+                    events = db.execute("SELECT * FROM events WHERE binding_id=?", (old["binding_id"],)).fetchall()
+                    if old["state"] == "paused" or any(event["status"] in {"queued", "dispatching"}
+                            or (event["status"] == "acknowledged" and event["receipt_json"] is None and event["last_error_code"] is None)
+                            for event in events):
+                        raise ContinuationStateError("thread has paused or unsettled work")
+                    if old["state"] != "active":
+                        continue
+                    if any(old[key] != normalized[key] for key in ("profile_name", "t3_environment_id", "hermes_session_id")):
+                        raise ContinuationStateError("thread has foreign active mission identity")
+                    settled = len(events) == old["max_continuations"]
+                    for event in events:
+                        try:
+                            receipt = json.loads(event["receipt_json"])
+                        except (TypeError, ValueError):
+                            receipt = None
+                        settled = settled and event["status"] == "acknowledged" and isinstance(receipt, dict) and receipt.get("status") == "completed" and self._event_authority_matches(old, event)
+                    if not settled:
+                        raise ContinuationStateError("thread has an active mission")
+                    db.execute("UPDATE bindings SET state='stopped',updated_at=? WHERE binding_id=?", (now, old["binding_id"]))
+                self._insert_binding(db, normalized, now, baseline)
+                db.execute("INSERT INTO source_reservations VALUES(?,?,?)", (normalized["binding_id"], _canonical(reservation).decode("ascii"), self.sign(reservation)))
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        return self.get_binding(normalized["binding_id"])
+
+    def cancel_undispatched(self, binding_id, message_id):
+        """Retire only an untouched active reservation, preserving operator withdrawal."""
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute("SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
+                if row is None or row["state"] != "active" or db.execute("SELECT 1 FROM events WHERE binding_id=? LIMIT 1", (binding_id,)).fetchone():
+                    db.execute("ROLLBACK")
+                    return False
+                try:
+                    reservation = self._source_correlation(db, self._effective_binding(db, row))
+                except ContinuationStateError:
+                    db.execute("ROLLBACK")
+                    return False
+                if reservation is None or reservation["source_message_id"] != message_id:
+                    db.execute("ROLLBACK")
+                    return False
+                db.execute("UPDATE bindings SET state='cancelled',updated_at=? WHERE binding_id=?", (utc_now(), binding_id))
+                db.execute("COMMIT")
+                return True
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
 
     def renew(self, replaces_binding_id: str, *, baseline: tuple[int, str] | None = None,
               desktop_upgrade: bool = False, current_turn: tuple[str, str] | None = None,
@@ -1038,7 +1152,7 @@ class ContinuationStore:
                 item["successor_binding_id"] = (
                     successor["successor_binding_id"] if successor else None
                 )
-                if row["platform"] == "desktop":
+                if row["platform"] == "desktop" or self.reserved_source(row):
                     item["source_message_id"] = self.reserved_source(row)
                     item["armed"] = item["armed"] and bool(item["source_message_id"])
                 result.append(item)
@@ -1072,7 +1186,7 @@ class ContinuationStore:
                     return False
                 if native_event is not None and native_event.get("sequence") != cursor_sequence:
                     raise ContinuationStateError("source correlation sequence is invalid")
-                if binding.platform == "desktop":
+                if binding.platform == "desktop" or self._source_correlation(db, binding) is not None:
                     self._correlate_source(db, binding, native_event, snapshot_gap)
                     reservation = self._source_correlation(db, binding)
                     correlation = (reservation or {}).get("correlation", {})

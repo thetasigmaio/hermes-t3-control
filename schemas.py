@@ -151,10 +151,10 @@ T3_THREAD_SEND_SCHEMA = _schema(
             ),
         },
         "completion_policy": {"type": "string", "enum": ["required", "none"],
-            "description": "When continuation is enabled, explicitly require a scoped handoff or select none for an unwatched send."},
+            "description": "Defaults to required: automatically register one bounded result report in the current trusted conversation, or fail before dispatch. Select none only for an intentional unwatched send."},
         "continuation": {
             "type": "object", "additionalProperties": False,
-            "description": "Required scoped Desktop handoff: register or explicitly renew before source dispatch; omission is a plain send without a continuation promise.",
+            "description": "Optional explicit extended Desktop mission authority. Omit for automatic registration of one read-only result report; no binding IDs or destination credentials are needed.",
             "properties": {"notify_telegram": {"type": "boolean", "description": "Explicitly notify the configured Telegram home after this Desktop PM verification; separate durable receipt."}, **{name: dict(_ID) for name in ("binding_id", "owner_id", "environment_id", "sunsama_task_id", "source_identity", "followup_scope", "replaces")},
                            "expected_turn_id": {"type": ["string", "null"]},
                            "max_continuations": {"type": "integer", "minimum": 1, "maximum": 16},

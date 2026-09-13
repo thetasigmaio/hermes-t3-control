@@ -22,4 +22,4 @@ For Desktop or `hermes serve`, run `hermes serve --status`, then fully relaunch 
 
 Full setup and recovery are in the bundled `README.md` and `docs/operations.md`.
 
-The same-session continuation observer remains disabled unless an operator creates an exact local binding and explicitly enables `continuation_enabled`. Stock Hermes lacks the required native gateway APIs. The separately published experimental patch applies only to clean upstream commit `63279301bcbdc185c1b07b98a9312eb0c862f26d`; see `docs/experimental-continuation.md`. The eleven basic tools remain available without it.
+The same-session continuation observer is opt-in and needs the matching native host patch plus a live authenticated consumer. Version 1.5.0 automatically registers one result report for ordinary `t3_thread_send`, or fails before dispatch. Use `completion_policy: "none"` only for an intentional unwatched send. No per-task binding or credential setup is needed. See `docs/experimental-continuation.md`. The upstream host PR is not merged.

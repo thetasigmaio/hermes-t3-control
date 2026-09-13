@@ -17,7 +17,7 @@ Run the literal first non-thread-mutating check after restart. Default local aut
 
 ## Allowlisted same-session continuation
 
-Continuation is an experimental, default-profile opt-in. It is unavailable on unmodified stock Hermes and requires the exact clean-base manual host patch. The eleven basic tools remain independent.
+Continuation is an experimental, default-profile opt-in. It is unavailable on unmodified stock Hermes and requires the exact clean-base manual host patch. Stock Hermes supports basic read/control; intentional unwatched sends must set `completion_policy: "none"`. Ordinary sends require the matching automatic-completion host APIs.
 
 Follow [Experimental continuation](experimental-continuation.md) for authenticated patch download, exact-base checks, affected tests, binding, renewal, restart, and rollback. The Sunsama-named field is only an opaque operator task reference; the plugin does not contact Sunsama. Binding commands and local status output contain private route/session metadata and must not be published.
 
@@ -64,15 +64,15 @@ Verify the release tag against the pinned signer, confirm the active profile, th
     env -i PATH="$PATH" LC_ALL=C HOME="$VERIFY_DIR/home" XDG_CONFIG_HOME="$VERIFY_DIR/xdg" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"
   }
   safe_git -C "$VERIFY_DIR/repo" init -q
-  safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.4.0:refs/tags/v1.4.0'
-  test "$(safe_git -C "$VERIFY_DIR/repo" cat-file -t refs/tags/v1.4.0)" = tag
-  test "$(safe_git -C "$VERIFY_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.4.0)" = v1.4.0
-  TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.4.0 2>&1 || true)"
+  safe_git -C "$VERIFY_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.5.0:refs/tags/v1.5.0'
+  test "$(safe_git -C "$VERIFY_DIR/repo" cat-file -t refs/tags/v1.5.0)" = tag
+  test "$(safe_git -C "$VERIFY_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.5.0)" = v1.5.0
+  TAG_VERIFY="$(safe_git -C "$VERIFY_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.5.0 2>&1 || true)"
   if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
     printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
     exit 1
   fi
-  HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.4.0^{commit}')"
+  HERMES_T3_CONTROL_REF="$(safe_git -C "$VERIFY_DIR/repo" rev-parse --verify 'v1.5.0^{commit}')"
   printf '%s\n' "$HERMES_T3_CONTROL_REF" | grep -Eq '^[0-9a-f]{40}$'
   hermes plugins disable hermes-t3-control
   hermes plugins remove hermes-t3-control
@@ -113,31 +113,31 @@ The downloaded checksum alone is not authenticity proof. This private, HTTPS-onl
     env -i PATH="$PATH" LC_ALL=C HOME="$RELEASE_DIR/home" XDG_CONFIG_HOME="$RELEASE_DIR/xdg" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"
   }
   safe_git -C "$RELEASE_DIR/repo" init -q
-  safe_git -C "$RELEASE_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.4.0:refs/tags/v1.4.0'
-  test "$(safe_git -C "$RELEASE_DIR/repo" cat-file -t refs/tags/v1.4.0)" = tag
-  test "$(safe_git -C "$RELEASE_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.4.0)" = v1.4.0
-  TAG_VERIFY="$(safe_git -C "$RELEASE_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.4.0 2>&1 || true)"
+  safe_git -C "$RELEASE_DIR/repo" -c protocol.file.allow=never fetch -q --no-tags https://github.com/thetasigmaio/hermes-t3-control.git 'refs/tags/v1.5.0:refs/tags/v1.5.0'
+  test "$(safe_git -C "$RELEASE_DIR/repo" cat-file -t refs/tags/v1.5.0)" = tag
+  test "$(safe_git -C "$RELEASE_DIR/repo" for-each-ref --format='%(tag)' refs/tags/v1.5.0)" = v1.5.0
+  TAG_VERIFY="$(safe_git -C "$RELEASE_DIR/repo" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/dev/null verify-tag --raw v1.5.0 2>&1 || true)"
   if ! printf '%s\n' "$TAG_VERIFY" | grep -Fqx 'Good "git" signature with ED25519 key SHA256:w7wKQukCKTYbelHXBB3necJ6DkvZ9l01ehw83L5r4T4'; then
     printf '%s\n' 'Release tag signature did not match the pinned signer.' >&2
     exit 1
   fi
-  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.4.0^{commit}')"
+  RELEASE_REF="$(safe_git -C "$RELEASE_DIR/repo" rev-parse --verify 'v1.5.0^{commit}')"
   printf '%s\n' "$RELEASE_REF" | grep -Eq '^[0-9a-f]{40}$'
   safe_git -C "$RELEASE_DIR/repo" checkout -q --detach "$RELEASE_REF"
-  safe_git -C "$RELEASE_DIR/repo" show "$RELEASE_REF:release/v1.4.0.sha256" > "$RELEASE_DIR/authenticated.sha256"
-  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.4.0.tar.gz" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/hermes-t3-control-1.4.0.tar.gz
-  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.4.0.tar.gz.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/hermes-t3-control-1.4.0.tar.gz.sha256
-  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/install-t3.sh" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/install-t3.sh
-  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/install-t3.sh.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.4.0/install-t3.sh.sha256
-  grep '  hermes-t3-control-1.4.0.tar.gz$' "$RELEASE_DIR/authenticated.sha256" > "$RELEASE_DIR/expected.sha256"
-  cmp -- "$RELEASE_DIR/expected.sha256" "$RELEASE_DIR/download/hermes-t3-control-1.4.0.tar.gz.sha256"
-  (cd "$RELEASE_DIR/download" && python3 -B "$RELEASE_DIR/repo/scripts/verify_release.py" hermes-t3-control-1.4.0.tar.gz.sha256)
+  safe_git -C "$RELEASE_DIR/repo" show "$RELEASE_REF:release/v1.5.0.sha256" > "$RELEASE_DIR/authenticated.sha256"
+  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.5.0.tar.gz" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/hermes-t3-control-1.5.0.tar.gz
+  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/hermes-t3-control-1.5.0.tar.gz.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/hermes-t3-control-1.5.0.tar.gz.sha256
+  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/install-t3.sh" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/install-t3.sh
+  curl --fail --show-error --location --proto '=https' --proto-redir '=https' --output "$RELEASE_DIR/download/install-t3.sh.sha256" https://github.com/thetasigmaio/hermes-t3-control/releases/download/v1.5.0/install-t3.sh.sha256
+  grep '  hermes-t3-control-1.5.0.tar.gz$' "$RELEASE_DIR/authenticated.sha256" > "$RELEASE_DIR/expected.sha256"
+  cmp -- "$RELEASE_DIR/expected.sha256" "$RELEASE_DIR/download/hermes-t3-control-1.5.0.tar.gz.sha256"
+  (cd "$RELEASE_DIR/download" && python3 -B "$RELEASE_DIR/repo/scripts/verify_release.py" hermes-t3-control-1.5.0.tar.gz.sha256)
   grep '  install-t3.sh$' "$RELEASE_DIR/authenticated.sha256" > "$RELEASE_DIR/expected-installer.sha256"
   cmp -- "$RELEASE_DIR/expected-installer.sha256" "$RELEASE_DIR/download/install-t3.sh.sha256"
   (cd "$RELEASE_DIR/download" && python3 -B "$RELEASE_DIR/repo/scripts/verify_release.py" install-t3.sh.sha256)
   safe_git -C "$RELEASE_DIR/repo" show "$RELEASE_REF:scripts/install-signed.sh" | cmp - "$RELEASE_DIR/download/install-t3.sh"
   python3 -B "$RELEASE_DIR/repo/scripts/build_release.py" --output-dir "$RELEASE_DIR/reproduced"
-  cmp -- "$RELEASE_DIR/download/hermes-t3-control-1.4.0.tar.gz" "$RELEASE_DIR/reproduced/hermes-t3-control-1.4.0.tar.gz"
+  cmp -- "$RELEASE_DIR/download/hermes-t3-control-1.5.0.tar.gz" "$RELEASE_DIR/reproduced/hermes-t3-control-1.5.0.tar.gz"
   bash "$RELEASE_DIR/download/install-t3.sh"
 )
 ```
@@ -150,8 +150,8 @@ Run the dependency-free suite and local release gates from a clean checkout:
 PYTHONWARNINGS=error python3.11 -B -m unittest discover -s tests -v
 env PYTHONDONTWRITEBYTECODE=1 hermes plugins doctor . --ci
 python3 -B scripts/build_release.py --output-dir dist
-python3 -B scripts/verify_release.py dist/hermes-t3-control-1.4.0.tar.gz.sha256
-python3 -B scripts/verify_release.py dist/hermes-gateway-continuation-1.4.0.patch.sha256
+python3 -B scripts/verify_release.py dist/hermes-t3-control-1.5.0.tar.gz.sha256
+python3 -B scripts/verify_release.py dist/hermes-gateway-continuation-1.5.0.patch.sha256
 python3 -B scripts/verify_release.py dist/install-t3.sh.sha256
 ```
 
@@ -161,4 +161,4 @@ Supported-install CI uses uv 0.12.0 and `uv sync --frozen` against these exact H
 - 0.20.5: `fcbd1076a93841fa88855acce810e342a5b78101`
 - 0.21.0: `29112bef099274229cadff79cdff7bf7b99c4b77`
 
-The fresh-process inspector permits only its expected loopback TCP connection and asserts that the plugin is enabled, manifest v1, version 1.4.0, and exactly eleven tools are registered, discoverable, and callable.
+The fresh-process inspector permits only its expected loopback TCP connection and asserts that the plugin is enabled, manifest v1, version 1.5.0, and exactly eleven tools are registered, discoverable, and callable.

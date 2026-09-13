@@ -91,7 +91,7 @@ assert manifest.manifest_version == 1
 assert manifest.api_version == 1
 assert (manifest.name, manifest.version, manifest.kind) == (
     "hermes-t3-control",
-    "1.4.0",
+    "1.5.0",
     "standalone",
 )
 assert tuple(manifest.provides_tools) == expected_tools
@@ -520,7 +520,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
             disabled_plugins = json.loads(listed_disabled.stdout)
             self.assertEqual(len(disabled_plugins), 1)
             self.assertEqual(disabled_plugins[0]["name"], "hermes-t3-control")
-            self.assertEqual(disabled_plugins[0]["version"], "1.4.0")
+            self.assertEqual(disabled_plugins[0]["version"], "1.5.0")
             self.assertIn(disabled_plugins[0]["source"], {"git", f"git pinned@{revision[:8]}"})
             self.assertEqual(disabled_plugins[0]["status"], "not enabled")
 
@@ -529,7 +529,7 @@ class SupportedInstallRegressionTests(unittest.TestCase):
                 (installed_root / "plugin.yaml").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["manifest_version"], 1)
-            self.assertEqual(manifest["version"], "1.4.0")
+            self.assertEqual(manifest["version"], "1.5.0")
             self.assertEqual(tuple(manifest["provides_tools"]), EXPECTED_TOOLS)
             self.assertEqual(
                 manifest["python_dependencies"], ["websockets>=15,<16"]

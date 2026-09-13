@@ -189,3 +189,13 @@ dispatch on the separately patched Desktop host. It carries a fresh binding ID,
 finite scope/budget, optional predecessor, optional external task reference, and
 opt-in Telegram notice. Missing native context or readiness fails closed.
 See [experimental setup and limitations](experimental-continuation.md).
+
+
+### Automatic send completion
+
+`t3_thread_send` defaults to `completion_policy: "required"`. With the matching
+native host and enabled observer, omit `continuation`: the tool registers one
+result report in the current authenticated conversation before dispatch. If no
+supported consumer is ready, it refuses the send. For deliberate basic control
+without a return report, set `completion_policy: "none"`. The optional explicit
+`continuation` object is retained for extended Desktop mission authority.

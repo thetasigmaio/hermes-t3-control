@@ -110,8 +110,9 @@ jobs:
       - name: Run affected host tests
         working-directory: hermes
         run: |
-          uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2 \
+          uv run --frozen --extra dev --extra messaging bash scripts/run_tests.sh -j 2 --file-timeout 300 \
             tests/agent/test_codex_responses_adapter.py \
+            tests/agent/test_compression_rotation_state.py \
             tests/agent/test_engine_preflight_wire.py \
             tests/agent/test_gateway_event_overflow.py \
             tests/agent/test_preflight_compression_gate.py \
@@ -147,6 +148,11 @@ jobs:
             tests/tui_gateway/test_relay_live_author.py \
             tests/tui_gateway/test_session_control.py \
             tests/tui_gateway/test_turn_finished_failure_cause.py
+      - name: Exercise native discovered send and typed callback chains
+        working-directory: hermes
+        run: |
+          uv run --frozen --extra dev --extra messaging python -B ../plugin/tests/native_handoff_probe.py --host . --surface desktop
+          uv run --frozen --extra dev --extra messaging python -B ../plugin/tests/native_handoff_probe.py --host . --surface gateway
 
   package:
     name: Deterministic release package
@@ -165,22 +171,22 @@ jobs:
         run: python -B scripts/build_release.py --output-dir dist
       - name: Verify detached checksum
         run: |
-          python -B scripts/verify_release.py dist/hermes-t3-control-1.4.0.tar.gz.sha256
-          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.4.0.patch.sha256
+          python -B scripts/verify_release.py dist/hermes-t3-control-1.5.0.tar.gz.sha256
+          python -B scripts/verify_release.py dist/hermes-gateway-continuation-1.5.0.patch.sha256
           python -B scripts/verify_release.py dist/install-t3.sh.sha256
       - name: Verify reproducibility and authenticated release source
-        # Candidate builds have fresh checksums. Only the exact signed v1.4.0
+        # Candidate builds have fresh checksums. Only the exact signed v1.5.0
         # source must reproduce its immutable manifest; tag mismatches fail.
         run: python -B -m unittest -v tests.test_release.DeterministicArtifactTests.test_builds_are_byte_identical_and_checksum_is_portable
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hermes-t3-control-1.4.0
+          name: hermes-t3-control-1.5.0
           path: |
-            dist/hermes-t3-control-1.4.0.tar.gz
-            dist/hermes-t3-control-1.4.0.tar.gz.sha256
-            dist/hermes-gateway-continuation-1.4.0.patch
-            dist/hermes-gateway-continuation-1.4.0.patch.sha256
+            dist/hermes-t3-control-1.5.0.tar.gz
+            dist/hermes-t3-control-1.5.0.tar.gz.sha256
+            dist/hermes-gateway-continuation-1.5.0.patch
+            dist/hermes-gateway-continuation-1.5.0.patch.sha256
             dist/install-t3.sh
             dist/install-t3.sh.sha256
           if-no-files-found: error
